@@ -75,6 +75,13 @@ check_package_arg() {
 # Validates a full brew command line. Returns non-zero and sets DENY_REASON
 # when the command must not run.
 check_command() {
+  # brew.sh moves a leading -v to the end, so `brew -v sh` runs `brew sh -v`.
+  # Validate the command line the way brew will see it.
+  if [[ "${1:-}" == "-v" && $# -gt 1 ]]; then
+    shift
+    set -- "$@" -v
+  fi
+
   local cmd="${1:-}" arg
   [[ $# -gt 0 ]] && shift
 
@@ -141,11 +148,14 @@ check_command() {
 }
 
 audit() {
-  local decision="$1"
+  local decision="$1" argv=""
   shift
   [[ -w "${BREWAU_AUDIT_LOG}" || -w "${BREWAU_LOG_DIR}" ]] || return 0
+  # Quote every argument so newlines or other control characters in free-text
+  # arguments cannot forge log lines.
+  [[ $# -gt 0 ]] && argv="$(printf '%q ' "$@")"
   printf '%s user=%s decision=%s argv=%s\n' \
-    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "${SUDO_USER:-unknown}" "${decision}" "$*" >>"${BREWAU_AUDIT_LOG}" 2>/dev/null
+    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "${SUDO_USER:-unknown}" "${decision}" "${argv% }" >>"${BREWAU_AUDIT_LOG}" 2>/dev/null
 }
 
 # Only pass through presentation variables, and only with harmless values.

@@ -43,17 +43,28 @@ holds if nothing but the policy can steer `_brewau`:
   - only allowlisted subcommands (`install`, `upgrade`, `info`, …). `sh`, `ruby`, `irb`, `edit`,
     `extract`, `bundle`, `services`, `tap-new`, developer commands and unknown commands are refused;
   - only allowlisted options (`--cc`, `--appdir`, `--interactive`, `--debug`, … are refused);
+  - the command line is checked the way `brew` will see it (`brew -v sh` is `brew sh -v`);
   - package arguments must be plain names: no paths, URLs or `file://`;
-  - packages and taps outside `homebrew/*` must be in `ALLOWED_TAPS`;
-  - brew runs with `env -i` plus a fixed environment, so `HOMEBREW_*` variables, `~/.homebrew/brew.env`
-    and similar cannot be injected.
+  - packages and taps outside `homebrew/*` must be in `ALLOWED_TAPS`; taps that are installed
+    but not allowed are passed to Homebrew as `HOMEBREW_FORBIDDEN_TAPS`, so unqualified names
+    and dependencies cannot resolve to them either;
+  - brew runs with `env -i` plus a fixed environment and a private temp directory, so `HOMEBREW_*`
+    variables cannot be injected. `/etc/homebrew/brew.env` (with
+    `HOMEBREW_SYSTEM_ENV_TAKES_PRIORITY`) keeps prefix or user `brew.env` files from overriding
+    the enforced settings.
+- Apps installed by casks are owned by `_brewau` and not writable by users, because cask
+  upgrade/uninstall steps can run code from inside the app (e.g. `uninstall script:`). Apps
+  that an updater has replaced since are re-protected before each scheduled cask upgrade.
 - Every invocation is logged with the calling user to `/opt/brewau/var/log/audit.log`.
 
 Residual risk, shared with Workbrew:
 - A cask that ships a `.pkg` runs its installer as root. You are trusting the casks you install
   and the taps in `ALLOWED_TAPS`.
-- Apps in `/Applications` that you can write to may include uninstall scripts that a cask
-  uninstall stanza runs as root.
+- Admins can write to `/Applications` itself, so an admin account can swap a protected app for
+  its own copy and then run `brew uninstall`/`upgrade` on that cask. For admin members of
+  `brewau_users`, app protection closes accidental drift (self-updaters), not a deliberate attack.
+  Standard users cannot do this.
+- Everyone in `brewau_users` shares one package set: they can uninstall or untap what others use.
 
 ## Install
 
@@ -61,15 +72,19 @@ Requires an Apple Silicon Mac with Homebrew in `/opt/homebrew`.
 
 ```sh
 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/kastruppro/brewau/main/install.sh)"
-brewau setup-shell   # points `brew shellenv` in your profile at the wrapper
+/opt/brewau/bin/brewau setup-shell   # points `brew shellenv` in your profile at the wrapper
 # open a new terminal
 brewau doctor
 ```
 
+`install.sh` only installs a package that is notarized and signed by the brewau release team
+(override with `BREWAU_TEAM_ID` for forks).
+
 Alternatively download `brewau.pkg` from Releases, or deploy it with MDM. The installer:
-creates `_brewau` and `brewau_users`, adds the console user and the previous prefix owner to
-`brewau_users`, transfers `/opt/homebrew` to `_brewau`, allowlists any taps you already have,
-and loads the daily job.
+creates `_brewau` and `brewau_users`, transfers `/opt/homebrew` and the apps of installed casks
+to `_brewau`, allowlists any taps you already have, and loads the daily job. On the first install
+only, it also adds the console user and the previous prefix owner to `brewau_users`; upgrades
+leave group membership alone, so `deny-user` sticks.
 
 ## Usage
 
@@ -81,10 +96,12 @@ brewau run             # run the upgrade job now
 brewau log -f          # follow the upgrade log
 brewau log --audit     # who ran which brew command
 brewau doctor          # health check
+brewau restore-shell   # undo setup-shell
 
-sudo brewau config     # edit policy/schedule and apply it
+sudo brewau config     # edit policy/schedule; only applied if it parses
 sudo brewau allow-user alice
-sudo brewau uninstall  # returns /opt/homebrew to its original owner
+sudo brewau repair     # re-apply ownership, permissions and system files
+sudo brewau uninstall  # returns /opt/homebrew, apps, permissions and shell profiles
 ```
 
 ## Configuration
@@ -98,8 +115,8 @@ sudo brewau uninstall  # returns /opt/homebrew to its original owner
 | `EXTRA_ALLOWED_OPTIONS` | empty | brew options to allow beyond the built-in list |
 | `AUTO_UPGRADE` | `1` | enable the nightly job |
 | `UPGRADE_GREEDY` | `1` | include self-updating casks |
-| `UPGRADE_EXCLUDE` | empty | never auto-upgrade these |
-| `UPGRADE_HOUR`, `UPGRADE_MINUTE` | `4`, `0` | when to run; missed runs happen on wake |
+| `UPGRADE_EXCLUDE` | empty | never auto-upgrade these (formulae are pinned, so they are not upgraded as dependencies either) |
+| `UPGRADE_HOUR`, `UPGRADE_MINUTE` | `4`, `0` | when to run; a run missed while asleep happens on wake, a run missed while powered off is skipped (`brewau doctor` warns after 48 hours) |
 
 ## Limitations
 
@@ -108,6 +125,9 @@ sudo brewau uninstall  # returns /opt/homebrew to its original owner
 - Files under `/opt/homebrew` are no longer writable by you. That includes `npm -g`,
   `gem install` into Homebrew's Ruby, and editing configs in `/opt/homebrew/etc`. Use
   per-user prefixes (`npm config set prefix ~/.npm-global`), or `sudo -u _brewau` for one-off config edits.
+- Apps installed by casks can no longer update themselves as you (they are owned by
+  `_brewau`); the nightly job updates them instead, including self-updating ones with
+  `UPGRADE_GREEDY=1`.
 - macOS "App Management" privacy protection may stop the background job from replacing some
   apps. Check `brewau log` after the first run.
 - Intel Macs (`/usr/local`) are not supported.
@@ -115,7 +135,7 @@ sudo brewau uninstall  # returns /opt/homebrew to its original owner
 ## Building and releasing
 
 ```sh
-make test                  # policy unit tests
+make test                  # policy, config and shell-profile tests
 make pkg                   # unsigned build/brewau-<version>-unsigned.pkg
 make install               # install this checkout locally (sudo)
 

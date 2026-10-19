@@ -1,5 +1,9 @@
 #!/bin/bash -p
 # brewau-upgrade: scheduled unattended update, run by launchd as _brewau.
+#
+# There is no lock file: launchd never starts a second instance of a running
+# job (and `kickstart` without -k is a no-op then), and a lock left behind by
+# a killed run would silently stop every later run.
 
 set -u
 
@@ -7,8 +11,10 @@ BREWAU_LIBEXEC="/opt/brewau/libexec"
 # shellcheck source=common.sh
 source "${BREWAU_LIBEXEC}/common.sh"
 
-LOCK_DIR="${BREWAU_STATE_DIR}/upgrade.lock"
 LAST_RUN="${BREWAU_STATE_DIR}/last-run"
+# Formulae this job pinned because of UPGRADE_EXCLUDE, so it only ever unpins
+# its own pins and leaves pins made by users alone.
+EXCLUDE_PINS="${BREWAU_STATE_DIR}/exclude-pins"
 
 log() {
   echo "$(date '+%Y-%m-%d %H:%M:%S') $*"
@@ -27,15 +33,57 @@ write_state() {
   } >"${LAST_RUN}.tmp" && mv -f "${LAST_RUN}.tmp" "${LAST_RUN}"
 }
 
-filter_excluded() {
-  local name word skip
-  for name in "$@"; do
-    skip=0
-    for word in ${UPGRADE_EXCLUDE}; do
-      [[ "${word}" == "${name}" ]] && skip=1
-    done
-    [[ ${skip} -eq 0 ]] && echo "${name}"
+in_words() {
+  local word
+  for word in $2; do
+    [[ "${word}" == "$1" ]] && return 0
   done
+  return 1
+}
+
+# Prints the arguments that are not in the space-separated list $1.
+without() {
+  local list="$1" name
+  shift
+  for name in "$@"; do
+    in_words "${name}" "${list}" || echo "${name}"
+  done
+}
+
+# `brew upgrade` also upgrades outdated dependencies of what it upgrades, so
+# leaving a formula off the command line does not exclude it. A pin does.
+sync_exclude_pins() {
+  local installed pinned previous="" name kept=""
+  installed=" $(brew_run list --formula -1 2>/dev/null | tr '\n' ' ') "
+  pinned=" $(brew_run list --pinned 2>/dev/null | tr '\n' ' ') "
+  [[ -r "${EXCLUDE_PINS}" ]] && previous="$(cat "${EXCLUDE_PINS}")"
+
+  for name in ${previous}; do
+    if in_words "${name}" "${UPGRADE_EXCLUDE}"; then
+      kept="${kept} ${name}"
+    elif [[ "${pinned}" == *" ${name} "* ]]; then
+      log "unpinning ${name} (no longer in UPGRADE_EXCLUDE)"
+      brew_run unpin "${name}" || kept="${kept} ${name}"
+    fi
+  done
+  for name in ${UPGRADE_EXCLUDE}; do
+    [[ "${installed}" == *" ${name} "* ]] || continue
+    in_words "${name}" "${kept}" && continue
+    # Already pinned by someone else: respect it, but do not take it over.
+    [[ "${pinned}" == *" ${name} "* ]] && continue
+    log "pinning ${name} (UPGRADE_EXCLUDE)"
+    brew_run pin "${name}" && kept="${kept} ${name}"
+  done
+  echo "${kept# }" >"${EXCLUDE_PINS}"
+}
+
+protect_apps() {
+  local json
+  json="$(mktemp "${BREWAU_TMP}/casks.XXXXXX")" || return 0
+  if brew_run info --json=v2 --installed --cask >"${json}" 2>/dev/null; then
+    brewau_protect_apps "${json}" /usr/bin/sudo -n
+  fi
+  rm -f "${json}"
 }
 
 main() {
@@ -47,22 +95,19 @@ main() {
     exit 0
   fi
 
-  if ! mkdir "${LOCK_DIR}" 2>/dev/null; then
-    log "another upgrade is running; exiting"
-    exit 0
-  fi
-  trap 'rmdir "${LOCK_DIR}" 2>/dev/null' EXIT
-
-  local status="ok" greedy="" formulae casks
+  local status="ok" greedy="" formulae casks pinned
   [[ "${UPGRADE_GREEDY}" == "1" ]] && greedy="--greedy"
 
   log "brew update"
   brew_run update || status="update-failed"
 
+  sync_exclude_pins
+  pinned="$(brew_run list --pinned 2>/dev/null | tr '\n' ' ')"
+
   # shellcheck disable=SC2046
-  formulae="$(filter_excluded $(brew_run outdated --formula --quiet))"
+  formulae="$(without "${UPGRADE_EXCLUDE} ${pinned}" $(brew_run outdated --formula --quiet))"
   # shellcheck disable=SC2046
-  casks="$(filter_excluded $(brew_run outdated --cask --quiet ${greedy}))"
+  casks="$(without "${UPGRADE_EXCLUDE}" $(brew_run outdated --cask --quiet ${greedy}))"
 
   if [[ -n "${formulae}" ]]; then
     log "upgrading formulae: $(echo ${formulae})"
@@ -70,6 +115,8 @@ main() {
     brew_run upgrade --formula ${formulae} || status="upgrade-failed"
   fi
   if [[ -n "${casks}" ]]; then
+    # Apps may have been replaced by their own updater since the last run.
+    protect_apps
     log "upgrading casks: $(echo ${casks})"
     # shellcheck disable=SC2086
     brew_run upgrade --cask ${greedy} ${casks} || status="upgrade-failed"

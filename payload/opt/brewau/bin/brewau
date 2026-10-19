@@ -20,10 +20,12 @@ Usage: brewau <command>
   log [-f] [--audit]  show the upgrade log (or the brew audit log)
   doctor              check that the installation is healthy
   setup-shell         point your shell profile at the brewau wrapper
+  restore-shell       undo setup-shell (uninstall does this for every user)
 
 Administrator commands (run with sudo):
   config              edit ${BREWAU_CONF} and apply it
-  reload              re-apply brewau.conf (schedule, sudoers)
+  reload              re-apply brewau.conf (schedule, sudoers, brew.env)
+  repair              re-apply ownership, permissions and system files
   allow-user <user>   allow a user to run brew
   deny-user <user>    revoke a user's access to brew
   uninstall           remove brewau and return Homebrew to its original owner
@@ -105,25 +107,49 @@ cmd_doctor() {
   if [[ "${owner}" == "${BREWAU_USER}" ]]; then
     ok "${HOMEBREW_PREFIX_PATH} is owned by ${BREWAU_USER}"
   else
-    bad "${HOMEBREW_PREFIX_PATH} is owned by ${owner:-nobody}; run: sudo brewau reload"
+    bad "${HOMEBREW_PREFIX_PATH} is owned by ${owner:-nobody}; run: sudo brewau repair"
   fi
 
   writable="$(find "${HOMEBREW_PREFIX_PATH}" -maxdepth 3 ! -type l \( -perm -g+w -o -perm -o+w \) 2>/dev/null | head -1)"
   if [[ -z "${writable}" ]]; then
     ok "no group/world-writable paths in ${HOMEBREW_PREFIX_PATH}"
   else
-    bad "${writable} is group/world-writable; run: sudo /opt/brewau/libexec/brewau-setup install"
+    bad "${writable} is group/world-writable; run: sudo brewau repair"
   fi
 
-  [[ -f "${BREWAU_SUDOERS}" ]] && ok "sudoers rule installed" || bad "${BREWAU_SUDOERS} is missing"
+  local env_file
+  for env_file in "${HOMEBREW_PREFIX_PATH}/etc/homebrew/brew.env" "${BREWAU_HOME}/.homebrew/brew.env"; do
+    [[ -f "${env_file}" ]] && echo "  - ${env_file} exists; settings in it that brewau does not enforce still apply, review it"
+  done
+  grep -q '^HOMEBREW_SYSTEM_ENV_TAKES_PRIORITY=1' /etc/homebrew/brew.env 2>/dev/null &&
+    ok "/etc/homebrew/brew.env enforces brewau's settings" ||
+    bad "/etc/homebrew/brew.env is missing brewau's settings; run: sudo brewau reload"
+
+  [[ -f "${BREWAU_SUDOERS}" ]] && ok "sudoers rule installed" || bad "${BREWAU_SUDOERS} is missing; run: sudo brewau repair"
   daemon_loaded && ok "upgrade daemon is loaded" || bad "upgrade daemon is not loaded; run: sudo brewau reload"
   in_users_group && ok "$(id -un) is in ${BREWAU_USERS_GROUP}" ||
     bad "$(id -un) is not in ${BREWAU_USERS_GROUP}; run: sudo brewau allow-user $(id -un)"
 
-  if [[ -r "${BREWAU_STATE_DIR}/last-run" ]] && grep -q '^status=ok' "${BREWAU_STATE_DIR}/last-run"; then
-    ok "last scheduled run succeeded"
-  elif [[ -r "${BREWAU_STATE_DIR}/last-run" ]]; then
-    bad "last scheduled run failed; see: brewau log"
+  brewau_load_config
+  local forbidden
+  forbidden="$(brewau_forbidden_taps)"
+  [[ -n "${forbidden}" ]] &&
+    echo "  - installed taps outside ALLOWED_TAPS (blocked): ${forbidden}"
+
+  local last_run="${BREWAU_STATE_DIR}/last-run" finished age
+  if [[ "${AUTO_UPGRADE}" == "1" && -r "${last_run}" ]]; then
+    if grep -q '^status=ok' "${last_run}"; then
+      ok "last scheduled run succeeded"
+    else
+      bad "last scheduled run failed; see: brewau log"
+    fi
+    finished="$(sed -n 's/^finished=//p' "${last_run}")"
+    age=$(($(date +%s) - $(date -j -u -f '%Y-%m-%dT%H:%M:%SZ' "${finished}" +%s 2>/dev/null || echo 0)))
+    if [[ ${age} -gt $((48 * 3600)) ]]; then
+      bad "no scheduled run for $((age / 86400)) days (the Mac is off at $(printf '%02d:%02d' "$((10#${UPGRADE_HOUR}))" "$((10#${UPGRADE_MINUTE}))")?); run: brewau run"
+    fi
+  elif [[ "${AUTO_UPGRADE}" == "1" ]]; then
+    echo "  - no scheduled run yet; start one with: brewau run"
   fi
   return "${FAILED}"
 }
@@ -131,19 +157,32 @@ cmd_doctor() {
 SHELLENV_RE="(^|[^/[:alnum:]_])(${HOMEBREW_PREFIX_PATH}/bin/)?brew shellenv"
 PATH_MARKER="# brewau: keep the wrapper first in PATH"
 
+PROFILES=(.zprofile .zshrc .bash_profile .bashrc .profile .config/fish/config.fish)
+
 backup_once() {
   [[ -f "$1.brewau-backup" ]] || cp -p "$1" "$1.brewau-backup"
+}
+
+# Runs a filter command over a file and writes the result back in place, so
+# symlinked dotfiles (stow, chezmoi, ...) stay symlinks and keep their owner.
+rewrite_file() {
+  local file="$1" tmp
+  shift
+  tmp="$(mktemp "${TMPDIR:-/tmp}/brewau-profile.XXXXXX")" || return 1
+  if "$@" <"${file}" >"${tmp}"; then
+    cmp -s "${tmp}" "${file}" || cat "${tmp}" >"${file}"
+  fi
+  rm -f "${tmp}"
 }
 
 cmd_setup_shell() {
   local file rc shell
   # Point every `brew shellenv` (with or without the full path) at the wrapper.
-  for file in "${HOME}/.zprofile" "${HOME}/.zshrc" "${HOME}/.bash_profile" "${HOME}/.bashrc" \
-    "${HOME}/.profile" "${HOME}/.config/fish/config.fish"; do
+  for file in "${PROFILES[@]/#/${HOME}/}"; do
     [[ -f "${file}" ]] || continue
     grep -Eq "${SHELLENV_RE}" "${file}" || continue
     backup_once "${file}"
-    sed -i '' -E "s#${SHELLENV_RE}#\\1${BREWAU_ROOT}/bin/brew shellenv#g" "${file}"
+    rewrite_file "${file}" sed -E "s#${SHELLENV_RE}#\\1${BREWAU_ROOT}/bin/brew shellenv#g"
     echo "updated ${file} (backup: ${file}.brewau-backup)"
   done
 
@@ -170,11 +209,51 @@ cmd_setup_shell() {
   echo "Open a new terminal, then run: brewau doctor"
 }
 
+# Undoes setup-shell: points `brew shellenv` back at Homebrew and removes the
+# PATH lines it appended. Without this, profiles would call a wrapper that no
+# longer exists after uninstall and lose Homebrew from PATH.
+cmd_restore_shell() {
+  local file
+  for file in "${PROFILES[@]/#/${HOME}/}"; do
+    [[ -f "${file}" ]] || continue
+    grep -qF -e "${BREWAU_ROOT}/bin" "${file}" || continue
+    rewrite_file "${file}" awk -v marker="${PATH_MARKER}" \
+      -v from="${BREWAU_ROOT}/bin/brew shellenv" -v to="${HOMEBREW_BIN} shellenv" '
+        drop { drop = 0; next }
+        $0 == marker { drop = 1; if (blank) blank = ""; next }
+        {
+          while ((i = index($0, from)) > 0)
+            $0 = substr($0, 1, i - 1) to substr($0, i + length(from))
+          if (blank) print ""
+          if ($0 == "") { blank = 1; next }
+          blank = ""
+          print
+        }
+        END { if (blank) print "" }'
+    echo "restored ${file}"
+  done
+}
+
 cmd_config() {
   [[ "$(id -u)" -eq 0 ]] || brewau_die "run with sudo: sudo brewau config"
-  "${EDITOR:-vi}" "${BREWAU_CONF}"
-  chown root:wheel "${BREWAU_CONF}"
-  chmod 0644 "${BREWAU_CONF}"
+  local tmp answer
+  tmp="$(mktemp /tmp/brewau-conf.XXXXXX)"
+  cp "${BREWAU_CONF}" "${tmp}"
+  # Edit a copy and only install it once it parses; a broken live config
+  # makes every brew command fail.
+  while true; do
+    "${EDITOR:-vi}" "${tmp}"
+    if (brewau_load_config "${tmp}"); then
+      break
+    fi
+    read -r -p "brewau: the configuration is invalid. Edit again? [Y/n] " answer
+    if [[ "${answer}" == [nN]* ]]; then
+      rm -f "${tmp}"
+      brewau_die "no changes applied"
+    fi
+  done
+  install -o root -g wheel -m 0644 "${tmp}" "${BREWAU_CONF}"
+  rm -f "${tmp}"
   exec "${BREWAU_LIBEXEC}/brewau-setup" reload
 }
 
@@ -189,7 +268,12 @@ case "${1:-}" in
   log) shift; cmd_log "$@" ;;
   doctor) cmd_doctor ;;
   setup-shell) cmd_setup_shell ;;
+  restore-shell) cmd_restore_shell ;;
   config) cmd_config ;;
+  repair)
+    [[ "$(id -u)" -eq 0 ]] || brewau_die "run with sudo: sudo brewau repair"
+    root_command install
+    ;;
   reload | allow-user | deny-user | uninstall) root_command "$@" ;;
   version | --version | -v) echo "${VERSION}" ;;
   "" | help | -h | --help) usage ;;

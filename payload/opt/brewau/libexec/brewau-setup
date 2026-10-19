@@ -1,8 +1,9 @@
 #!/bin/bash -p
 # brewau-setup: privileged lifecycle operations. Must run as root.
 #
-#   brewau-setup install [user...]   create accounts, take over the prefix, load daemon
-#   brewau-setup reload              regenerate sudoers + LaunchDaemon from brewau.conf
+#   brewau-setup install [user...]   create accounts, take over the prefix, load daemon;
+#                                    also repairs an existing installation
+#   brewau-setup reload              regenerate sudoers, brew.env + LaunchDaemon from brewau.conf
 #   brewau-setup allow-user <user>   grant a user access to brew
 #   brewau-setup deny-user <user>    revoke a user's access to brew
 #   brewau-setup uninstall           restore vanilla Homebrew owned by the original user
@@ -15,7 +16,17 @@ source "${BREWAU_LIBEXEC}/common.sh"
 
 NEWSYSLOG_CONF="/etc/newsyslog.d/brewau.conf"
 ORIGINAL_OWNER_FILE="${BREWAU_ROOT}/etc/original-owner"
+# Modes of prefix paths whose group/world write bit brewau removed, so
+# uninstall can put them back.
+ORIGINAL_MODES_FILE="${BREWAU_ROOT}/etc/original-modes"
+# Written after the first successful install. Users are only granted access
+# automatically before it exists, so `deny-user` survives upgrades.
+INSTALLED_MARKER="${BREWAU_ROOT}/etc/installed"
 PKG_ID="com.kastruppro.brewau"
+
+BREW_ENV="/etc/homebrew/brew.env"
+BREW_ENV_BEGIN="# BEGIN brewau (managed; regenerate with: sudo brewau reload)"
+BREW_ENV_END="# END brewau"
 
 log() { echo "brewau-setup: $*"; }
 
@@ -28,6 +39,29 @@ console_user() {
   user="$(stat -f%Su /dev/console 2>/dev/null || true)"
   case "${user}" in "" | root | loginwindow | _mbsetupuser) return 0 ;; esac
   echo "${user}"
+}
+
+daemon_loaded() {
+  launchctl print "system/${BREWAU_LABEL}" >/dev/null 2>&1
+}
+
+# Runs brew as _brewau with the same environment the policy uses.
+brew_as_service() {
+  (cd / && sudo -u "${BREWAU_USER}" /bin/bash -p -c \
+    'source /opt/brewau/libexec/common.sh && brewau_load_config && brewau_exec_brew "$@"' brewau "$@")
+}
+
+# Writes `brew info --json=v2 --installed --cask` to a temp file and prints
+# its path, or fails if brew could not produce it.
+installed_casks_json() {
+  local json
+  json="$(mktemp /tmp/brewau-casks.XXXXXX)"
+  if brew_as_service info --json=v2 --installed --cask >"${json}" 2>/dev/null && [[ -s "${json}" ]]; then
+    echo "${json}"
+    return 0
+  fi
+  rm -f "${json}"
+  return 1
 }
 
 free_id() {
@@ -89,10 +123,14 @@ ensure_dirs() {
   install -d -o root -g wheel -m 0755 "${BREWAU_ROOT}" "${BREWAU_ROOT}/etc" "${BREWAU_VAR}"
   install -d -o "${BREWAU_USER}" -g "${BREWAU_GROUP}" -m 0755 \
     "${BREWAU_HOME}" "${BREWAU_LOG_DIR}" "${BREWAU_STATE_DIR}"
+  # Private replacement for the shared, world-writable /tmp.
+  install -d -o "${BREWAU_USER}" -g "${BREWAU_GROUP}" -m 0700 "${BREWAU_TMP}"
   local logfile
   for logfile in "${BREWAU_LOG_DIR}/upgrade.log" "${BREWAU_AUDIT_LOG}"; do
     [[ -f "${logfile}" ]] || install -o "${BREWAU_USER}" -g "${BREWAU_GROUP}" -m 0644 /dev/null "${logfile}"
   done
+  # Lock files from versions before 0.2.0 could be left behind forever.
+  rmdir "${BREWAU_STATE_DIR}/upgrade.lock" 2>/dev/null || true
   # The policy and setup code must never be writable by _brewau or users.
   chown -R root:wheel "${BREWAU_ROOT}/bin" "${BREWAU_ROOT}/libexec" "${BREWAU_ROOT}/share"
   chmod -R go-w "${BREWAU_ROOT}/bin" "${BREWAU_ROOT}/libexec" "${BREWAU_ROOT}/share"
@@ -106,6 +144,7 @@ existing_third_party_taps() {
     repo="$(basename "${dir}")"
     repo="${repo#homebrew-}"
     [[ "${user}" == "homebrew" ]] && continue
+    [[ "${user}/${repo}" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || continue
     echo "${user}/${repo}"
   done
 }
@@ -132,8 +171,23 @@ take_over_prefix() {
   fi
   chown -hR "${BREWAU_USER}:admin" "${HOMEBREW_PREFIX_PATH}"
   # Group/world write would let admins or users plant code that _brewau (and
-  # therefore root) executes.
+  # therefore root) executes. Record the old modes for uninstall first.
+  touch "${ORIGINAL_MODES_FILE}"
+  chown root:wheel "${ORIGINAL_MODES_FILE}"
+  chmod 0644 "${ORIGINAL_MODES_FILE}"
+  find "${HOMEBREW_PREFIX_PATH}" ! -type l \( -perm -g+w -o -perm -o+w \) \
+    -exec stat -f '%Lp %N' {} + >>"${ORIGINAL_MODES_FILE}"
   find "${HOMEBREW_PREFIX_PATH}" ! -type l \( -perm -g+w -o -perm -o+w \) -exec chmod go-w {} +
+}
+
+protect_cask_apps() {
+  local json
+  if json="$(installed_casks_json)"; then
+    brewau_protect_apps "${json}"
+    rm -f "${json}"
+  else
+    log "WARNING: could not list installed casks; apps in /Applications were not checked"
+  fi
 }
 
 write_sudoers() {
@@ -155,11 +209,51 @@ EOF
   rm -f "${tmp}"
 }
 
+# Prints brew.env without the brewau block.
+brew_env_without_block() {
+  [[ -f "${BREW_ENV}" ]] || return 0
+  awk -v begin="${BREW_ENV_BEGIN}" -v end="${BREW_ENV_END}" \
+    '$0 == begin { skip = 1; next } $0 == end { skip = 0; next } !skip' "${BREW_ENV}"
+}
+
+# Homebrew reads the prefix and user brew.env files after the environment the
+# policy sets, so they could override its HOMEBREW_* settings. The
+# system-wide file takes priority over both when it says so.
+write_brew_env() {
+  local tmp
+  tmp="$(mktemp /tmp/brewau-brewenv.XXXXXX)"
+  brew_env_without_block >"${tmp}"
+  cat >>"${tmp}" <<EOF
+${BREW_ENV_BEGIN}
+HOMEBREW_SYSTEM_ENV_TAKES_PRIORITY=1
+HOMEBREW_FORBID_PACKAGES_FROM_PATHS=1
+HOMEBREW_FORBIDDEN_FORMULAE=${FORBIDDEN_FORMULAE}
+HOMEBREW_FORBIDDEN_CASKS=${FORBIDDEN_CASKS}
+${BREW_ENV_END}
+EOF
+  install -d -o root -g wheel -m 0755 "$(dirname "${BREW_ENV}")"
+  install -o root -g wheel -m 0644 "${tmp}" "${BREW_ENV}"
+  rm -f "${tmp}"
+}
+
+remove_brew_env() {
+  [[ -f "${BREW_ENV}" ]] || return 0
+  local tmp
+  tmp="$(mktemp /tmp/brewau-brewenv.XXXXXX)"
+  brew_env_without_block >"${tmp}"
+  if grep -q '[^[:space:]]' "${tmp}"; then
+    install -o root -g wheel -m 0644 "${tmp}" "${BREW_ENV}"
+  else
+    rm -f "${BREW_ENV}"
+    rmdir "$(dirname "${BREW_ENV}")" 2>/dev/null || true
+  fi
+  rm -f "${tmp}"
+}
+
 write_launchdaemon() {
-  local hour="${UPGRADE_HOUR}" minute="${UPGRADE_MINUTE}"
-  [[ "${hour}" =~ ^[0-9]+$ && ${hour} -le 23 ]] || brewau_die "UPGRADE_HOUR must be 0-23"
-  [[ "${minute}" =~ ^[0-9]+$ && ${minute} -le 59 ]] || brewau_die "UPGRADE_MINUTE must be 0-59"
-  cat >"${BREWAU_PLIST}.tmp" <<EOF
+  local tmp="${BREWAU_PLIST}.tmp" i
+  # brewau_load_config has validated UPGRADE_HOUR and UPGRADE_MINUTE.
+  cat >"${tmp}" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -177,9 +271,9 @@ write_launchdaemon() {
   <key>StartCalendarInterval</key>
   <dict>
     <key>Hour</key>
-    <integer>${hour}</integer>
+    <integer>$((10#${UPGRADE_HOUR}))</integer>
     <key>Minute</key>
-    <integer>${minute}</integer>
+    <integer>$((10#${UPGRADE_MINUTE}))</integer>
   </dict>
   <key>StandardOutPath</key>
   <string>${BREWAU_LOG_DIR}/upgrade.log</string>
@@ -192,13 +286,33 @@ write_launchdaemon() {
 </dict>
 </plist>
 EOF
-  plutil -lint -s "${BREWAU_PLIST}.tmp" || brewau_die "generated LaunchDaemon plist is invalid"
-  chown root:wheel "${BREWAU_PLIST}.tmp"
-  chmod 0644 "${BREWAU_PLIST}.tmp"
-  launchctl bootout "system/${BREWAU_LABEL}" 2>/dev/null || true
-  mv -f "${BREWAU_PLIST}.tmp" "${BREWAU_PLIST}"
-  launchctl bootstrap system "${BREWAU_PLIST}"
-  log "scheduled daily upgrade at $(printf '%02d:%02d' "${hour}" "${minute}")"
+  plutil -lint -s "${tmp}" || brewau_die "generated LaunchDaemon plist is invalid"
+  chown root:wheel "${tmp}"
+  chmod 0644 "${tmp}"
+
+  # Reloading kills a running upgrade, so leave an unchanged daemon alone.
+  if [[ -f "${BREWAU_PLIST}" ]] && cmp -s "${tmp}" "${BREWAU_PLIST}" && daemon_loaded; then
+    rm -f "${tmp}"
+    return 0
+  fi
+
+  if daemon_loaded; then
+    launchctl bootout "system/${BREWAU_LABEL}" 2>/dev/null || true
+    # bootout returns before the job is gone, and bootstrap fails until it is.
+    for ((i = 0; i < 50; i++)); do
+      daemon_loaded || break
+      sleep 0.2
+    done
+  fi
+  mv -f "${tmp}" "${BREWAU_PLIST}"
+  for ((i = 0; i < 5; i++)); do
+    if launchctl bootstrap system "${BREWAU_PLIST}" 2>/dev/null; then
+      log "scheduled daily upgrade at $(printf '%02d:%02d' "$((10#${UPGRADE_HOUR}))" "$((10#${UPGRADE_MINUTE}))")"
+      return 0
+    fi
+    sleep 1
+  done
+  launchctl bootstrap system "${BREWAU_PLIST}" || brewau_die "could not load ${BREWAU_PLIST}"
 }
 
 write_system_files() {
@@ -216,6 +330,7 @@ cmd_reload() {
   require_root
   brewau_load_config
   write_sudoers
+  write_brew_env
   write_launchdaemon
 }
 
@@ -224,6 +339,10 @@ cmd_install() {
   [[ -x "${HOMEBREW_BIN}" ]] ||
     brewau_die "Homebrew was not found at ${HOMEBREW_PREFIX_PATH}. Install Homebrew first: https://brew.sh"
 
+  # Earlier versions did not write the marker but always wrote original-owner.
+  local first_install=1
+  [[ -f "${INSTALLED_MARKER}" || -f "${ORIGINAL_OWNER_FILE}" ]] && first_install=0
+
   ensure_service_account
   ensure_users_group
   ensure_dirs
@@ -231,19 +350,15 @@ cmd_install() {
   brewau_load_config
 
   local user users=("$@")
-  if [[ ${#users[@]} -eq 0 ]]; then
+  if [[ ${#users[@]} -eq 0 && ${first_install} -eq 1 ]]; then
     user="$(console_user)"
     [[ -n "${user}" ]] && users+=("${user}")
-    if [[ -f "${ORIGINAL_OWNER_FILE}" ]]; then
-      users+=("$(cat "${ORIGINAL_OWNER_FILE}")")
-    else
-      users+=("$(stat -f%Su "${HOMEBREW_PREFIX_PATH}")")
-    fi
+    users+=("$(stat -f%Su "${HOMEBREW_PREFIX_PATH}")")
   fi
 
   take_over_prefix
   local granted=" "
-  for user in "${users[@]}"; do
+  for user in ${users[@]+"${users[@]}"}; do
     [[ "${user}" == "${BREWAU_USER}" || "${user}" == "root" ]] && continue
     [[ "${granted}" == *" ${user} "* ]] && continue
     allow_user "${user}"
@@ -252,11 +367,51 @@ cmd_install() {
 
   write_system_files
   write_sudoers
+  write_brew_env
+  protect_cask_apps
   write_launchdaemon
   dscacheutil -flushcache 2>/dev/null || true
+  touch "${INSTALLED_MARKER}"
 
   log "installed. Open a new terminal; \`brew\` now runs through brewau."
   log "if your shell profile runs \`/opt/homebrew/bin/brew shellenv\`, run \`/opt/brewau/bin/brewau setup-shell\`."
+}
+
+# Undoes `brewau setup-shell` for every local user, running as that user so
+# file ownership is kept.
+restore_shell_profiles() {
+  local user uid home
+  while read -r user uid; do
+    [[ "${uid}" -ge 500 ]] || continue
+    home="$(dscl . -read "/Users/${user}" NFSHomeDirectory 2>/dev/null | awk '{print $2}')"
+    [[ -n "${home}" && -d "${home}" ]] || continue
+    (cd / && sudo -u "${user}" -H /bin/bash -p "${BREWAU_ROOT}/bin/brewau" restore-shell </dev/null) ||
+      log "WARNING: could not restore the shell profile of ${user}"
+  done < <(dscl . -list /Users UniqueID)
+}
+
+# Gives apps that brewau installed back to the user who will own the prefix.
+return_cask_apps() {
+  local owner="$1" json app
+  json="$(installed_casks_json)" || {
+    log "WARNING: could not list installed casks; apps owned by ${BREWAU_USER} stay that way"
+    return 0
+  }
+  while IFS= read -r app; do
+    find "${app}" -user "${BREWAU_USER}" -exec chown -h "${owner}:admin" {} + 2>/dev/null ||
+      log "WARNING: could not return ${app} to ${owner}"
+  done < <(brewau_cask_app_paths "${json}")
+  rm -f "${json}"
+}
+
+restore_prefix_modes() {
+  [[ -f "${ORIGINAL_MODES_FILE}" ]] || return 0
+  local mode path
+  while read -r mode path; do
+    [[ "${mode}" =~ ^[0-7]{3,4}$ && "${path}" == "${HOMEBREW_PREFIX_PATH}"/* ]] || continue
+    [[ -e "${path}" && ! -L "${path}" ]] && chmod "${mode}" "${path}" 2>/dev/null
+  done <"${ORIGINAL_MODES_FILE}"
+  return 0
 }
 
 cmd_uninstall() {
@@ -266,16 +421,20 @@ cmd_uninstall() {
   [[ -z "${owner}" ]] && owner="$(console_user)"
 
   launchctl bootout "system/${BREWAU_LABEL}" 2>/dev/null || true
-  rm -f "${BREWAU_PLIST}" "${BREWAU_SUDOERS}" "${BREWAU_PATHS_D}" "${NEWSYSLOG_CONF}"
+  restore_shell_profiles
 
   if [[ -n "${owner}" ]] && id "${owner}" >/dev/null 2>&1 && [[ -d "${HOMEBREW_PREFIX_PATH}" ]]; then
+    return_cask_apps "${owner}"
     log "returning ${HOMEBREW_PREFIX_PATH} to ${owner}"
     chown -hR "${owner}:admin" "${HOMEBREW_PREFIX_PATH}"
+    restore_prefix_modes
   else
     log "WARNING: could not determine original owner; ${HOMEBREW_PREFIX_PATH} is still owned by ${BREWAU_USER}"
     log "fix with: sudo chown -hR <you>:admin ${HOMEBREW_PREFIX_PATH}"
   fi
 
+  rm -f "${BREWAU_PLIST}" "${BREWAU_SUDOERS}" "${BREWAU_PATHS_D}" "${NEWSYSLOG_CONF}"
+  remove_brew_env
   dscl . -delete "/Users/${BREWAU_USER}" 2>/dev/null || true
   dscl . -delete "/Groups/${BREWAU_GROUP}" 2>/dev/null || true
   dseditgroup -o delete "${BREWAU_USERS_GROUP}" 2>/dev/null || true

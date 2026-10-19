@@ -10,6 +10,8 @@
 set -euo pipefail
 
 BREWAU_REPO="${BREWAU_REPO:-kastruppro/brewau}"
+# Apple Developer team that signs official releases. Forks set their own.
+BREWAU_TEAM_ID="${BREWAU_TEAM_ID:-5W98EXLE44}"
 PKG_ID="com.kastruppro.brewau"
 
 die() {
@@ -39,8 +41,11 @@ install_release() {
 
   # Refuse anything Gatekeeper would not accept as a notarized Developer ID installer.
   spctl --assess --type install "${pkg}" 2>/dev/null || die "package is not signed and notarized; refusing to install"
+  # Any notarized Developer ID package passes spctl, so also require ours.
   team="$(pkgutil --check-signature "${pkg}" | sed -n 's/.*Developer ID Installer: .*(\(.*\)).*/\1/p' | head -1)"
-  echo "Package signed by Developer ID team ${team:-unknown}"
+  [[ "${team}" == "${BREWAU_TEAM_ID}" ]] ||
+    die "package is signed by team ${team:-unknown}, expected ${BREWAU_TEAM_ID}; refusing to install"
+  echo "Package signed by Developer ID team ${team}"
 
   echo "Installing (you will be asked for your password once)"
   sudo /usr/sbin/installer -pkg "${pkg}" -target /

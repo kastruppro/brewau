@@ -50,7 +50,7 @@ release: notarize
 	@echo "Release ready: $(BUILD)/brewau.pkg (upload as a GitHub release asset)"
 
 test:
-	./tests/policy_test.sh
+	@set -e; for t in tests/*_test.sh; do echo "$$t"; /bin/bash "$$t"; done
 
 lint:
 	shellcheck -x payload/opt/brewau/bin/* payload/opt/brewau/libexec/* scripts/* install.sh tests/*.sh
