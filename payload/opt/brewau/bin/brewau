@@ -128,24 +128,46 @@ cmd_doctor() {
   return "${FAILED}"
 }
 
+SHELLENV_RE="(^|[^/[:alnum:]_])(${HOMEBREW_PREFIX_PATH}/bin/)?brew shellenv"
+PATH_MARKER="# brewau: keep the wrapper first in PATH"
+
+backup_once() {
+  [[ -f "$1.brewau-backup" ]] || cp -p "$1" "$1.brewau-backup"
+}
+
 cmd_setup_shell() {
-  local file changed=0
+  local file rc shell
+  # Point every `brew shellenv` (with or without the full path) at the wrapper.
   for file in "${HOME}/.zprofile" "${HOME}/.zshrc" "${HOME}/.bash_profile" "${HOME}/.bashrc" \
     "${HOME}/.profile" "${HOME}/.config/fish/config.fish"; do
     [[ -f "${file}" ]] || continue
-    grep -q "${HOMEBREW_PREFIX_PATH}/bin/brew shellenv" "${file}" || continue
-    cp -p "${file}" "${file}.brewau-backup"
-    sed -i '' "s|${HOMEBREW_PREFIX_PATH}/bin/brew shellenv|${BREWAU_ROOT}/bin/brew shellenv|g" "${file}"
+    grep -Eq "${SHELLENV_RE}" "${file}" || continue
+    backup_once "${file}"
+    sed -i '' -E "s#${SHELLENV_RE}#\\1${BREWAU_ROOT}/bin/brew shellenv#g" "${file}"
     echo "updated ${file} (backup: ${file}.brewau-backup)"
-    changed=1
   done
-  if [[ ${changed} -eq 0 ]]; then
-    echo "No shell profile references ${HOMEBREW_PREFIX_PATH}/bin/brew shellenv."
-    echo "If brew is still not the wrapper, add this to your profile:"
-    echo "  eval \"\$(${BREWAU_ROOT}/bin/brew shellenv)\""
-  else
-    echo "Open a new terminal, then run: brewau doctor"
+
+  # Profiles can also prepend /opt/homebrew/bin by hand, so finish the rc file
+  # of the login shell by putting the wrapper first again.
+  shell="$(basename "$(dscl . -read "/Users/$(id -un)" UserShell 2>/dev/null | awk '{print $2}')")"
+  case "${shell}" in
+    zsh) rc="${HOME}/.zshrc" ;;
+    bash) rc="${HOME}/.bash_profile" ;;
+    fish) rc="${HOME}/.config/fish/config.fish" ;;
+    *) rc="" ;;
+  esac
+  if [[ -n "${rc}" ]] && ! grep -qF "${PATH_MARKER}" "${rc}" 2>/dev/null; then
+    [[ -f "${rc}" ]] && backup_once "${rc}"
+    mkdir -p "$(dirname "${rc}")"
+    if [[ "${shell}" == "fish" ]]; then
+      printf '\n%s\nfish_add_path --global --move --path %s\n' "${PATH_MARKER}" "${BREWAU_ROOT}/bin" >>"${rc}"
+    else
+      printf '\n%s\nexport PATH="%s:${PATH}"\n' "${PATH_MARKER}" "${BREWAU_ROOT}/bin" >>"${rc}"
+    fi
+    echo "added the wrapper to the end of ${rc}"
   fi
+
+  echo "Open a new terminal, then run: brewau doctor"
 }
 
 cmd_config() {
