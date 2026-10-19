@@ -1,0 +1,5 @@
+#!/bin/bash
+# Installer postinstall: all setup logic lives in brewau-setup so the .pkg and
+# install.sh behave identically.
+
+exec /opt/brewau/libexec/brewau-setup install

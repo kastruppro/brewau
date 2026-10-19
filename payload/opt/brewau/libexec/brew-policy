@@ -1,0 +1,180 @@
+#!/bin/bash -p
+# brew-policy: the security boundary between a user and the _brewau account.
+#
+# Invoked by /opt/brewau/bin/brew via `sudo -u _brewau`. Anything this script
+# lets through runs as _brewau, which has passwordless sudo, so the default is
+# to deny. Only allowlisted subcommands, options and package names pass.
+
+set -u
+
+# sudo runs this file by its absolute path from sudoers, so this resolves to
+# /opt/brewau/libexec in production and to the repo checkout in tests.
+BREWAU_LIBEXEC="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+# shellcheck source=common.sh
+source "${BREWAU_LIBEXEC}/common.sh"
+
+# Subcommands that only read state.
+READ_COMMANDS=" --version -v --prefix --cellar --repository --repo --cache --caskroom --env --config
+  config doctor dr list ls info abv search -S outdated deps uses leaves desc options missing
+  tap-info commands help -h --help formulae casks shellenv "
+
+# Subcommands that change the prefix or /Applications.
+WRITE_COMMANDS=" install reinstall upgrade uninstall remove rm autoremove cleanup update update-reset
+  link ln unlink pin unpin tap untap fetch analytics completions migrate "
+
+# Commands whose arguments are free text and never resolved as files.
+FREE_TEXT_COMMANDS=" search -S help -h --help commands "
+
+ALLOWED_OPTIONS=" -v --verbose -q --quiet -f --force -n --dry-run -h --help
+  --formula --formulae --cask --casks --greedy --greedy-latest --greedy-auto-updates
+  --zap --adopt --overwrite --ignore-dependencies --only-dependencies --skip-cask-deps
+  --skip-post-install --skip-link --require-sha --fetch-HEAD --HEAD --build-from-source -s
+  --force-bottle --installed --eval-all --desc --name --description --versions --pinned
+  --full-name --multiple --tree --direct --recursive --include-build --include-test
+  --include-optional --skip-recommended --annotate --dependents --display-times --ask
+  --json --json=v1 --json=v2 --scrub --deps --repair --installed-on-request
+  --installed-as-dependency --poured-from-bottle --built-from-source --missing --declared
+  --list-checks --unbrewed --auto-update --no-upgrade --quiet -1 -l -r -t --fish --zsh --bash
+  --on-request --as-dependency --leaves --print-path --casks --names --size --plain "
+
+NAME_RE='^[A-Za-z0-9][A-Za-z0-9@._+-]*$'
+TAP_RE='^[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]*$'
+QUALIFIED_RE='^([A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]*)/[A-Za-z0-9][A-Za-z0-9@._+-]*$'
+
+DENY_REASON=""
+
+deny() {
+  DENY_REASON="$*"
+  return 1
+}
+
+in_list() {
+  case "$2" in *" $1 "*) return 0 ;; esac
+  return 1
+}
+
+option_allowed() {
+  local opt="$1"
+  in_list "${opt}" "${ALLOWED_OPTIONS}" && return 0
+  in_list "${opt}" " ${EXTRA_ALLOWED_OPTIONS} " && return 0
+  [[ "${opt}" =~ ^--prune=([0-9]+|all)$ ]] && return 0
+  [[ "${opt}" =~ ^--shell=(bash|zsh|fish|csh|pwsh)$ ]] && return 0
+  return 1
+}
+
+check_package_arg() {
+  local arg="$1" tap
+  if [[ "${arg}" =~ ${QUALIFIED_RE} ]]; then
+    tap="${BASH_REMATCH[1]}"
+    brewau_tap_allowed "${tap}" || deny "tap '${tap}' is not in ALLOWED_TAPS"
+    return
+  fi
+  [[ "${arg}" =~ ${NAME_RE} ]] || deny "'${arg}' is not a plain formula/cask name (paths and URLs are not allowed)"
+}
+
+# Validates a full brew command line. Returns non-zero and sets DENY_REASON
+# when the command must not run.
+check_command() {
+  local cmd="${1:-}" arg
+  [[ $# -gt 0 ]] && shift
+
+  if [[ -z "${cmd}" ]]; then
+    return 0
+  fi
+
+  if ! in_list "${cmd}" "${READ_COMMANDS}" && ! in_list "${cmd}" "${WRITE_COMMANDS}"; then
+    deny "'brew ${cmd}' is not allowed by policy"
+    return
+  fi
+
+  case "${cmd}" in
+    tap)
+      local positional=0
+      for arg in "$@"; do
+        if [[ "${arg}" == -* ]]; then
+          option_allowed "${arg}" || { deny "option '${arg}' is not allowed"; return; }
+          continue
+        fi
+        positional=$((positional + 1))
+        [[ ${positional} -gt 1 ]] && { deny "custom tap remotes are not allowed"; return; }
+        [[ "${arg}" =~ ${TAP_RE} ]] || { deny "'${arg}' is not a valid tap name"; return; }
+        brewau_tap_allowed "${arg}" || { deny "tap '${arg}' is not in ALLOWED_TAPS"; return; }
+      done
+      return 0
+      ;;
+    untap | tap-info)
+      for arg in "$@"; do
+        if [[ "${arg}" == -* ]]; then
+          option_allowed "${arg}" || { deny "option '${arg}' is not allowed"; return; }
+          continue
+        fi
+        [[ "${arg}" =~ ${TAP_RE} ]] || { deny "'${arg}' is not a valid tap name"; return; }
+      done
+      return 0
+      ;;
+    analytics)
+      [[ $# -le 1 ]] || { deny "too many arguments"; return; }
+      case "${1:-state}" in on | off | state) return 0 ;; esac
+      deny "brew analytics accepts on|off|state"
+      return
+      ;;
+  esac
+
+  if in_list "${cmd}" "${FREE_TEXT_COMMANDS}"; then
+    for arg in "$@"; do
+      [[ "${arg}" == -* ]] && ! option_allowed "${arg}" && { deny "option '${arg}' is not allowed"; return; }
+    done
+    return 0
+  fi
+
+  for arg in "$@"; do
+    if [[ "${arg}" == "--" ]]; then
+      deny "'--' is not allowed"
+      return
+    elif [[ "${arg}" == -* ]]; then
+      option_allowed "${arg}" || { deny "option '${arg}' is not allowed"; return; }
+    else
+      check_package_arg "${arg}" || return
+    fi
+  done
+  return 0
+}
+
+audit() {
+  local decision="$1"
+  shift
+  [[ -w "${BREWAU_AUDIT_LOG}" || -w "${BREWAU_LOG_DIR}" ]] || return 0
+  printf '%s user=%s decision=%s argv=%s\n' \
+    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "${SUDO_USER:-unknown}" "${decision}" "$*" >>"${BREWAU_AUDIT_LOG}" 2>/dev/null
+}
+
+# Only pass through presentation variables, and only with harmless values.
+passthrough_env() {
+  local out="" name value
+  for name in TERM COLUMNS LINES LANG LC_ALL NO_COLOR; do
+    value="$(printenv "${name}" 2>/dev/null)" || continue
+    [[ "${value}" =~ ^[A-Za-z0-9._@-]{1,64}$ ]] || continue
+    out="${out} ${name}=${value}"
+  done
+  echo "${out}"
+}
+
+main() {
+  [[ "$(id -un)" == "${BREWAU_USER}" ]] || brewau_die "brew-policy must run as ${BREWAU_USER}"
+  brewau_load_config
+
+  if ! check_command "$@"; then
+    audit deny "$@"
+    echo "brewau: denied: ${DENY_REASON}" >&2
+    echo "brewau: edit ${BREWAU_CONF} as an administrator to change the policy." >&2
+    exit 1
+  fi
+  audit allow "$@"
+
+  BREWAU_PASSTHROUGH_ENV="$(passthrough_env)"
+  brewau_exec_brew "$@"
+}
+
+if [[ -z "${BREWAU_POLICY_TEST:-}" ]]; then
+  main "$@"
+fi

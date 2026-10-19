@@ -1,0 +1,14 @@
+#!/bin/bash
+# Installer preinstall: refuse to install where brewau cannot work.
+
+if [[ "$(uname -m)" != "arm64" ]]; then
+  echo "brewau requires an Apple Silicon Mac (Homebrew in /opt/homebrew)." >&2
+  exit 1
+fi
+
+if [[ ! -x /opt/homebrew/bin/brew ]]; then
+  echo "Homebrew was not found in /opt/homebrew. Install Homebrew first: https://brew.sh" >&2
+  exit 1
+fi
+
+exit 0

@@ -1,0 +1,22 @@
+# brewau configuration. Owned by root; edit with `sudo brewau config`.
+# Values are space-separated lists. This file is parsed, never executed.
+
+# Third-party taps users may install from, as user/repo. Official homebrew/*
+# taps are always allowed. Anything you list here is trusted with root.
+ALLOWED_TAPS=""
+
+# Packages nobody may install (passed to HOMEBREW_FORBIDDEN_*).
+FORBIDDEN_FORMULAE=""
+FORBIDDEN_CASKS=""
+
+# Additional brew options to allow beyond the built-in allowlist, e.g. "--no-binaries".
+EXTRA_ALLOWED_OPTIONS=""
+
+# Scheduled unattended upgrades. Run `sudo brewau reload` after changing the time.
+AUTO_UPGRADE="1"
+# Also upgrade casks that update themselves (Chrome, Slack, ...).
+UPGRADE_GREEDY="1"
+# Formulae/casks the scheduled job must never upgrade.
+UPGRADE_EXCLUDE=""
+UPGRADE_HOUR="4"
+UPGRADE_MINUTE="0"

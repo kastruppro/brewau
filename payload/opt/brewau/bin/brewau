@@ -1,0 +1,175 @@
+#!/bin/bash -p
+# brewau: status and administration for the brewau Homebrew isolation layer.
+
+set -u
+
+BREWAU_LIBEXEC="/opt/brewau/libexec"
+# shellcheck source=../libexec/common.sh
+source "${BREWAU_LIBEXEC}/common.sh"
+
+VERSION="$(cat "${BREWAU_ROOT}/share/VERSION" 2>/dev/null || echo unknown)"
+
+usage() {
+  cat <<EOF
+brewau ${VERSION} - unattended, isolated Homebrew
+
+Usage: brewau <command>
+
+  status              show schedule, last run and access
+  run                 start the scheduled upgrade now
+  log [-f] [--audit]  show the upgrade log (or the brew audit log)
+  doctor              check that the installation is healthy
+  setup-shell         point your shell profile at the brewau wrapper
+
+Administrator commands (run with sudo):
+  config              edit ${BREWAU_CONF} and apply it
+  reload              re-apply brewau.conf (schedule, sudoers)
+  allow-user <user>   allow a user to run brew
+  deny-user <user>    revoke a user's access to brew
+  uninstall           remove brewau and return Homebrew to its original owner
+EOF
+}
+
+ok() { printf '  \033[32m✓\033[0m %s\n' "$*"; }
+bad() { printf '  \033[31m✗\033[0m %s\n' "$*"; FAILED=1; }
+
+in_users_group() {
+  case " $(id -Gn "${1:-$(id -un)}" 2>/dev/null) " in *" ${BREWAU_USERS_GROUP} "*) return 0 ;; esac
+  return 1
+}
+
+daemon_loaded() {
+  launchctl print "system/${BREWAU_LABEL}" >/dev/null 2>&1
+}
+
+cmd_status() {
+  brewau_load_config
+  echo "brewau ${VERSION}"
+  if [[ "${AUTO_UPGRADE}" == "1" ]]; then
+    printf 'Schedule:   daily at %02d:%02d%s\n' "${UPGRADE_HOUR}" "${UPGRADE_MINUTE}" \
+      "$([[ "${UPGRADE_GREEDY}" == "1" ]] && echo " (including self-updating casks)")"
+  else
+    echo "Schedule:   disabled (AUTO_UPGRADE=0)"
+  fi
+  if [[ -r "${BREWAU_STATE_DIR}/last-run" ]]; then
+    local finished status upgraded
+    finished="$(sed -n 's/^finished=//p' "${BREWAU_STATE_DIR}/last-run")"
+    status="$(sed -n 's/^status=//p' "${BREWAU_STATE_DIR}/last-run")"
+    upgraded="$(sed -n 's/^upgraded=//p' "${BREWAU_STATE_DIR}/last-run")"
+    echo "Last run:   ${finished} (${status})"
+    echo "Upgraded:   ${upgraded:-nothing}"
+  else
+    echo "Last run:   never"
+  fi
+  echo "Taps:       homebrew/* ${ALLOWED_TAPS}"
+  if in_users_group; then
+    echo "Access:     $(id -un) may use brew"
+  else
+    echo "Access:     $(id -un) may NOT use brew"
+  fi
+}
+
+cmd_run() {
+  /usr/bin/sudo -n /bin/launchctl kickstart "system/${BREWAU_LABEL}" ||
+    brewau_die "could not start the upgrade (are you in ${BREWAU_USERS_GROUP}?)"
+  echo "Upgrade started. Follow it with: brewau log -f"
+}
+
+cmd_log() {
+  local file="${BREWAU_LOG_DIR}/upgrade.log" follow=0 arg
+  for arg in "$@"; do
+    case "${arg}" in
+      -f) follow=1 ;;
+      --audit) file="${BREWAU_AUDIT_LOG}" ;;
+      *) brewau_die "unknown option ${arg}" ;;
+    esac
+  done
+  [[ -r "${file}" ]] || brewau_die "no log yet at ${file}"
+  if [[ ${follow} -eq 1 ]]; then
+    exec tail -n 50 -f "${file}"
+  fi
+  exec tail -n 100 "${file}"
+}
+
+cmd_doctor() {
+  FAILED=0
+  local brew_path owner writable
+  brew_path="$(command -v brew || true)"
+  if [[ "${brew_path}" == "${BREWAU_ROOT}/bin/brew" ]]; then
+    ok "brew in PATH is the brewau wrapper"
+  else
+    bad "brew in PATH is ${brew_path:-missing}; run: brewau setup-shell (then open a new terminal)"
+  fi
+
+  owner="$(stat -f%Su "${HOMEBREW_PREFIX_PATH}" 2>/dev/null || true)"
+  if [[ "${owner}" == "${BREWAU_USER}" ]]; then
+    ok "${HOMEBREW_PREFIX_PATH} is owned by ${BREWAU_USER}"
+  else
+    bad "${HOMEBREW_PREFIX_PATH} is owned by ${owner:-nobody}; run: sudo brewau reload"
+  fi
+
+  writable="$(find "${HOMEBREW_PREFIX_PATH}" -maxdepth 3 ! -type l \( -perm -g+w -o -perm -o+w \) 2>/dev/null | head -1)"
+  if [[ -z "${writable}" ]]; then
+    ok "no group/world-writable paths in ${HOMEBREW_PREFIX_PATH}"
+  else
+    bad "${writable} is group/world-writable; run: sudo /opt/brewau/libexec/brewau-setup install"
+  fi
+
+  [[ -f "${BREWAU_SUDOERS}" ]] && ok "sudoers rule installed" || bad "${BREWAU_SUDOERS} is missing"
+  daemon_loaded && ok "upgrade daemon is loaded" || bad "upgrade daemon is not loaded; run: sudo brewau reload"
+  in_users_group && ok "$(id -un) is in ${BREWAU_USERS_GROUP}" ||
+    bad "$(id -un) is not in ${BREWAU_USERS_GROUP}; run: sudo brewau allow-user $(id -un)"
+
+  if [[ -r "${BREWAU_STATE_DIR}/last-run" ]] && grep -q '^status=ok' "${BREWAU_STATE_DIR}/last-run"; then
+    ok "last scheduled run succeeded"
+  elif [[ -r "${BREWAU_STATE_DIR}/last-run" ]]; then
+    bad "last scheduled run failed; see: brewau log"
+  fi
+  return "${FAILED}"
+}
+
+cmd_setup_shell() {
+  local file changed=0
+  for file in "${HOME}/.zprofile" "${HOME}/.zshrc" "${HOME}/.bash_profile" "${HOME}/.bashrc" \
+    "${HOME}/.profile" "${HOME}/.config/fish/config.fish"; do
+    [[ -f "${file}" ]] || continue
+    grep -q "${HOMEBREW_PREFIX_PATH}/bin/brew shellenv" "${file}" || continue
+    cp -p "${file}" "${file}.brewau-backup"
+    sed -i '' "s|${HOMEBREW_PREFIX_PATH}/bin/brew shellenv|${BREWAU_ROOT}/bin/brew shellenv|g" "${file}"
+    echo "updated ${file} (backup: ${file}.brewau-backup)"
+    changed=1
+  done
+  if [[ ${changed} -eq 0 ]]; then
+    echo "No shell profile references ${HOMEBREW_PREFIX_PATH}/bin/brew shellenv."
+    echo "If brew is still not the wrapper, add this to your profile:"
+    echo "  eval \"\$(${BREWAU_ROOT}/bin/brew shellenv)\""
+  else
+    echo "Open a new terminal, then run: brewau doctor"
+  fi
+}
+
+cmd_config() {
+  [[ "$(id -u)" -eq 0 ]] || brewau_die "run with sudo: sudo brewau config"
+  "${EDITOR:-vi}" "${BREWAU_CONF}"
+  chown root:wheel "${BREWAU_CONF}"
+  chmod 0644 "${BREWAU_CONF}"
+  exec "${BREWAU_LIBEXEC}/brewau-setup" reload
+}
+
+root_command() {
+  [[ "$(id -u)" -eq 0 ]] || brewau_die "run with sudo: sudo brewau $*"
+  exec "${BREWAU_LIBEXEC}/brewau-setup" "$@"
+}
+
+case "${1:-}" in
+  status) cmd_status ;;
+  run) cmd_run ;;
+  log) shift; cmd_log "$@" ;;
+  doctor) cmd_doctor ;;
+  setup-shell) cmd_setup_shell ;;
+  config) cmd_config ;;
+  reload | allow-user | deny-user | uninstall) root_command "$@" ;;
+  version | --version | -v) echo "${VERSION}" ;;
+  "" | help | -h | --help) usage ;;
+  *) usage >&2; exit 1 ;;
+esac

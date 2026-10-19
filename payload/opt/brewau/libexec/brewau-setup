@@ -1,0 +1,295 @@
+#!/bin/bash -p
+# brewau-setup: privileged lifecycle operations. Must run as root.
+#
+#   brewau-setup install [user...]   create accounts, take over the prefix, load daemon
+#   brewau-setup reload              regenerate sudoers + LaunchDaemon from brewau.conf
+#   brewau-setup allow-user <user>   grant a user access to brew
+#   brewau-setup deny-user <user>    revoke a user's access to brew
+#   brewau-setup uninstall           restore vanilla Homebrew owned by the original user
+
+set -euo pipefail
+
+BREWAU_LIBEXEC="/opt/brewau/libexec"
+# shellcheck source=common.sh
+source "${BREWAU_LIBEXEC}/common.sh"
+
+NEWSYSLOG_CONF="/etc/newsyslog.d/brewau.conf"
+ORIGINAL_OWNER_FILE="${BREWAU_ROOT}/etc/original-owner"
+PKG_ID="com.kastruppro.brewau"
+
+log() { echo "brewau-setup: $*"; }
+
+require_root() {
+  [[ "$(id -u)" -eq 0 ]] || brewau_die "this command must run as root (use sudo)"
+}
+
+console_user() {
+  local user
+  user="$(stat -f%Su /dev/console 2>/dev/null || true)"
+  case "${user}" in "" | root | loginwindow | _mbsetupuser) return 0 ;; esac
+  echo "${user}"
+}
+
+free_id() {
+  local id
+  for ((id = 400; id < 500; id++)); do
+    if ! dscl . -search /Users UniqueID "${id}" | grep -q . &&
+      ! dscl . -search /Groups PrimaryGroupID "${id}" | grep -q .; then
+      echo "${id}"
+      return 0
+    fi
+  done
+  brewau_die "no free system UID/GID between 400 and 499"
+}
+
+ensure_service_account() {
+  if dscl . -read "/Users/${BREWAU_USER}" >/dev/null 2>&1; then
+    return 0
+  fi
+  local id
+  id="$(free_id)"
+  log "creating service account ${BREWAU_USER} (uid/gid ${id})"
+  dscl . -create "/Groups/${BREWAU_GROUP}"
+  dscl . -create "/Groups/${BREWAU_GROUP}" PrimaryGroupID "${id}"
+  dscl . -create "/Groups/${BREWAU_GROUP}" RealName "brewau service"
+  dscl . -create "/Groups/${BREWAU_GROUP}" Password "*"
+
+  dscl . -create "/Users/${BREWAU_USER}"
+  dscl . -create "/Users/${BREWAU_USER}" UniqueID "${id}"
+  dscl . -create "/Users/${BREWAU_USER}" PrimaryGroupID "${id}"
+  dscl . -create "/Users/${BREWAU_USER}" RealName "brewau service"
+  dscl . -create "/Users/${BREWAU_USER}" NFSHomeDirectory "${BREWAU_HOME}"
+  dscl . -create "/Users/${BREWAU_USER}" UserShell /usr/bin/false
+  dscl . -create "/Users/${BREWAU_USER}" Password "*"
+  dscl . -create "/Users/${BREWAU_USER}" IsHidden 1
+}
+
+ensure_users_group() {
+  if ! dscl . -read "/Groups/${BREWAU_USERS_GROUP}" >/dev/null 2>&1; then
+    log "creating group ${BREWAU_USERS_GROUP}"
+    dseditgroup -o create -r "brewau users" "${BREWAU_USERS_GROUP}"
+  fi
+}
+
+allow_user() {
+  local user="$1"
+  id "${user}" >/dev/null 2>&1 || brewau_die "no such user: ${user}"
+  ensure_users_group
+  dseditgroup -o edit -a "${user}" -t user "${BREWAU_USERS_GROUP}"
+  log "granted brew access to ${user}"
+}
+
+deny_user() {
+  local user="$1"
+  dseditgroup -o edit -d "${user}" -t user "${BREWAU_USERS_GROUP}"
+  log "revoked brew access from ${user}"
+}
+
+ensure_dirs() {
+  install -d -o root -g wheel -m 0755 "${BREWAU_ROOT}" "${BREWAU_ROOT}/etc" "${BREWAU_VAR}"
+  install -d -o "${BREWAU_USER}" -g "${BREWAU_GROUP}" -m 0755 \
+    "${BREWAU_HOME}" "${BREWAU_LOG_DIR}" "${BREWAU_STATE_DIR}"
+  local logfile
+  for logfile in "${BREWAU_LOG_DIR}/upgrade.log" "${BREWAU_AUDIT_LOG}"; do
+    [[ -f "${logfile}" ]] || install -o "${BREWAU_USER}" -g "${BREWAU_GROUP}" -m 0644 /dev/null "${logfile}"
+  done
+  # The policy and setup code must never be writable by _brewau or users.
+  chown -R root:wheel "${BREWAU_ROOT}/bin" "${BREWAU_ROOT}/libexec" "${BREWAU_ROOT}/share"
+  chmod -R go-w "${BREWAU_ROOT}/bin" "${BREWAU_ROOT}/libexec" "${BREWAU_ROOT}/share"
+}
+
+existing_third_party_taps() {
+  local dir user repo
+  for dir in "${HOMEBREW_PREFIX_PATH}"/Library/Taps/*/homebrew-*; do
+    [[ -d "${dir}" ]] || continue
+    user="$(basename "$(dirname "${dir}")")"
+    repo="$(basename "${dir}")"
+    repo="${repo#homebrew-}"
+    [[ "${user}" == "homebrew" ]] && continue
+    echo "${user}/${repo}"
+  done
+}
+
+ensure_config() {
+  [[ -f "${BREWAU_CONF}" ]] && return 0
+  local taps
+  taps="$(existing_third_party_taps | tr '\n' ' ' | sed 's/ *$//')"
+  sed "s|^ALLOWED_TAPS=\"\"|ALLOWED_TAPS=\"${taps}\"|" \
+    "${BREWAU_ROOT}/share/brewau.conf.default" >"${BREWAU_CONF}"
+  chown root:wheel "${BREWAU_CONF}"
+  chmod 0644 "${BREWAU_CONF}"
+  [[ -n "${taps}" ]] && log "allowed existing taps: ${taps}"
+  return 0
+}
+
+take_over_prefix() {
+  local owner
+  owner="$(stat -f%Su "${HOMEBREW_PREFIX_PATH}")"
+  if [[ "${owner}" != "${BREWAU_USER}" ]]; then
+    echo "${owner}" >"${ORIGINAL_OWNER_FILE}"
+    chown root:wheel "${ORIGINAL_OWNER_FILE}"
+    log "transferring ${HOMEBREW_PREFIX_PATH} from ${owner} to ${BREWAU_USER}"
+  fi
+  chown -hR "${BREWAU_USER}:admin" "${HOMEBREW_PREFIX_PATH}"
+  # Group/world write would let admins or users plant code that _brewau (and
+  # therefore root) executes.
+  find "${HOMEBREW_PREFIX_PATH}" ! -type l \( -perm -g+w -o -perm -o+w \) -exec chmod go-w {} +
+}
+
+write_sudoers() {
+  local tmp
+  tmp="$(mktemp /tmp/brewau-sudoers.XXXXXX)"
+  cat >"${tmp}" <<EOF
+# Managed by brewau. Regenerate with: sudo brewau reload
+# _brewau runs Homebrew; Homebrew elevates some cask steps with sudo -E.
+${BREWAU_USER} ALL=(root) NOPASSWD: ALL
+# Members of ${BREWAU_USERS_GROUP} may run brew, but only through the policy.
+%${BREWAU_USERS_GROUP} ALL=(${BREWAU_USER}) NOPASSWD: ${BREWAU_LIBEXEC}/brew-policy
+%${BREWAU_USERS_GROUP} ALL=(root) NOPASSWD: /bin/launchctl kickstart system/${BREWAU_LABEL}
+EOF
+  if ! visudo -cqf "${tmp}"; then
+    rm -f "${tmp}"
+    brewau_die "generated sudoers file failed validation; not installed"
+  fi
+  install -o root -g wheel -m 0440 "${tmp}" "${BREWAU_SUDOERS}"
+  rm -f "${tmp}"
+}
+
+write_launchdaemon() {
+  local hour="${UPGRADE_HOUR}" minute="${UPGRADE_MINUTE}"
+  [[ "${hour}" =~ ^[0-9]+$ && ${hour} -le 23 ]] || brewau_die "UPGRADE_HOUR must be 0-23"
+  [[ "${minute}" =~ ^[0-9]+$ && ${minute} -le 59 ]] || brewau_die "UPGRADE_MINUTE must be 0-59"
+  cat >"${BREWAU_PLIST}.tmp" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>${BREWAU_LABEL}</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>${BREWAU_LIBEXEC}/brewau-upgrade</string>
+  </array>
+  <key>UserName</key>
+  <string>${BREWAU_USER}</string>
+  <key>GroupName</key>
+  <string>${BREWAU_GROUP}</string>
+  <key>StartCalendarInterval</key>
+  <dict>
+    <key>Hour</key>
+    <integer>${hour}</integer>
+    <key>Minute</key>
+    <integer>${minute}</integer>
+  </dict>
+  <key>StandardOutPath</key>
+  <string>${BREWAU_LOG_DIR}/upgrade.log</string>
+  <key>StandardErrorPath</key>
+  <string>${BREWAU_LOG_DIR}/upgrade.log</string>
+  <key>ProcessType</key>
+  <string>Background</string>
+  <key>LowPriorityIO</key>
+  <true/>
+</dict>
+</plist>
+EOF
+  plutil -lint -s "${BREWAU_PLIST}.tmp" || brewau_die "generated LaunchDaemon plist is invalid"
+  chown root:wheel "${BREWAU_PLIST}.tmp"
+  chmod 0644 "${BREWAU_PLIST}.tmp"
+  launchctl bootout "system/${BREWAU_LABEL}" 2>/dev/null || true
+  mv -f "${BREWAU_PLIST}.tmp" "${BREWAU_PLIST}"
+  launchctl bootstrap system "${BREWAU_PLIST}"
+  log "scheduled daily upgrade at $(printf '%02d:%02d' "${hour}" "${minute}")"
+}
+
+write_system_files() {
+  echo "${BREWAU_ROOT}/bin" >"${BREWAU_PATHS_D}"
+  chmod 0644 "${BREWAU_PATHS_D}"
+  cat >"${NEWSYSLOG_CONF}" <<EOF
+# logfilename                          [owner:group]    mode count size(KB) when flags
+${BREWAU_LOG_DIR}/upgrade.log    ${BREWAU_USER}:${BREWAU_GROUP} 644  5     1024     *    NJ
+${BREWAU_AUDIT_LOG}      ${BREWAU_USER}:${BREWAU_GROUP} 644  5     1024     *    NJ
+EOF
+  chmod 0644 "${NEWSYSLOG_CONF}"
+}
+
+cmd_reload() {
+  require_root
+  brewau_load_config
+  write_sudoers
+  write_launchdaemon
+}
+
+cmd_install() {
+  require_root
+  [[ -x "${HOMEBREW_BIN}" ]] ||
+    brewau_die "Homebrew was not found at ${HOMEBREW_PREFIX_PATH}. Install Homebrew first: https://brew.sh"
+
+  ensure_service_account
+  ensure_users_group
+  ensure_dirs
+  ensure_config
+  brewau_load_config
+
+  local user users=("$@")
+  if [[ ${#users[@]} -eq 0 ]]; then
+    user="$(console_user)"
+    [[ -n "${user}" ]] && users+=("${user}")
+    if [[ -f "${ORIGINAL_OWNER_FILE}" ]]; then
+      users+=("$(cat "${ORIGINAL_OWNER_FILE}")")
+    else
+      users+=("$(stat -f%Su "${HOMEBREW_PREFIX_PATH}")")
+    fi
+  fi
+
+  take_over_prefix
+  local granted=" "
+  for user in "${users[@]}"; do
+    [[ "${user}" == "${BREWAU_USER}" || "${user}" == "root" ]] && continue
+    [[ "${granted}" == *" ${user} "* ]] && continue
+    allow_user "${user}"
+    granted="${granted}${user} "
+  done
+
+  write_system_files
+  write_sudoers
+  write_launchdaemon
+  dscacheutil -flushcache 2>/dev/null || true
+
+  log "installed. Open a new terminal; \`brew\` now runs through brewau."
+  log "if your shell profile runs \`/opt/homebrew/bin/brew shellenv\`, run \`/opt/brewau/bin/brewau setup-shell\`."
+}
+
+cmd_uninstall() {
+  require_root
+  local owner=""
+  [[ -f "${ORIGINAL_OWNER_FILE}" ]] && owner="$(cat "${ORIGINAL_OWNER_FILE}")"
+  [[ -z "${owner}" ]] && owner="$(console_user)"
+
+  launchctl bootout "system/${BREWAU_LABEL}" 2>/dev/null || true
+  rm -f "${BREWAU_PLIST}" "${BREWAU_SUDOERS}" "${BREWAU_PATHS_D}" "${NEWSYSLOG_CONF}"
+
+  if [[ -n "${owner}" ]] && id "${owner}" >/dev/null 2>&1 && [[ -d "${HOMEBREW_PREFIX_PATH}" ]]; then
+    log "returning ${HOMEBREW_PREFIX_PATH} to ${owner}"
+    chown -hR "${owner}:admin" "${HOMEBREW_PREFIX_PATH}"
+  else
+    log "WARNING: could not determine original owner; ${HOMEBREW_PREFIX_PATH} is still owned by ${BREWAU_USER}"
+    log "fix with: sudo chown -hR <you>:admin ${HOMEBREW_PREFIX_PATH}"
+  fi
+
+  dscl . -delete "/Users/${BREWAU_USER}" 2>/dev/null || true
+  dscl . -delete "/Groups/${BREWAU_GROUP}" 2>/dev/null || true
+  dseditgroup -o delete "${BREWAU_USERS_GROUP}" 2>/dev/null || true
+  rm -rf "${BREWAU_ROOT}"
+  pkgutil --forget "${PKG_ID}" >/dev/null 2>&1 || true
+  dscacheutil -flushcache 2>/dev/null || true
+  log "uninstalled. Homebrew at ${HOMEBREW_PREFIX_PATH} is vanilla again."
+}
+
+case "${1:-}" in
+  install) shift; cmd_install "$@" ;;
+  reload) cmd_reload ;;
+  allow-user) require_root; allow_user "${2:?user required}" ;;
+  deny-user) require_root; deny_user "${2:?user required}" ;;
+  uninstall) cmd_uninstall ;;
+  *) brewau_die "usage: brewau-setup install|reload|allow-user|deny-user|uninstall" ;;
+esac

@@ -1,0 +1,40 @@
+#!/bin/bash -p
+# brewau wrapper: runs brew as the isolated _brewau account through the
+# brew-policy enforcer. Install this directory first in PATH.
+
+BREWAU_ROOT="/opt/brewau"
+POLICY="${BREWAU_ROOT}/libexec/brew-policy"
+
+case "${1:-}" in
+  shellenv)
+    # Same output as Homebrew's shellenv, but keeps this wrapper first in PATH.
+    shell="${2:-$(basename "${SHELL:-zsh}")}"
+    shell="${shell#-}"
+    /opt/homebrew/bin/brew shellenv "${shell}" 2>/dev/null
+    case "${shell}" in
+      fish) echo "fish_add_path --global --move --path ${BREWAU_ROOT}/bin;" ;;
+      csh | tcsh) echo "setenv PATH ${BREWAU_ROOT}/bin:\$PATH;" ;;
+      *) echo "export PATH=\"${BREWAU_ROOT}/bin:\${PATH}\";" ;;
+    esac
+    exit 0
+    ;;
+esac
+
+if [[ "$(id -u)" -eq 0 ]]; then
+  echo "brewau: do not run brew as root; run it as your normal user." >&2
+  exit 1
+fi
+
+case " $(id -Gn) " in
+  *" brewau_users "*) ;;
+  *)
+    echo "brewau: $(id -un) is not allowed to use brew on this Mac." >&2
+    echo "brewau: an administrator can grant access with: sudo brewau allow-user $(id -un)" >&2
+    exit 1
+    ;;
+esac
+
+# _brewau cannot read most users' working directories, and the policy rejects
+# paths anyway, so start from / to avoid getcwd errors.
+cd / || exit 1
+exec /usr/bin/sudo -n -u _brewau -- "${POLICY}" "$@"
