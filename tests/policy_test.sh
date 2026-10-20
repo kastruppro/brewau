@@ -85,6 +85,29 @@ expect deny -v developer on
 expect deny -v services start postgresql
 expect deny -v x wget
 
+# brew services runs as root, so only ALLOWED_SERVICES and safe actions pass.
+ALLOWED_SERVICES="tailscale"
+expect allow services
+expect allow services list
+expect allow services list --json
+expect allow services start tailscale
+expect allow services restart tailscale
+expect allow services stop tailscale
+expect allow services info tailscale --json
+expect allow -v services start tailscale
+expect deny services start redis
+expect deny services start tailscale redis
+expect deny services start
+expect deny services list tailscale
+expect deny services start tailscale --file=/tmp/evil.plist
+expect deny services start --file=/tmp/evil.plist tailscale
+expect deny services start tailscale --sudo-service-user=root
+expect deny services start tailscale --json
+expect deny services cleanup
+expect deny services start ../tailscale
+expect deny services start acme/tools/tailscale
+ALLOWED_SERVICES=""
+
 # Taps outside the allowlist.
 expect deny tap evil/tap
 expect deny tap acme/tools https://evil.example/tools.git

@@ -34,6 +34,12 @@ case " $(id -Gn) " in
     ;;
 esac
 
+# Services run as the user unless they are in ALLOWED_SERVICES; that script
+# routes system services through the policy itself.
+if [[ "${1:-}" == "services" || ("${1:-}" == "-v" && "${2:-}" == "services") ]]; then
+  exec /bin/bash -p "${BREWAU_ROOT}/libexec/brewau-services" "$@"
+fi
+
 # _brewau cannot read most users' working directories, and the policy rejects
 # paths anyway, so start from / to avoid getcwd errors.
 cd / || exit 1

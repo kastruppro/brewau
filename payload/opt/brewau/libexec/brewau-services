@@ -1,0 +1,138 @@
+#!/bin/bash -p
+# brewau-services: `brew services`, invoked by the brew wrapper as the user.
+#
+# Formulae in ALLOWED_SERVICES run as root system daemons; those calls go
+# through brew-policy, which enforces the list. Every other service runs as
+# the calling user, exactly as with vanilla Homebrew, so this part needs no
+# privileges. The one difference: the user cannot write to /opt/homebrew/var,
+# so paths there (logs, data, working directory) are moved to the user's own
+# BREWAU_USER_VAR in the generated LaunchAgent.
+
+set -u
+
+# Never trust the caller's PATH, as in the privileged scripts.
+PATH="/usr/bin:/bin:/usr/sbin:/sbin"
+export PATH
+
+BREWAU_LIBEXEC="/opt/brewau/libexec"
+# shellcheck source=common.sh
+source "${BREWAU_LIBEXEC}/common.sh"
+
+POLICY="${BREWAU_LIBEXEC}/brew-policy"
+PREFIX_VAR="${HOMEBREW_PREFIX_PATH}/var"
+BREWAU_USER_VAR="${BREWAU_USER_VAR:-${HOME}/Library/Application Support/brewau/var}"
+LAUNCH_AGENTS="${LAUNCH_AGENTS:-${HOME}/Library/LaunchAgents}"
+
+# Homebrew run as the user, like vanilla Homebrew. It never writes to the
+# prefix for `brew services`, and running as the user grants nothing.
+user_brew() {
+  (cd / && HOMEBREW_NO_AUTO_UPDATE=1 "${HOMEBREW_BIN}" "$@")
+}
+
+system_services() {
+  (cd / && /usr/bin/sudo -n -u "${BREWAU_USER}" -- "${POLICY}" services "$@")
+}
+
+requires_root() {
+  local json
+  json="$(user_brew info --json=v2 --formula "$1" 2>/dev/null)" || return 1
+  [[ "$(plutil -extract formulae.0.service.require_root raw -o - - <<<"${json}" 2>/dev/null)" == "true" ]]
+}
+
+# Prints every string value in plist $1 (ProgramArguments, environment
+# variables, paths), one per line.
+plist_strings() {
+  plutil -convert xml1 -o - "$1" 2>/dev/null |
+    sed -n 's#.*<string>\(.*\)</string>.*#\1#p' |
+    sed 's#&amp;#\&#g; s#&lt;#<#g; s#&gt;#>#g'
+}
+
+# Points a Homebrew LaunchAgent at BREWAU_USER_VAR instead of the prefix's
+# var directory and reloads it. Idempotent.
+relocate_agent() {
+  local plist="$1" label key path missing=""
+  grep -qF "${PREFIX_VAR}" "${plist}" || return 0
+  label="$(plutil -extract Label raw -o - "${plist}" 2>/dev/null)" || return 0
+
+  local i
+  launchctl bootout "gui/$(id -u)/${label}" 2>/dev/null
+  # bootout returns before the job is gone, and bootstrap fails until it is.
+  for ((i = 0; i < 25; i++)); do
+    launchctl print "gui/$(id -u)/${label}" >/dev/null 2>&1 || break
+    sleep 0.2
+  done
+  brewau_rewrite_file "${plist}" brewau_replace_literal "${PREFIX_VAR}" "${BREWAU_USER_VAR}"
+  plutil -lint -s "${plist}" || { echo "brewau: ${plist} became invalid; not loading it" >&2; return 1; }
+
+  mkdir -p "${BREWAU_USER_VAR}/log"
+  for key in StandardOutPath StandardErrorPath; do
+    path="$(plutil -extract "${key}" raw -o - "${plist}" 2>/dev/null)" && mkdir -p "$(dirname "${path}")"
+  done
+  path="$(plutil -extract WorkingDirectory raw -o - "${plist}" 2>/dev/null)" && mkdir -p "${path}"
+
+  # Data directories (e.g. a database cluster) cannot be created generically;
+  # name the ones the service expects but that do not exist yet.
+  while IFS= read -r path; do
+    path="${path#*=}"
+    [[ "${path}" == "${BREWAU_USER_VAR}"/* && ! -e "${path}" ]] && missing="${missing}    ${path}"$'\n'
+  done < <(plist_strings "${plist}")
+
+  launchctl bootstrap "gui/$(id -u)" "${plist}" 2>/dev/null || true
+  echo "brewau: ${label#homebrew.mxcl.} runs as $(id -un); its files from ${PREFIX_VAR} are in ${BREWAU_USER_VAR}"
+  if [[ -n "${missing}" ]]; then
+    printf 'brewau: these paths do not exist yet; the service may need them created or initialised first:\n%s' "${missing}"
+  fi
+}
+
+relocate_agents() {
+  local plist
+  for plist in "${LAUNCH_AGENTS}"/homebrew.mxcl.*.plist; do
+    [[ -f "${plist}" ]] && relocate_agent "${plist}"
+  done
+  return 0
+}
+
+main() {
+  local action name="" arg rc
+  # brew.sh moves a leading -v to the end; do the same.
+  [[ "${1:-}" == "-v" && $# -gt 1 ]] && { shift; set -- "$@" -v; }
+  [[ "${1:-}" == "services" ]] && shift
+  action="${1:-list}"
+  for arg in "${@:2}"; do
+    [[ "${arg}" == -* ]] || { name="${arg}"; break; }
+  done
+  brewau_load_config
+
+  case "${action}" in
+    list)
+      user_brew services "$@"
+      rc=$?
+      if [[ -n "${ALLOWED_SERVICES}" ]]; then
+        echo
+        echo "System services (root; ALLOWED_SERVICES):"
+        system_services "$@" || rc=$?
+      fi
+      return "${rc}"
+      ;;
+    info | start | stop | restart | run | kill)
+      if [[ -n "${name}" ]] && brewau_service_allowed "${name}"; then
+        system_services "$@"
+        return
+      fi
+      if [[ -n "${name}" && "${action}" =~ ^(start|restart|run)$ ]] && requires_root "${name}"; then
+        echo "brewau: ${name} needs to run as root, and is not in ALLOWED_SERVICES." >&2
+        echo "brewau: an administrator can allow it: sudo brewau config (ALLOWED_SERVICES=\"${name}\")" >&2
+        return 1
+      fi
+      ;;
+  esac
+
+  user_brew services "$@"
+  rc=$?
+  case "${action}" in start | restart | run) relocate_agents ;; esac
+  return "${rc}"
+}
+
+if [[ -z "${BREWAU_SERVICES_TEST:-}" ]]; then
+  main "$@"
+fi

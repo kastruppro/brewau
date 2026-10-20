@@ -1,0 +1,5 @@
+# Globals are defined in common.sh (or by tests) and used by the code that
+# sources it, which shellcheck cannot see across files.
+disable=SC2034
+# common.sh is sourced from its installed path, /opt/brewau/libexec.
+disable=SC1091

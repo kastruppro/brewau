@@ -19,6 +19,8 @@ BREWAU_STATE_DIR="${BREWAU_VAR}/state"
 BREWAU_AUDIT_LOG="${BREWAU_LOG_DIR}/audit.log"
 
 HOMEBREW_PREFIX_PATH="/opt/homebrew"
+# Where casks put apps. Overridden only by tests.
+BREWAU_APPDIR="${BREWAU_APPDIR:-/Applications}"
 HOMEBREW_BIN="${HOMEBREW_PREFIX_PATH}/bin/brew"
 
 # Taps that are always trusted. Everything else must be listed in
@@ -33,6 +35,7 @@ EXTRA_ALLOWED_OPTIONS=""
 AUTO_UPGRADE="1"
 UPGRADE_GREEDY="1"
 UPGRADE_EXCLUDE=""
+ALLOWED_SERVICES=""
 UPGRADE_HOUR="4"
 UPGRADE_MINUTE="0"
 
@@ -60,7 +63,7 @@ brewau_load_config() {
     [[ "${value}" =~ ^[A-Za-z0-9@/._+=[:space:]-]*$ ]] || brewau_die "invalid value for ${key} in ${file}"
     case "${key}" in
       ALLOWED_TAPS | FORBIDDEN_FORMULAE | FORBIDDEN_CASKS | EXTRA_ALLOWED_OPTIONS | \
-        AUTO_UPGRADE | UPGRADE_GREEDY | UPGRADE_EXCLUDE | UPGRADE_HOUR | UPGRADE_MINUTE)
+        AUTO_UPGRADE | UPGRADE_GREEDY | UPGRADE_EXCLUDE | UPGRADE_HOUR | UPGRADE_MINUTE | ALLOWED_SERVICES)
         printf -v "${key}" '%s' "${value}"
         ;;
       *) echo "brewau: ignoring unknown config key ${key}" >&2 ;;
@@ -75,8 +78,12 @@ brewau_check_config() {
   local file="$1"
   [[ "${AUTO_UPGRADE}" == "0" || "${AUTO_UPGRADE}" == "1" ]] || brewau_die "AUTO_UPGRADE must be 0 or 1 in ${file}"
   [[ "${UPGRADE_GREEDY}" == "0" || "${UPGRADE_GREEDY}" == "1" ]] || brewau_die "UPGRADE_GREEDY must be 0 or 1 in ${file}"
-  [[ "${UPGRADE_HOUR}" =~ ^[0-9]{1,2}$ && 10#${UPGRADE_HOUR} -le 23 ]] || brewau_die "UPGRADE_HOUR must be 0-23 in ${file}"
-  [[ "${UPGRADE_MINUTE}" =~ ^[0-9]{1,2}$ && 10#${UPGRADE_MINUTE} -le 59 ]] || brewau_die "UPGRADE_MINUTE must be 0-59 in ${file}"
+  [[ "${UPGRADE_HOUR}" =~ ^[0-9]{1,2}$ ]] && ((10#${UPGRADE_HOUR} <= 23)) || brewau_die "UPGRADE_HOUR must be 0-23 in ${file}"
+  [[ "${UPGRADE_MINUTE}" =~ ^[0-9]{1,2}$ ]] && ((10#${UPGRADE_MINUTE} <= 59)) || brewau_die "UPGRADE_MINUTE must be 0-59 in ${file}"
+  local name
+  for name in ${ALLOWED_SERVICES}; do
+    [[ "${name}" =~ ^[A-Za-z0-9][A-Za-z0-9@._+-]*$ ]] || brewau_die "ALLOWED_SERVICES entries must be formula names in ${file}"
+  done
   return 0
 }
 
@@ -90,18 +97,42 @@ brewau_tap_allowed() {
   return 1
 }
 
+# True if formula $1 may run its service as a root system daemon.
+brewau_service_allowed() {
+  local word
+  for word in ${ALLOWED_SERVICES}; do
+    [[ "${word}" == "$1" ]] && return 0
+  done
+  return 1
+}
+
 # Taps that are installed but not allowed. Unqualified names and dependencies
 # can resolve to any installed tap, so these are passed to Homebrew as
-# HOMEBREW_FORBIDDEN_TAPS and enforced by brew itself.
+# HOMEBREW_FORBIDDEN_TAPS and enforced by brew itself. Homebrew matches a
+# user/repo entry only against taps with the default GitHub remote, so taps
+# with a custom remote are listed by their remote URL.
 brewau_forbidden_taps() {
-  local dir user repo tap out=""
+  local dir user repo tap remote ref out=""
   for dir in "${HOMEBREW_PREFIX_PATH}"/Library/Taps/*/homebrew-*; do
     [[ -d "${dir}" ]] || continue
     user="$(basename "$(dirname "${dir}")")"
     repo="$(basename "${dir}")"
-    tap="${user}/${repo#homebrew-}"
-    [[ "${tap}" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || continue
-    brewau_tap_allowed "${tap}" || out="${out:+${out} }${tap}"
+    repo="${repo#homebrew-}"
+    tap="${user}/${repo}"
+    brewau_tap_allowed "${tap}" && continue
+    ref="${tap}"
+    # Read the config file directly: `git -C` refuses repositories owned by
+    # someone else, and this also runs as the user in `brewau doctor`.
+    remote="$(git config --file "${dir}/.git/config" --get remote.origin.url 2>/dev/null || true)"
+    remote="${remote%/}"
+    case "$(brewau_lower "${remote%.git}")" in
+      "" | "https://github.com/$(brewau_lower "${user}/homebrew-${repo}")") ;;
+      *) ref="${remote}" ;;
+    esac
+    # A reference Homebrew could misparse would leave the tap unblocked, so
+    # refuse to run at all rather than pass it on.
+    [[ "${ref}" =~ ^[A-Za-z0-9@:/._+~%=-]+$ ]] || brewau_die "cannot block tap ${tap}: unexpected remote ${remote}"
+    out="${out:+${out} }${ref}"
   done
   echo "${out}"
 }
@@ -118,7 +149,7 @@ brewau_cask_app_paths() {
     for ((j = 0; j < artifacts; j++)); do
       plutil -extract "casks.${i}.artifacts.${j}.app" raw -o - "${json}" >/dev/null 2>&1 || continue
       target="$(plutil -extract "casks.${i}.artifacts.${j}.target" raw -o - "${json}" 2>/dev/null)" || continue
-      [[ "${target}" == /Applications/*.app && "${target}" != *..* ]] || continue
+      [[ "${target}" == "${BREWAU_APPDIR}"/*.app && "${target}" != *..* ]] || continue
       [[ -d "${target}" && ! -L "${target}" ]] && echo "${target}"
     done
   done
@@ -133,33 +164,87 @@ brewau_protect_apps() {
   local json="$1" app
   shift
   while IFS= read -r app; do
-    if [[ -n "$(find "${app}" ! -type l \( ! -user root ! -user "${BREWAU_USER}" -o -perm -g+w -o -perm -o+w \) -print 2>/dev/null | head -1)" ]]; then
-      echo "brewau: protecting ${app}"
-      "$@" /usr/bin/find "${app}" ! -user root ! -user "${BREWAU_USER}" -exec /usr/sbin/chown -h "${BREWAU_USER}:admin" {} + </dev/null ||
-        echo "brewau: WARNING: could not take ownership of ${app} (App Management permission?)" >&2
-      "$@" /usr/bin/find "${app}" ! -type l \( -perm -g+w -o -perm -o+w \) -exec /bin/chmod go-w {} + </dev/null || true
-    fi
+    brewau_app_needs_protection "${app}" || continue
+    echo "brewau: protecting ${app}"
+    "$@" /usr/bin/find "${app}" ! -user root ! -user "${BREWAU_USER}" -exec /usr/sbin/chown -h "${BREWAU_USER}:admin" {} + </dev/null ||
+      echo "brewau: WARNING: could not take ownership of ${app} (App Management permission?)" >&2
+    "$@" /usr/bin/find "${app}" ! -type l \( -perm -g+w -o -perm -o+w \) -exec /bin/chmod go-w {} + </dev/null || true
+    # chmod go-w leaves ACL entries alone, and an ACL can grant write too.
+    "$@" /usr/bin/find "${app}" ! -type l -acl -exec /bin/chmod -N {} + </dev/null || true
   done < <(brewau_cask_app_paths "${json}")
+}
+
+# True if anything in the app is owned by someone other than root/_brewau, is
+# group/world-writable, or carries an ACL (which can grant write access).
+brewau_app_needs_protection() {
+  [[ -n "$(find "$1" ! -type l \( ! -user root ! -user "${BREWAU_USER}" -o -perm -g+w -o -perm -o+w -o -acl \) -print 2>/dev/null | head -1)" ]]
+}
+
+# Runs a filter command over a file and writes the result back in place, so
+# symlinked files (stow, chezmoi, ...) stay symlinks and keep their owner.
+brewau_rewrite_file() {
+  local file="$1" tmp
+  shift
+  tmp="$(mktemp "${TMPDIR:-/tmp}/brewau-rewrite.XXXXXX")" || return 1
+  if "$@" <"${file}" >"${tmp}"; then
+    cmp -s "${tmp}" "${file}" || cat "${tmp}" >"${file}"
+  fi
+  rm -f "${tmp}"
+}
+
+# Filter for brewau_rewrite_file: replaces every occurrence of $1 with $2,
+# literally (no regex or sed escaping involved).
+brewau_replace_literal() {
+  awk -v from="$1" -v to="$2" '{
+    out = ""
+    while ((i = index($0, from)) > 0) {
+      out = out substr($0, 1, i - 1) to
+      $0 = substr($0, i + length(from))
+    }
+    print out $0
+  }'
 }
 
 # Run brew as the current (_brewau) user with a fully reset environment.
 # Extra NAME=value pairs passed via BREWAU_PASSTHROUGH_ENV are appended.
 brewau_exec_brew() {
+  _brewau_exec_brew "${BREWAU_USER}" "$@"
+}
+
+# Run brew as root, for `brew services` on ALLOWED_SERVICES (system daemons).
+# Homebrew permits root only for `brew services`. Root gets its own HOME and
+# temp directory so it never leaves root-owned files where _brewau works.
+brewau_exec_brew_as_root() {
+  _brewau_exec_brew root "$@"
+}
+
+_brewau_exec_brew() {
+  local as="$1" home="${BREWAU_HOME}" tmp="${BREWAU_TMP}" forbidden_taps
+  local sudo=()
+  shift
   cd / || exit 1
+  # sudo already never lowers the umask below 022; do not rely on its config.
+  umask 022
+  forbidden_taps="$(brewau_forbidden_taps)" || exit 1
+  if [[ "${as}" == "root" ]]; then
+    home="/var/root"
+    tmp="/private/tmp"
+    sudo=(/usr/bin/sudo -n)
+  fi
   # shellcheck disable=SC2086
-  exec /usr/bin/env -i \
-    HOME="${BREWAU_HOME}" \
-    USER="${BREWAU_USER}" \
-    LOGNAME="${BREWAU_USER}" \
+  exec ${sudo[@]+"${sudo[@]}"} /usr/bin/env -i \
+    HOME="${home}" \
+    USER="${as}" \
+    LOGNAME="${as}" \
     SHELL=/bin/bash \
     PATH="${HOMEBREW_PREFIX_PATH}/bin:${HOMEBREW_PREFIX_PATH}/sbin:/usr/bin:/bin:/usr/sbin:/sbin" \
-    TMPDIR="${BREWAU_TMP}" \
-    HOMEBREW_TEMP="${BREWAU_TMP}" \
+    TMPDIR="${tmp}" \
+    HOMEBREW_TEMP="${tmp}" \
     HOMEBREW_NO_ENV_HINTS=1 \
     HOMEBREW_FORBID_PACKAGES_FROM_PATHS=1 \
     HOMEBREW_FORBIDDEN_FORMULAE="${FORBIDDEN_FORMULAE}" \
     HOMEBREW_FORBIDDEN_CASKS="${FORBIDDEN_CASKS}" \
-    HOMEBREW_FORBIDDEN_TAPS="$(brewau_forbidden_taps)" \
+    HOMEBREW_FORBIDDEN_TAPS="${forbidden_taps}" \
     ${BREWAU_PASSTHROUGH_ENV} \
     "${HOMEBREW_BIN}" "$@"
 }

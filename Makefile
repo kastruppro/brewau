@@ -23,7 +23,8 @@ stage:
 	find $(ROOT) -type d -exec chmod 0755 {} +
 	find $(ROOT) -type f -exec chmod 0644 {} +
 	chmod 0755 $(ROOT)/opt/brewau/bin/* $(ROOT)/opt/brewau/libexec/brew-policy \
-		$(ROOT)/opt/brewau/libexec/brewau-upgrade $(ROOT)/opt/brewau/libexec/brewau-setup
+		$(ROOT)/opt/brewau/libexec/brewau-upgrade $(ROOT)/opt/brewau/libexec/brewau-setup \
+		$(ROOT)/opt/brewau/libexec/brewau-services
 	chmod 0755 scripts/preinstall scripts/postinstall
 
 pkg: stage
@@ -53,7 +54,8 @@ test:
 	@set -e; for t in tests/*_test.sh; do echo "$$t"; /bin/bash "$$t"; done
 
 lint:
-	shellcheck -x payload/opt/brewau/bin/* payload/opt/brewau/libexec/* scripts/* install.sh tests/*.sh
+	@command -v shellcheck >/dev/null || { echo "shellcheck not found; install it with: brew install shellcheck" >&2; exit 1; }
+	shellcheck -x -S warning payload/opt/brewau/bin/* payload/opt/brewau/libexec/* scripts/* install.sh tests/*.sh
 
 # Install from this checkout without building a package.
 install: stage

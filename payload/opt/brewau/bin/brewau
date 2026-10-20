@@ -3,6 +3,13 @@
 
 set -u
 
+# Keep the user's PATH only for `doctor` and the editor in `config`.
+USER_PATH="${PATH:-}"
+# Never trust the caller's PATH: sudo passes it through, so a program planted
+# in it would run with this script's privileges.
+PATH="/usr/bin:/bin:/usr/sbin:/sbin"
+export PATH
+
 BREWAU_LIBEXEC="/opt/brewau/libexec"
 # shellcheck source=../libexec/common.sh
 source "${BREWAU_LIBEXEC}/common.sh"
@@ -48,10 +55,10 @@ cmd_status() {
   brewau_load_config
   echo "brewau ${VERSION}"
   if [[ "${AUTO_UPGRADE}" == "1" ]]; then
-    printf 'Schedule:   daily at %02d:%02d%s\n' "${UPGRADE_HOUR}" "${UPGRADE_MINUTE}" \
+    printf 'Schedule:   daily at %02d:%02d%s\n' "$((10#${UPGRADE_HOUR}))" "$((10#${UPGRADE_MINUTE}))" \
       "$([[ "${UPGRADE_GREEDY}" == "1" ]] && echo " (including self-updating casks)")"
   else
-    echo "Schedule:   disabled (AUTO_UPGRADE=0)"
+    echo "Schedule:   disabled (AUTO_UPGRADE=0); start one by hand with: brewau run"
   fi
   if [[ -r "${BREWAU_STATE_DIR}/last-run" ]]; then
     local finished status upgraded
@@ -72,8 +79,12 @@ cmd_status() {
 }
 
 cmd_run() {
-  /usr/bin/sudo -n /bin/launchctl kickstart "system/${BREWAU_LABEL}" ||
-    brewau_die "could not start the upgrade (are you in ${BREWAU_USERS_GROUP}?)"
+  local err
+  in_users_group || brewau_die "$(id -un) is not in ${BREWAU_USERS_GROUP}; ask an administrator to run: sudo brewau allow-user $(id -un)"
+  if ! err="$(/usr/bin/sudo -n /bin/launchctl kickstart "system/${BREWAU_LABEL}" 2>&1)"; then
+    daemon_loaded || brewau_die "the upgrade daemon is not loaded; run: sudo brewau reload"
+    brewau_die "could not start the upgrade: ${err:-launchctl failed}"
+  fi
   echo "Upgrade started. Follow it with: brewau log -f"
 }
 
@@ -96,7 +107,7 @@ cmd_log() {
 cmd_doctor() {
   FAILED=0
   local brew_path owner writable
-  brew_path="$(command -v brew || true)"
+  brew_path="$(PATH="${USER_PATH}" command -v brew || true)"
   if [[ "${brew_path}" == "${BREWAU_ROOT}/bin/brew" ]]; then
     ok "brew in PATH is the brewau wrapper"
   else
@@ -110,11 +121,11 @@ cmd_doctor() {
     bad "${HOMEBREW_PREFIX_PATH} is owned by ${owner:-nobody}; run: sudo brewau repair"
   fi
 
-  writable="$(find "${HOMEBREW_PREFIX_PATH}" -maxdepth 3 ! -type l \( -perm -g+w -o -perm -o+w \) 2>/dev/null | head -1)"
+  writable="$(find "${HOMEBREW_PREFIX_PATH}" -maxdepth 3 ! -type l \( -perm -g+w -o -perm -o+w -o -acl \) 2>/dev/null | head -1)"
   if [[ -z "${writable}" ]]; then
-    ok "no group/world-writable paths in ${HOMEBREW_PREFIX_PATH}"
+    ok "no group/world-writable or ACL'd paths in ${HOMEBREW_PREFIX_PATH}"
   else
-    bad "${writable} is group/world-writable; run: sudo brewau repair"
+    bad "${writable} is group/world-writable or has an ACL; run: sudo brewau repair"
   fi
 
   local env_file
@@ -151,6 +162,11 @@ cmd_doctor() {
   elif [[ "${AUTO_UPGRADE}" == "1" ]]; then
     echo "  - no scheduled run yet; start one with: brewau run"
   fi
+
+  if tail -n 500 "${BREWAU_LOG_DIR}/upgrade.log" 2>/dev/null |
+    grep -Eq 'Operation not permitted|could not take ownership'; then
+    bad "macOS blocked changes to apps (App Management); allow it for the upgrade job, e.g. with an MDM Privacy Preferences (PPPC) profile; see: brewau log"
+  fi
   return "${FAILED}"
 }
 
@@ -163,18 +179,6 @@ backup_once() {
   [[ -f "$1.brewau-backup" ]] || cp -p "$1" "$1.brewau-backup"
 }
 
-# Runs a filter command over a file and writes the result back in place, so
-# symlinked dotfiles (stow, chezmoi, ...) stay symlinks and keep their owner.
-rewrite_file() {
-  local file="$1" tmp
-  shift
-  tmp="$(mktemp "${TMPDIR:-/tmp}/brewau-profile.XXXXXX")" || return 1
-  if "$@" <"${file}" >"${tmp}"; then
-    cmp -s "${tmp}" "${file}" || cat "${tmp}" >"${file}"
-  fi
-  rm -f "${tmp}"
-}
-
 cmd_setup_shell() {
   local file rc shell
   # Point every `brew shellenv` (with or without the full path) at the wrapper.
@@ -182,7 +186,7 @@ cmd_setup_shell() {
     [[ -f "${file}" ]] || continue
     grep -Eq "${SHELLENV_RE}" "${file}" || continue
     backup_once "${file}"
-    rewrite_file "${file}" sed -E "s#${SHELLENV_RE}#\\1${BREWAU_ROOT}/bin/brew shellenv#g"
+    brewau_rewrite_file "${file}" sed -E "s#${SHELLENV_RE}#\\1${BREWAU_ROOT}/bin/brew shellenv#g"
     echo "updated ${file} (backup: ${file}.brewau-backup)"
   done
 
@@ -217,7 +221,7 @@ cmd_restore_shell() {
   for file in "${PROFILES[@]/#/${HOME}/}"; do
     [[ -f "${file}" ]] || continue
     grep -qF -e "${BREWAU_ROOT}/bin" "${file}" || continue
-    rewrite_file "${file}" awk -v marker="${PATH_MARKER}" \
+    brewau_rewrite_file "${file}" awk -v marker="${PATH_MARKER}" \
       -v from="${BREWAU_ROOT}/bin/brew shellenv" -v to="${HOMEBREW_BIN} shellenv" '
         drop { drop = 0; next }
         $0 == marker { drop = 1; if (blank) blank = ""; next }
@@ -242,7 +246,10 @@ cmd_config() {
   # Edit a copy and only install it once it parses; a broken live config
   # makes every brew command fail.
   while true; do
-    "${EDITOR:-vi}" "${tmp}"
+    # EDITOR may carry arguments (e.g. "code --wait"), and lives in the
+    # administrator's own PATH.
+    # shellcheck disable=SC2086
+    PATH="${USER_PATH}" ${EDITOR:-vi} "${tmp}"
     if (brewau_load_config "${tmp}"); then
       break
     fi

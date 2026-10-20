@@ -7,6 +7,11 @@
 
 set -u
 
+# Never trust the caller's PATH: sudo passes it through, so a program planted
+# in it would run with this script's privileges.
+PATH="/usr/bin:/bin:/usr/sbin:/sbin"
+export PATH
+
 BREWAU_LIBEXEC="/opt/brewau/libexec"
 # shellcheck source=common.sh
 source "${BREWAU_LIBEXEC}/common.sh"
@@ -52,29 +57,57 @@ without() {
 
 # `brew upgrade` also upgrades outdated dependencies of what it upgrades, so
 # leaving a formula off the command line does not exclude it. A pin does.
+# Reconciles against the actual pins every run, so a pin that disappeared
+# (brew unpin, reinstall) is put back. Fails if the pins cannot be verified.
 sync_exclude_pins() {
-  local installed pinned previous="" name kept=""
-  installed=" $(brew_run list --formula -1 2>/dev/null | tr '\n' ' ') "
-  pinned=" $(brew_run list --pinned 2>/dev/null | tr '\n' ' ') "
+  local installed pinned previous="" name kept="" result=0
+  installed="$(brew_run list --formula -1)" || return 1
+  pinned="$(brew_run list --pinned)" || return 1
+  installed=" $(echo ${installed}) "
+  pinned=" $(echo ${pinned}) "
   [[ -r "${EXCLUDE_PINS}" ]] && previous="$(cat "${EXCLUDE_PINS}")"
 
   for name in ${previous}; do
-    if in_words "${name}" "${UPGRADE_EXCLUDE}"; then
-      kept="${kept} ${name}"
-    elif [[ "${pinned}" == *" ${name} "* ]]; then
-      log "unpinning ${name} (no longer in UPGRADE_EXCLUDE)"
-      brew_run unpin "${name}" || kept="${kept} ${name}"
-    fi
+    in_words "${name}" "${UPGRADE_EXCLUDE}" && continue
+    [[ "${pinned}" == *" ${name} "* ]] || continue
+    log "unpinning ${name} (no longer in UPGRADE_EXCLUDE)"
+    brew_run unpin "${name}" || { kept="${kept} ${name}"; result=1; }
   done
   for name in ${UPGRADE_EXCLUDE}; do
     [[ "${installed}" == *" ${name} "* ]] || continue
-    in_words "${name}" "${kept}" && continue
-    # Already pinned by someone else: respect it, but do not take it over.
-    [[ "${pinned}" == *" ${name} "* ]] && continue
+    if [[ "${pinned}" == *" ${name} "* ]]; then
+      # Keep owning our own pins; a pin someone else made is respected but
+      # not taken over, so it is never unpinned by this job.
+      in_words "${name}" "${previous}" && kept="${kept} ${name}"
+      continue
+    fi
     log "pinning ${name} (UPGRADE_EXCLUDE)"
-    brew_run pin "${name}" && kept="${kept} ${name}"
+    if brew_run pin "${name}"; then
+      kept="${kept} ${name}"
+    else
+      result=1
+    fi
   done
   echo "${kept# }" >"${EXCLUDE_PINS}"
+  return "${result}"
+}
+
+# A system service keeps running the old binary after its formula is
+# upgraded, so restart the ones that are loaded.
+restart_system_services() {
+  local name
+  for name in "$@"; do
+    brewau_service_allowed "${name}" || continue
+    launchctl print "system/homebrew.mxcl.${name}" >/dev/null 2>&1 || continue
+    log "restarting system service ${name}"
+    (BREWAU_PASSTHROUGH_ENV="" brewau_exec_brew_as_root services restart "${name}") || log "could not restart ${name}"
+  done
+}
+
+# Homebrew leaves temp files behind when a cask fails; keep the directory small.
+clean_tmp() {
+  find "${BREWAU_TMP}" -mindepth 1 -maxdepth 1 -mtime +7 -exec rm -rf {} + 2>/dev/null
+  return 0
 }
 
 protect_apps() {
@@ -86,33 +119,48 @@ protect_apps() {
   rm -f "${json}"
 }
 
-main() {
-  [[ "$(id -un)" == "${BREWAU_USER}" ]] || brewau_die "brewau-upgrade must run as ${BREWAU_USER}"
-  brewau_load_config
-
-  if [[ "${AUTO_UPGRADE}" != "1" ]]; then
-    log "AUTO_UPGRADE is disabled; nothing to do"
-    exit 0
-  fi
-
-  local status="ok" greedy="" formulae casks pinned
+run_upgrade() {
+  local status="ok" greedy="" formulae="" casks="" pinned output
   [[ "${UPGRADE_GREEDY}" == "1" ]] && greedy="--greedy"
 
   log "brew update"
   brew_run update || status="update-failed"
 
-  sync_exclude_pins
-  pinned="$(brew_run list --pinned 2>/dev/null | tr '\n' ' ')"
+  # Without verified pins an excluded formula could be upgraded as a
+  # dependency, so formulae are skipped rather than risk it.
+  local formulae_ok=1
+  if ! sync_exclude_pins; then
+    log "could not verify UPGRADE_EXCLUDE pins"
+    status="pin-failed"
+    [[ -n "${UPGRADE_EXCLUDE}" ]] && formulae_ok=0
+  fi
 
-  # shellcheck disable=SC2046
-  formulae="$(without "${UPGRADE_EXCLUDE} ${pinned}" $(brew_run outdated --formula --quiet))"
-  # shellcheck disable=SC2046
-  casks="$(without "${UPGRADE_EXCLUDE}" $(brew_run outdated --cask --quiet ${greedy}))"
+  # Check each command's exit status: inside a substitution a failure would
+  # otherwise look like "nothing is outdated".
+  if [[ ${formulae_ok} -eq 1 ]]; then
+    if pinned="$(brew_run list --pinned)" && output="$(brew_run outdated --formula --quiet)"; then
+      # shellcheck disable=SC2086
+      formulae="$(without "${UPGRADE_EXCLUDE} $(echo ${pinned})" ${output})"
+    else
+      log "could not list outdated formulae"
+      status="outdated-failed"
+    fi
+  fi
+  # shellcheck disable=SC2086
+  if output="$(brew_run outdated --cask --quiet ${greedy})"; then
+    # shellcheck disable=SC2086
+    casks="$(without "${UPGRADE_EXCLUDE}" ${output})"
+  else
+    log "could not list outdated casks"
+    status="outdated-failed"
+  fi
 
   if [[ -n "${formulae}" ]]; then
     log "upgrading formulae: $(echo ${formulae})"
     # shellcheck disable=SC2086
     brew_run upgrade --formula ${formulae} || status="upgrade-failed"
+    # shellcheck disable=SC2086
+    restart_system_services ${formulae}
   fi
   if [[ -n "${casks}" ]]; then
     # Apps may have been replaced by their own updater since the last run.
@@ -121,14 +169,25 @@ main() {
     # shellcheck disable=SC2086
     brew_run upgrade --cask ${greedy} ${casks} || status="upgrade-failed"
   fi
-  [[ -z "${formulae}${casks}" ]] && log "everything is up to date"
+  [[ -z "${formulae}${casks}" && "${status}" == "ok" ]] && log "everything is up to date"
 
   log "brew cleanup"
   brew_run cleanup --prune=30 || true
+  clean_tmp
 
   write_state "${status}" "$(echo ${formulae} ${casks})"
   log "done (${status})"
   [[ "${status}" == "ok" ]]
 }
 
-main "$@"
+# With AUTO_UPGRADE=0 the LaunchDaemon has no schedule, so the job only runs
+# when started with `brewau run`.
+main() {
+  [[ "$(id -un)" == "${BREWAU_USER}" ]] || brewau_die "brewau-upgrade must run as ${BREWAU_USER}"
+  brewau_load_config
+  run_upgrade
+}
+
+if [[ -z "${BREWAU_UPGRADE_TEST:-}" ]]; then
+  main "$@"
+fi

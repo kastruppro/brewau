@@ -12,6 +12,11 @@ FORBIDDEN_CASKS=""
 # Additional brew options to allow beyond the built-in allowlist, e.g. "--no-binaries".
 EXTRA_ALLOWED_OPTIONS=""
 
+# Formulae whose `brew services` run as root system daemons (LaunchDaemons),
+# e.g. "tailscale". Anything listed runs as root, so only list services that
+# need it. Other services run as the user who starts them.
+ALLOWED_SERVICES=""
+
 # Scheduled unattended upgrades. Run `sudo brewau reload` after changing the time.
 AUTO_UPGRADE="1"
 # Also upgrade casks that update themselves (Chrome, Slack, ...).

@@ -10,6 +10,11 @@
 
 set -euo pipefail
 
+# Never trust the caller's PATH: sudo passes it through, so a program planted
+# in it would run with this script's privileges.
+PATH="/usr/bin:/bin:/usr/sbin:/sbin"
+export PATH
+
 BREWAU_LIBEXEC="/opt/brewau/libexec"
 # shellcheck source=common.sh
 source "${BREWAU_LIBEXEC}/common.sh"
@@ -110,12 +115,14 @@ allow_user() {
   id "${user}" >/dev/null 2>&1 || brewau_die "no such user: ${user}"
   ensure_users_group
   dseditgroup -o edit -a "${user}" -t user "${BREWAU_USERS_GROUP}"
+  dscacheutil -flushcache 2>/dev/null || true
   log "granted brew access to ${user}"
 }
 
 deny_user() {
   local user="$1"
   dseditgroup -o edit -d "${user}" -t user "${BREWAU_USERS_GROUP}"
+  dscacheutil -flushcache 2>/dev/null || true
   log "revoked brew access from ${user}"
 }
 
@@ -170,6 +177,9 @@ take_over_prefix() {
     log "transferring ${HOMEBREW_PREFIX_PATH} from ${owner} to ${BREWAU_USER}"
   fi
   chown -hR "${BREWAU_USER}:admin" "${HOMEBREW_PREFIX_PATH}"
+  # `brew services` creates its log directory before starting a service, which
+  # fails for users (they cannot write here), so make sure it exists.
+  install -d -o "${BREWAU_USER}" -g admin -m 0755 "${HOMEBREW_PREFIX_PATH}/var" "${HOMEBREW_PREFIX_PATH}/var/log"
   # Group/world write would let admins or users plant code that _brewau (and
   # therefore root) executes. Record the old modes for uninstall first.
   touch "${ORIGINAL_MODES_FILE}"
@@ -178,6 +188,12 @@ take_over_prefix() {
   find "${HOMEBREW_PREFIX_PATH}" ! -type l \( -perm -g+w -o -perm -o+w \) \
     -exec stat -f '%Lp %N' {} + >>"${ORIGINAL_MODES_FILE}"
   find "${HOMEBREW_PREFIX_PATH}" ! -type l \( -perm -g+w -o -perm -o+w \) -exec chmod go-w {} +
+  # chmod go-w leaves ACL entries alone, and an ACL the previous owner set can
+  # still grant them write access. Homebrew does not use ACLs.
+  if [[ -n "$(find "${HOMEBREW_PREFIX_PATH}" ! -type l -acl -print | head -1)" ]]; then
+    log "removing ACLs from ${HOMEBREW_PREFIX_PATH}"
+    find "${HOMEBREW_PREFIX_PATH}" ! -type l -acl -exec chmod -N {} +
+  fi
 }
 
 protect_cask_apps() {
@@ -195,6 +211,8 @@ write_sudoers() {
   tmp="$(mktemp /tmp/brewau-sudoers.XXXXXX)"
   cat >"${tmp}" <<EOF
 # Managed by brewau. Regenerate with: sudo brewau reload
+# Never hand the caller's PATH to anything running as ${BREWAU_USER}.
+Defaults>${BREWAU_USER} secure_path="/usr/bin:/bin:/usr/sbin:/sbin"
 # _brewau runs Homebrew; Homebrew elevates some cask steps with sudo -E.
 ${BREWAU_USER} ALL=(root) NOPASSWD: ALL
 # Members of ${BREWAU_USERS_GROUP} may run brew, but only through the policy.
@@ -251,8 +269,18 @@ remove_brew_env() {
 }
 
 write_launchdaemon() {
-  local tmp="${BREWAU_PLIST}.tmp" i
-  # brewau_load_config has validated UPGRADE_HOUR and UPGRADE_MINUTE.
+  local tmp="${BREWAU_PLIST}.tmp" i schedule=""
+  # brewau_load_config has validated UPGRADE_HOUR and UPGRADE_MINUTE. With
+  # AUTO_UPGRADE=0 the job has no schedule but `brewau run` still starts it.
+  if [[ "${AUTO_UPGRADE}" == "1" ]]; then
+    schedule="  <key>StartCalendarInterval</key>
+  <dict>
+    <key>Hour</key>
+    <integer>$((10#${UPGRADE_HOUR}))</integer>
+    <key>Minute</key>
+    <integer>$((10#${UPGRADE_MINUTE}))</integer>
+  </dict>"
+  fi
   cat >"${tmp}" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -268,13 +296,7 @@ write_launchdaemon() {
   <string>${BREWAU_USER}</string>
   <key>GroupName</key>
   <string>${BREWAU_GROUP}</string>
-  <key>StartCalendarInterval</key>
-  <dict>
-    <key>Hour</key>
-    <integer>$((10#${UPGRADE_HOUR}))</integer>
-    <key>Minute</key>
-    <integer>$((10#${UPGRADE_MINUTE}))</integer>
-  </dict>
+${schedule}
   <key>StandardOutPath</key>
   <string>${BREWAU_LOG_DIR}/upgrade.log</string>
   <key>StandardErrorPath</key>
@@ -307,7 +329,11 @@ EOF
   mv -f "${tmp}" "${BREWAU_PLIST}"
   for ((i = 0; i < 5; i++)); do
     if launchctl bootstrap system "${BREWAU_PLIST}" 2>/dev/null; then
-      log "scheduled daily upgrade at $(printf '%02d:%02d' "$((10#${UPGRADE_HOUR}))" "$((10#${UPGRADE_MINUTE}))")"
+      if [[ -n "${schedule}" ]]; then
+        log "scheduled daily upgrade at $(printf '%02d:%02d' "$((10#${UPGRADE_HOUR}))" "$((10#${UPGRADE_MINUTE}))")"
+      else
+        log "scheduled upgrades are off (AUTO_UPGRADE=0); start one with: brewau run"
+      fi
       return 0
     fi
     sleep 1
@@ -390,6 +416,19 @@ restore_shell_profiles() {
   done < <(dscl . -list /Users UniqueID)
 }
 
+# Ends every process running as _brewau, e.g. a brew command a user started
+# before the sudoers rule was removed.
+stop_service_processes() {
+  local i
+  id "${BREWAU_USER}" >/dev/null 2>&1 || return 0
+  pkill -TERM -u "${BREWAU_USER}" 2>/dev/null || return 0
+  for ((i = 0; i < 50; i++)); do
+    pgrep -u "${BREWAU_USER}" >/dev/null 2>&1 || return 0
+    sleep 0.2
+  done
+  pkill -KILL -u "${BREWAU_USER}" 2>/dev/null || true
+}
+
 # Gives apps that brewau installed back to the user who will own the prefix.
 return_cask_apps() {
   local owner="$1" json app
@@ -420,7 +459,12 @@ cmd_uninstall() {
   [[ -f "${ORIGINAL_OWNER_FILE}" ]] && owner="$(cat "${ORIGINAL_OWNER_FILE}")"
   [[ -z "${owner}" ]] && owner="$(console_user)"
 
+  # Close every way into ${BREWAU_USER} (and so root) before the prefix becomes
+  # user-writable again; otherwise a user could edit Homebrew's code and run
+  # it through the still-valid policy rule.
   launchctl bootout "system/${BREWAU_LABEL}" 2>/dev/null || true
+  rm -f "${BREWAU_SUDOERS}"
+  stop_service_processes
   restore_shell_profiles
 
   if [[ -n "${owner}" ]] && id "${owner}" >/dev/null 2>&1 && [[ -d "${HOMEBREW_PREFIX_PATH}" ]]; then
@@ -433,7 +477,7 @@ cmd_uninstall() {
     log "fix with: sudo chown -hR <you>:admin ${HOMEBREW_PREFIX_PATH}"
   fi
 
-  rm -f "${BREWAU_PLIST}" "${BREWAU_SUDOERS}" "${BREWAU_PATHS_D}" "${NEWSYSLOG_CONF}"
+  rm -f "${BREWAU_PLIST}" "${BREWAU_PATHS_D}" "${NEWSYSLOG_CONF}"
   remove_brew_env
   dscl . -delete "/Users/${BREWAU_USER}" 2>/dev/null || true
   dscl . -delete "/Groups/${BREWAU_GROUP}" 2>/dev/null || true

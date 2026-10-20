@@ -32,7 +32,9 @@ install_from_root() {
 install_release() {
   local tmp pkg url team
   tmp="$(mktemp -d)"
-  trap 'rm -rf "${tmp}"' EXIT
+  # Expand now: the EXIT trap runs after this function, when ${tmp} is gone.
+  # shellcheck disable=SC2064
+  trap "rm -rf '${tmp}'" EXIT
   pkg="${tmp}/brewau.pkg"
   url="https://github.com/${BREWAU_REPO}/releases/latest/download/brewau.pkg"
 

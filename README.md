@@ -36,10 +36,11 @@ launchd ── daily ──▶ brewau-upgrade as _brewau ──▶ brew update /
 possible. Whatever can make `_brewau` run code therefore gets root, so the isolation only
 holds if nothing but the policy can steer `_brewau`:
 
-- `/opt/homebrew` is owned by `_brewau` with group/world write removed, so neither you nor
-  other admins' processes can plant code that Homebrew will run.
+- `/opt/homebrew` is owned by `_brewau` with group/world write and ACLs removed, so neither
+  you nor other admins' processes can plant code that Homebrew will run.
 - The wrapper reaches `_brewau` only through `brew-policy`, which is root-owned and
-  default-deny:
+  default-deny. It and the other privileged scripts pin `PATH` before running anything, and
+  sudoers sets `secure_path` for `_brewau`, so programs planted in your `PATH` never run there.
   - only allowlisted subcommands (`install`, `upgrade`, `info`, …). `sh`, `ruby`, `irb`, `edit`,
     `extract`, `bundle`, `services`, `tap-new`, developer commands and unknown commands are refused;
   - only allowlisted options (`--cc`, `--appdir`, `--interactive`, `--debug`, … are refused);
@@ -52,7 +53,7 @@ holds if nothing but the policy can steer `_brewau`:
     variables cannot be injected. `/etc/homebrew/brew.env` (with
     `HOMEBREW_SYSTEM_ENV_TAKES_PRIORITY`) keeps prefix or user `brew.env` files from overriding
     the enforced settings.
-- Apps installed by casks are owned by `_brewau` and not writable by users, because cask
+- Apps installed by casks are owned by `_brewau`, without group/world write or ACLs, because cask
   upgrade/uninstall steps can run code from inside the app (e.g. `uninstall script:`). Apps
   that an updater has replaced since are re-protected before each scheduled cask upgrade.
 - Every invocation is logged with the calling user to `/opt/brewau/var/log/audit.log`.
@@ -101,7 +102,8 @@ brewau restore-shell   # undo setup-shell
 sudo brewau config     # edit policy/schedule; only applied if it parses
 sudo brewau allow-user alice
 sudo brewau repair     # re-apply ownership, permissions and system files
-sudo brewau uninstall  # returns /opt/homebrew, apps, permissions and shell profiles
+sudo brewau uninstall  # closes access to _brewau first, then returns /opt/homebrew, apps,
+                       # permissions and shell profiles
 ```
 
 ## Configuration
@@ -113,15 +115,50 @@ sudo brewau uninstall  # returns /opt/homebrew, apps, permissions and shell prof
 | `ALLOWED_TAPS` | existing taps | extra taps users may install from |
 | `FORBIDDEN_FORMULAE`, `FORBIDDEN_CASKS` | empty | never installable |
 | `EXTRA_ALLOWED_OPTIONS` | empty | brew options to allow beyond the built-in list |
-| `AUTO_UPGRADE` | `1` | enable the nightly job |
+| `AUTO_UPGRADE` | `1` | enable the nightly job; with `0`, `brewau run` still starts one by hand |
 | `UPGRADE_GREEDY` | `1` | include self-updating casks |
+| `ALLOWED_SERVICES` | empty | formulae whose `brew services` run as root system daemons (e.g. `tailscale`) |
 | `UPGRADE_EXCLUDE` | empty | never auto-upgrade these (formulae are pinned, so they are not upgraded as dependencies either) |
 | `UPGRADE_HOUR`, `UPGRADE_MINUTE` | `4`, `0` | when to run; a run missed while asleep happens on wake, a run missed while powered off is skipped (`brewau doctor` warns after 48 hours) |
 
+## Services
+
+`brew services` works, in two modes:
+
+- **As you (default).** Homebrew starts the service as a LaunchAgent for your account, like
+  vanilla Homebrew, without any extra privileges. Because you cannot write to
+  `/opt/homebrew/var`, brewau moves the service's paths there (logs, data, working directory) to
+  `~/Library/Application Support/brewau/var`. Data directories that a formula normally creates
+  during installation (e.g. a database cluster) start out empty there, and brewau names them;
+  initialise them yourself, e.g. `initdb -D ~/Library/Application\ Support/brewau/var/postgresql@17`.
+- **As a system daemon (root).** Formulae listed in `ALLOWED_SERVICES` run as root
+  LaunchDaemons, started at boot. Use it for services that need root, which Homebrew marks as
+  `require_root` (e.g. `tailscale`, `dnsmasq`, `unbound`); brewau refuses to start those as you.
+  Only `list`, `info`, `start`, `stop`, `restart`, `run` and `kill` are allowed, without
+  `--file` or `--sudo-service-user`. The nightly job restarts them after upgrading their formula.
+
+```sh
+sudo brewau config            # ALLOWED_SERVICES="tailscale"
+brew install tailscale
+brew services start tailscale # root daemon
+sudo tailscale up             # first login; add --operator=$USER to use tailscale without sudo
+```
+
+Anything in `ALLOWED_SERVICES` runs as root, so a vulnerability in it is a root compromise.
+
+## Troubleshooting
+
+**`Operation not permitted` when a cask changes its app** (e.g. Parallels:
+`chown: /Applications/Parallels Desktop.app/...: Operation not permitted`). macOS App Management
+blocks changes to app bundles, even by root, unless the app that started the command is allowed.
+Enable your terminal (Terminal, iTerm, Ghostty, ...) in System Settings → Privacy & Security →
+App Management and run the command again. The nightly job has no terminal; on managed Macs
+grant App Management with an MDM Privacy Preferences (PPPC) profile, otherwise update such
+apps by hand (`brewau doctor` reports it).
+
 ## Limitations
 
-- `brew services` and `brew bundle` are blocked. Services would run as `_brewau`, and
-  Brewfiles are Ruby.
+- `brew bundle` is blocked: Brewfiles are Ruby.
 - Files under `/opt/homebrew` are no longer writable by you. That includes `npm -g`,
   `gem install` into Homebrew's Ruby, and editing configs in `/opt/homebrew/etc`. Use
   per-user prefixes (`npm config set prefix ~/.npm-global`), or `sudo -u _brewau` for one-off config edits.
