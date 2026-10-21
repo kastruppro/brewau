@@ -38,20 +38,34 @@ write_state() {
   } >"${LAST_RUN}.tmp" && mv -f "${LAST_RUN}.tmp" "${LAST_RUN}"
 }
 
-in_words() {
+# True if formula or cask $1 is in UPGRADE_EXCLUDE. Either may name it with or
+# without its tap: Homebrew prints tap packages as user/repo/name.
+excluded() {
   local word
-  for word in $2; do
-    [[ "${word}" == "$1" ]] && return 0
+  for word in ${UPGRADE_EXCLUDE}; do
+    [[ "${word##*/}" == "${1##*/}" ]] && return 0
   done
   return 1
 }
 
-# Prints the arguments that are not in the space-separated list $1.
-without() {
-  local list="$1" name
-  shift
+# Prints the arguments that are not excluded.
+not_excluded() {
+  local name
   for name in "$@"; do
-    in_words "${name}" "${list}" || echo "${name}"
+    excluded "${name}" || echo "${name}"
+  done
+}
+
+# Prints the outdated, unpinned names of kind $1 (formulae or casks) from the
+# `brew outdated --json=v2` output in $2. Homebrew refuses to upgrade a pinned
+# package named on the command line, so pins must be left out here.
+outdated_names() {
+  local kind="$1" json="$2" count i
+  count="$(plutil -extract "${kind}" raw -o - - <<<"${json}" 2>/dev/null)" || return 1
+  [[ "${count}" =~ ^[0-9]+$ ]] || return 1
+  for ((i = 0; i < count; i++)); do
+    [[ "$(plutil -extract "${kind}.${i}.pinned" raw -o - - <<<"${json}" 2>/dev/null)" == "true" ]] && continue
+    plutil -extract "${kind}.${i}.name" raw -o - - <<<"${json}" 2>/dev/null || return 1
   done
 }
 
@@ -59,26 +73,28 @@ without() {
 # leaving a formula off the command line does not exclude it. A pin does.
 # Reconciles against the actual pins every run, so a pin that disappeared
 # (brew unpin, reinstall) is put back. Fails if the pins cannot be verified.
+# Pins and the installed list use plain names, so UPGRADE_EXCLUDE entries are
+# reduced to theirs.
 sync_exclude_pins() {
-  local installed pinned previous="" name kept="" result=0
+  local installed pinned previous="" word name kept="" result=0
   installed="$(brew_run list --formula -1)" || return 1
-  pinned="$(brew_run list --pinned)" || return 1
-  installed=" $(echo ${installed}) "
-  pinned=" $(echo ${pinned}) "
+  pinned="$(brew_run list --pinned --formula)" || return 1
   [[ -r "${EXCLUDE_PINS}" ]] && previous="$(cat "${EXCLUDE_PINS}")"
 
   for name in ${previous}; do
-    in_words "${name}" "${UPGRADE_EXCLUDE}" && continue
-    [[ "${pinned}" == *" ${name} "* ]] || continue
+    excluded "${name}" && continue
+    brewau_in_words "${name}" "${pinned}" || continue
     log "unpinning ${name} (no longer in UPGRADE_EXCLUDE)"
     brew_run unpin "${name}" || { kept="${kept} ${name}"; result=1; }
   done
-  for name in ${UPGRADE_EXCLUDE}; do
-    [[ "${installed}" == *" ${name} "* ]] || continue
-    if [[ "${pinned}" == *" ${name} "* ]]; then
+  for word in ${UPGRADE_EXCLUDE}; do
+    name="${word##*/}"
+    brewau_in_words "${name}" "${installed}" || continue
+    brewau_in_words "${name}" "${kept}" && continue
+    if brewau_in_words "${name}" "${pinned}"; then
       # Keep owning our own pins; a pin someone else made is respected but
       # not taken over, so it is never unpinned by this job.
-      in_words "${name}" "${previous}" && kept="${kept} ${name}"
+      brewau_in_words "${name}" "${previous}" && kept="${kept} ${name}"
       continue
     fi
     log "pinning ${name} (UPGRADE_EXCLUDE)"
@@ -93,15 +109,21 @@ sync_exclude_pins() {
 }
 
 # A system service keeps running the old binary after its formula is
-# upgraded, so restart the ones that are loaded.
+# upgraded, so restart the ones that are loaded. Fails if one did not restart.
 restart_system_services() {
-  local name
+  local name result=0
   for name in "$@"; do
+    name="${name##*/}"
     brewau_service_allowed "${name}" || continue
     launchctl print "system/homebrew.mxcl.${name}" >/dev/null 2>&1 || continue
     log "restarting system service ${name}"
-    (BREWAU_PASSTHROUGH_ENV="" brewau_exec_brew_as_root services restart "${name}") || log "could not restart ${name}"
+    if ! (BREWAU_PASSTHROUGH_ENV="" brewau_exec_brew_as_root services restart "${name}"); then
+      log "could not restart ${name}"
+      result=1
+    fi
+    brewau_release_service_keg "${name}"
   done
+  return "${result}"
 }
 
 # Homebrew leaves temp files behind when a cask fails; keep the directory small.
@@ -110,21 +132,38 @@ clean_tmp() {
   return 0
 }
 
+# Locks every cask app (see brewau_protect_apps). Prints the casks whose apps
+# are still unprotected and returns 1, or returns 2 if the installed casks
+# could not be listed.
 protect_apps() {
-  local json
-  json="$(mktemp "${BREWAU_TMP}/casks.XXXXXX")" || return 0
+  local json result=0
+  json="$(mktemp "${BREWAU_TMP}/casks.XXXXXX")" || return 2
   if brew_run info --json=v2 --installed --cask >"${json}" 2>/dev/null; then
-    brewau_protect_apps "${json}" /usr/bin/sudo -n
+    brewau_protect_apps "${json}" /usr/bin/sudo -n || result=1
+  else
+    log "could not list installed casks to protect their apps"
+    result=2
   fi
   rm -f "${json}"
+  return "${result}"
 }
 
 run_upgrade() {
-  local status="ok" greedy="" formulae="" casks="" pinned output
+  local status="ok" greedy="" formulae="" casks="" output json name
   [[ "${UPGRADE_GREEDY}" == "1" ]] && greedy="--greedy"
 
   log "brew update"
   brew_run update || status="update-failed"
+
+  # Every run, not only when casks are outdated: an updater can replace an app
+  # at any time. Upgrading a cask runs code from its app, so a cask whose app
+  # could not be locked is not upgraded.
+  local unprotected="" protect_rc=0
+  unprotected="$(protect_apps)" || protect_rc=$?
+  if [[ ${protect_rc} -ne 0 ]]; then
+    log "not upgrading casks whose apps could not be protected: ${unprotected:-all of them}"
+    status="protect-failed"
+  fi
 
   # Without verified pins an excluded formula could be upgraded as a
   # dependency, so formulae are skipped rather than risk it.
@@ -137,21 +176,28 @@ run_upgrade() {
 
   # Check each command's exit status: inside a substitution a failure would
   # otherwise look like "nothing is outdated".
-  if [[ ${formulae_ok} -eq 1 ]]; then
-    if pinned="$(brew_run list --pinned)" && output="$(brew_run outdated --formula --quiet)"; then
+  # shellcheck disable=SC2086
+  if json="$(brew_run outdated --json=v2 ${greedy})"; then
+    if [[ ${formulae_ok} -eq 1 ]]; then
+      if output="$(outdated_names formulae "${json}")"; then
+        # shellcheck disable=SC2086
+        formulae="$(not_excluded ${output})"
+      else
+        log "could not list outdated formulae"
+        status="outdated-failed"
+      fi
+    fi
+    if output="$(outdated_names casks "${json}")"; then
       # shellcheck disable=SC2086
-      formulae="$(without "${UPGRADE_EXCLUDE} $(echo ${pinned})" ${output})"
+      for name in $(not_excluded ${output}); do
+        [[ ${protect_rc} -ne 2 ]] && ! brewau_in_words "${name##*/}" "${unprotected}" && casks="${casks} ${name}"
+      done
     else
-      log "could not list outdated formulae"
+      log "could not list outdated casks"
       status="outdated-failed"
     fi
-  fi
-  # shellcheck disable=SC2086
-  if output="$(brew_run outdated --cask --quiet ${greedy})"; then
-    # shellcheck disable=SC2086
-    casks="$(without "${UPGRADE_EXCLUDE}" ${output})"
   else
-    log "could not list outdated casks"
+    log "could not list outdated packages"
     status="outdated-failed"
   fi
 
@@ -160,14 +206,14 @@ run_upgrade() {
     # shellcheck disable=SC2086
     brew_run upgrade --formula ${formulae} || status="upgrade-failed"
     # shellcheck disable=SC2086
-    restart_system_services ${formulae}
+    restart_system_services ${formulae} || status="restart-failed"
   fi
   if [[ -n "${casks}" ]]; then
-    # Apps may have been replaced by their own updater since the last run.
-    protect_apps
     log "upgrading casks: $(echo ${casks})"
     # shellcheck disable=SC2086
     brew_run upgrade --cask ${greedy} ${casks} || status="upgrade-failed"
+    # The new versions can ship with group/world-writable files.
+    protect_apps >/dev/null
   fi
   [[ -z "${formulae}${casks}" && "${status}" == "ok" ]] && log "everything is up to date"
 
@@ -185,6 +231,11 @@ run_upgrade() {
 main() {
   [[ "$(id -un)" == "${BREWAU_USER}" ]] || brewau_die "brewau-upgrade must run as ${BREWAU_USER}"
   brewau_load_config
+  if ! brewau_cache_forbidden_taps; then
+    log "could not determine which taps to block; not running brew"
+    write_state "tap-check-failed" ""
+    exit 1
+  fi
   run_upgrade
 }
 

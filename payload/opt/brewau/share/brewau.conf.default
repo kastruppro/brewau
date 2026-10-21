@@ -21,7 +21,7 @@ ALLOWED_SERVICES=""
 AUTO_UPGRADE="1"
 # Also upgrade casks that update themselves (Chrome, Slack, ...).
 UPGRADE_GREEDY="1"
-# Formulae/casks the scheduled job must never upgrade.
+# Formulae/casks the scheduled job must never upgrade, with or without their tap.
 UPGRADE_EXCLUDE=""
 UPGRADE_HOUR="4"
 UPGRADE_MINUTE="0"

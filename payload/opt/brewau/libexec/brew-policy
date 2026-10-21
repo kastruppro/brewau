@@ -18,6 +18,8 @@ BREWAU_LIBEXEC="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 # shellcheck source=common.sh
 source "${BREWAU_LIBEXEC}/common.sh"
 
+# Lists below are whitespace-separated words (see brewau_in_words).
+
 # Subcommands that only read state.
 READ_COMMANDS=" --version -v --prefix --cellar --repository --repo --cache --caskroom --env --config
   config doctor dr list ls info abv search -S outdated deps uses leaves desc options missing
@@ -30,23 +32,35 @@ WRITE_COMMANDS=" install reinstall upgrade uninstall remove rm autoremove cleanu
 # Commands whose arguments are free text and never resolved as files.
 FREE_TEXT_COMMANDS=" search -S help -h --help commands "
 
+# No --adopt: it registers an app the user already owns (and can still change)
+# as a cask, whose install and uninstall steps then run code from inside it.
 ALLOWED_OPTIONS=" -v --verbose -q --quiet -f --force -n --dry-run -h --help
   --formula --formulae --cask --casks --greedy --greedy-latest --greedy-auto-updates
-  --zap --adopt --overwrite --ignore-dependencies --only-dependencies --skip-cask-deps
+  --zap --overwrite --ignore-dependencies --only-dependencies --skip-cask-deps
   --skip-post-install --skip-link --require-sha --fetch-HEAD --HEAD --build-from-source -s
   --force-bottle --installed --eval-all --desc --name --description --versions --pinned
   --full-name --multiple --tree --direct --recursive --include-build --include-test
   --include-optional --skip-recommended --annotate --dependents --display-times --ask
   --json --json=v1 --json=v2 --scrub --deps --repair --installed-on-request
   --installed-as-dependency --poured-from-bottle --built-from-source --missing --declared
-  --list-checks --unbrewed --auto-update --no-upgrade --quiet -1 -l -r -t --fish --zsh --bash
-  --on-request --as-dependency --leaves --print-path --casks --names --size --plain "
+  --list-checks --unbrewed --auto-update --no-upgrade -1 -l -r -t --fish --zsh --bash
+  --on-request --as-dependency --leaves --print-path --names --size --plain "
+
+# Commands that can put cask apps in place. Their apps are locked right after,
+# so that users never get to change code a later cask step runs as _brewau.
+CASK_INSTALL_COMMANDS=" install reinstall upgrade "
+
+# Commands that can run a cask's uninstall steps, i.e. code from inside its
+# app (as can `install --force` over an installed cask).
+CASK_UNINSTALL_COMMANDS=" uninstall remove rm reinstall upgrade "
 
 NAME_RE='^[A-Za-z0-9][A-Za-z0-9@._+-]*$'
 TAP_RE='^[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]*$'
 QUALIFIED_RE='^([A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]*)/[A-Za-z0-9][A-Za-z0-9@._+-]*$'
 
 DENY_REASON=""
+SERVICE_ACTION=""
+SERVICE_NAME=""
 
 deny() {
   DENY_REASON="$*"
@@ -54,14 +68,13 @@ deny() {
 }
 
 in_list() {
-  case "$2" in *" $1 "*) return 0 ;; esac
-  return 1
+  brewau_in_words "$1" "$2"
 }
 
 option_allowed() {
   local opt="$1"
   in_list "${opt}" "${ALLOWED_OPTIONS}" && return 0
-  in_list "${opt}" " ${EXTRA_ALLOWED_OPTIONS} " && return 0
+  in_list "${opt}" "${EXTRA_ALLOWED_OPTIONS}" && return 0
   [[ "${opt}" =~ ^--prune=([0-9]+|all)$ ]] && return 0
   [[ "${opt}" =~ ^--shell=(bash|zsh|fish|csh|pwsh)$ ]] && return 0
   return 1
@@ -81,26 +94,40 @@ check_package_arg() {
 # on formulae listed in ALLOWED_SERVICES passes. Options such as --file
 # (an arbitrary plist) or --sudo-service-user are refused. Services that are
 # not allowed run as the user instead; the brew wrapper handles those.
+# Like Homebrew, the first word is the action (default list), the second the
+# formula, wherever the options are. Sets SERVICE_ACTION and SERVICE_NAME.
 check_services() {
-  local action="${1:-list}" arg name=""
-  [[ $# -gt 0 ]] && shift
-  case "${action}" in
-    list | info | start | stop | restart | run | kill) ;;
-    *) deny "'brew services ${action}' is not allowed"; return ;;
-  esac
+  local arg action="" name="" json=0
   for arg in "$@"; do
     case "${arg}" in
-      -v | --verbose | -q | --quiet) continue ;;
-      --json)
-        [[ "${action}" == "list" || "${action}" == "info" ]] && continue
-        deny "option '${arg}' is not allowed for brew services ${action}"
-        return
-        ;;
+      -v | --verbose | -q | --quiet) ;;
+      --json) json=1 ;;
       -*) deny "option '${arg}' is not allowed for brew services"; return ;;
+      *)
+        if [[ -z "${action}" ]]; then
+          action="${arg}"
+        elif [[ -z "${name}" ]]; then
+          name="${arg}"
+        else
+          deny "brew services takes one formula"
+          return
+        fi
+        ;;
     esac
-    [[ -z "${name}" ]] || { deny "brew services takes one formula"; return; }
-    name="${arg}"
   done
+  action="$(brewau_service_action "${action:-list}")"
+  case "${action}" in
+    list | info | start | stop | restart | kill) ;;
+    # Homebrew refuses `run` as root; `start` is the system equivalent.
+    run) deny "'brew services run' cannot run a system service; use: brew services start ${name}"; return ;;
+    *) deny "'brew services ${action}' is not allowed"; return ;;
+  esac
+  if [[ ${json} -eq 1 && "${action}" != "list" && "${action}" != "info" ]]; then
+    deny "option '--json' is not allowed for brew services ${action}"
+    return
+  fi
+  SERVICE_ACTION="${action}"
+  SERVICE_NAME="${name}"
   if [[ "${action}" == "list" ]]; then
     [[ -z "${name}" ]] || { deny "brew services list takes no formula"; return; }
     return 0
@@ -163,6 +190,15 @@ check_command() {
       done
       return 0
       ;;
+    update-reset)
+      # Its arguments are repository paths (relative to /, where brew runs).
+      for arg in "$@"; do
+        [[ "${arg}" == -* ]] && option_allowed "${arg}" && continue
+        deny "brew update-reset takes no arguments"
+        return
+      done
+      return 0
+      ;;
     analytics)
       [[ $# -le 1 ]] || { deny "too many arguments"; return; }
       case "${1:-state}" in on | off | state) return 0 ;; esac
@@ -213,6 +249,97 @@ passthrough_env() {
   echo "${out}"
 }
 
+# True if subcommand $1 with the arguments after it (an already allowed command
+# line) can install or upgrade casks.
+installs_casks() {
+  local cmd="$1" arg
+  shift
+  in_list "${cmd}" "${CASK_INSTALL_COMMANDS}" || return 1
+  for arg in "$@"; do
+    case "${arg}" in --formula | --formulae) return 1 ;; esac
+  done
+  return 0
+}
+
+# True if subcommand $1 with the arguments after it can run cask uninstall
+# steps.
+runs_cask_uninstall() {
+  local cmd="$1" arg force=0
+  shift
+  for arg in "$@"; do
+    case "${arg}" in
+      --formula | --formulae) return 1 ;;
+      -f | --force) force=1 ;;
+    esac
+  done
+  in_list "${cmd}" "${CASK_UNINSTALL_COMMANDS}" || [[ "${cmd}" == "install" && ${force} -eq 1 ]]
+}
+
+# Locks every cask app (see brewau_protect_apps). Casks can ship apps with
+# group/world-writable files, and a user who changed one could have the next
+# cask upgrade or uninstall run their code as _brewau. Prints the casks whose
+# apps are still unprotected and returns 1, or returns 2 if the installed
+# casks could not be listed.
+protect_cask_apps() {
+  local json result=0
+  json="$(mktemp "${BREWAU_TMP}/casks.XXXXXX")" || return 2
+  if (brewau_exec_brew info --json=v2 --installed --cask) >"${json}" 2>/dev/null; then
+    brewau_protect_apps "${json}" /usr/bin/sudo -n || result=1
+  else
+    echo "brewau: WARNING: could not list installed casks to protect their apps" >&2
+    result=2
+  fi
+  rm -f "${json}"
+  return "${result}"
+}
+
+# Locks the cask apps before a command that can run code from them, and fails
+# (setting DENY_REASON) if an app it may touch is still unprotected: anyone
+# could have changed that code. $@ are the arguments after the subcommand;
+# without package names, every cask counts.
+cask_apps_protected() {
+  local unprotected rc=0 arg names=0
+  unprotected="$(protect_cask_apps)" || rc=$?
+  case "${rc}" in
+    0) return 0 ;;
+    2) deny "the installed casks could not be listed to check their apps"; return ;;
+  esac
+  for arg in "$@"; do
+    [[ "${arg}" == -* ]] && continue
+    names=1
+    brewau_in_words "${arg##*/}" "${unprotected}" &&
+      { deny "the app of ${arg##*/} could not be protected, so its code cannot be trusted"; return; }
+  done
+  [[ ${names} -eq 0 ]] || return 0
+  deny "the apps of ${unprotected//$'\n'/ } could not be protected, so their code cannot be trusted"
+}
+
+# Runs brew, then locks the cask apps, also when brew fails or is interrupted.
+run_then_protect_apps() {
+  local rc=0
+  # Traps (unlike ignored signals) leave brew interruptible...
+  trap ':' INT TERM HUP QUIT PIPE
+  (brewau_exec_brew "$@") || rc=$?
+  # ...but the locking, and the root helper it runs, must not be stopped.
+  trap '' INT TERM HUP QUIT PIPE
+  protect_cask_apps >/dev/null
+  trap - INT TERM HUP QUIT PIPE
+  return "${rc}"
+}
+
+# Runs `brew services` as root, then hands a started service's keg back (see
+# brewau_release_service_keg).
+run_system_services() {
+  local rc=0
+  # launchd (as root) writes the service logs here; keep it owned by us.
+  mkdir -p "${HOMEBREW_PREFIX_PATH}/var/log" 2>/dev/null
+  (brewau_exec_brew_as_root "$@") || rc=$?
+  case "${SERVICE_ACTION}" in
+    start | restart) brewau_release_service_keg "${SERVICE_NAME}" >&2 ;;
+  esac
+  return "${rc}"
+}
+
 main() {
   [[ "$(id -un)" == "${BREWAU_USER}" ]] || brewau_die "brew-policy must run as ${BREWAU_USER}"
   brewau_load_config
@@ -220,18 +347,30 @@ main() {
   if ! check_command "$@"; then
     audit deny "$@"
     echo "brewau: denied: ${DENY_REASON}" >&2
-    echo "brewau: edit ${BREWAU_CONF} as an administrator to change the policy." >&2
+    echo "brewau: an administrator can change the policy with: sudo brewau config" >&2
     exit 1
   fi
   audit allow "$@"
 
   BREWAU_PASSTHROUGH_ENV="$(passthrough_env)"
-  local cmd="${1:-}"
-  [[ "${cmd}" == "-v" && $# -gt 1 ]] && cmd="$2"
+  # The subcommand and its arguments, the way brew sees them.
+  local cmd="${1:-}" args=("${@:2}")
+  if [[ "${cmd}" == "-v" && $# -gt 1 ]]; then
+    cmd="$2"
+    args=("${@:3}" -v)
+  fi
   if [[ "${cmd}" == "services" ]]; then
-    # launchd (as root) writes the service logs here; keep it owned by us.
-    mkdir -p "${HOMEBREW_PREFIX_PATH}/var/log" 2>/dev/null
-    brewau_exec_brew_as_root "$@"
+    run_system_services "$@"
+    exit
+  fi
+  if runs_cask_uninstall "${cmd}" ${args[@]+"${args[@]}"} && ! cask_apps_protected ${args[@]+"${args[@]}"}; then
+    echo "brewau: denied: ${DENY_REASON}" >&2
+    echo "brewau: an administrator needs to look at it; see: brewau doctor" >&2
+    exit 1
+  fi
+  if installs_casks "${cmd}" ${args[@]+"${args[@]}"}; then
+    run_then_protect_apps "$@"
+    exit
   fi
   brewau_exec_brew "$@"
 }

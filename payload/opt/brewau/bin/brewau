@@ -47,10 +47,6 @@ in_users_group() {
   return 1
 }
 
-daemon_loaded() {
-  launchctl print "system/${BREWAU_LABEL}" >/dev/null 2>&1
-}
-
 cmd_status() {
   brewau_load_config
   echo "brewau ${VERSION}"
@@ -82,7 +78,7 @@ cmd_run() {
   local err
   in_users_group || brewau_die "$(id -un) is not in ${BREWAU_USERS_GROUP}; ask an administrator to run: sudo brewau allow-user $(id -un)"
   if ! err="$(/usr/bin/sudo -n /bin/launchctl kickstart "system/${BREWAU_LABEL}" 2>&1)"; then
-    daemon_loaded || brewau_die "the upgrade daemon is not loaded; run: sudo brewau reload"
+    brewau_daemon_loaded || brewau_die "the upgrade daemon is not loaded; run: sudo brewau reload"
     brewau_die "could not start the upgrade: ${err:-launchctl failed}"
   fi
   echo "Upgrade started. Follow it with: brewau log -f"
@@ -128,26 +124,31 @@ cmd_doctor() {
     bad "${writable} is group/world-writable or has an ACL; run: sudo brewau repair"
   fi
 
+  brewau_load_config
+
   local env_file
   for env_file in "${HOMEBREW_PREFIX_PATH}/etc/homebrew/brew.env" "${BREWAU_HOME}/.homebrew/brew.env"; do
     [[ -f "${env_file}" ]] && echo "  - ${env_file} exists; settings in it that brewau does not enforce still apply, review it"
   done
-  grep -q '^HOMEBREW_SYSTEM_ENV_TAKES_PRIORITY=1' /etc/homebrew/brew.env 2>/dev/null &&
-    ok "/etc/homebrew/brew.env enforces brewau's settings" ||
-    bad "/etc/homebrew/brew.env is missing brewau's settings; run: sudo brewau reload"
+  # Homebrew applies brew.env over the policy's environment, so a block left
+  # from an older brewau.conf is what counts.
+  if [[ "$(brewau_brew_env_current)" == "$(brewau_brew_env_block)" ]]; then
+    ok "${BREWAU_BREW_ENV} enforces brewau.conf"
+  else
+    bad "${BREWAU_BREW_ENV} does not match brewau.conf; run: sudo brewau reload"
+  fi
 
   [[ -f "${BREWAU_SUDOERS}" ]] && ok "sudoers rule installed" || bad "${BREWAU_SUDOERS} is missing; run: sudo brewau repair"
-  daemon_loaded && ok "upgrade daemon is loaded" || bad "upgrade daemon is not loaded; run: sudo brewau reload"
+  brewau_daemon_loaded && ok "upgrade daemon is loaded" || bad "upgrade daemon is not loaded; run: sudo brewau reload"
   in_users_group && ok "$(id -un) is in ${BREWAU_USERS_GROUP}" ||
     bad "$(id -un) is not in ${BREWAU_USERS_GROUP}; run: sudo brewau allow-user $(id -un)"
 
-  brewau_load_config
   local forbidden
   forbidden="$(brewau_forbidden_taps)"
   [[ -n "${forbidden}" ]] &&
     echo "  - installed taps outside ALLOWED_TAPS (blocked): ${forbidden}"
 
-  local last_run="${BREWAU_STATE_DIR}/last-run" finished age
+  local last_run="${BREWAU_STATE_DIR}/last-run" finished since age
   if [[ "${AUTO_UPGRADE}" == "1" && -r "${last_run}" ]]; then
     if grep -q '^status=ok' "${last_run}"; then
       ok "last scheduled run succeeded"
@@ -155,17 +156,21 @@ cmd_doctor() {
       bad "last scheduled run failed; see: brewau log"
     fi
     finished="$(sed -n 's/^finished=//p' "${last_run}")"
-    age=$(($(date +%s) - $(date -j -u -f '%Y-%m-%dT%H:%M:%SZ' "${finished}" +%s 2>/dev/null || echo 0)))
-    if [[ ${age} -gt $((48 * 3600)) ]]; then
-      bad "no scheduled run for $((age / 86400)) days (the Mac is off at $(printf '%02d:%02d' "$((10#${UPGRADE_HOUR}))" "$((10#${UPGRADE_MINUTE}))")?); run: brewau run"
+    if since="$(date -j -u -f '%Y-%m-%dT%H:%M:%SZ' "${finished}" +%s 2>/dev/null)"; then
+      age=$(($(date +%s) - since))
+      if [[ ${age} -gt $((48 * 3600)) ]]; then
+        bad "no scheduled run for $((age / 86400)) days (the Mac is off at $(printf '%02d:%02d' "$((10#${UPGRADE_HOUR}))" "$((10#${UPGRADE_MINUTE}))")?); run: brewau run"
+      fi
+    else
+      bad "${last_run} is unreadable; run: brewau run"
     fi
   elif [[ "${AUTO_UPGRADE}" == "1" ]]; then
     echo "  - no scheduled run yet; start one with: brewau run"
   fi
 
   if tail -n 500 "${BREWAU_LOG_DIR}/upgrade.log" 2>/dev/null |
-    grep -Eq 'Operation not permitted|could not take ownership'; then
-    bad "macOS blocked changes to apps (App Management); allow it for the upgrade job, e.g. with an MDM Privacy Preferences (PPPC) profile; see: brewau log"
+    grep -Eq 'Operation not permitted|could not take ownership|could not protect'; then
+    bad "some apps could not be protected, usually because macOS App Management blocked it; allow it for the upgrade job, e.g. with an MDM Privacy Preferences (PPPC) profile; see: brewau log"
   fi
   return "${FAILED}"
 }
@@ -186,8 +191,11 @@ cmd_setup_shell() {
     [[ -f "${file}" ]] || continue
     grep -Eq "${SHELLENV_RE}" "${file}" || continue
     backup_once "${file}"
-    brewau_rewrite_file "${file}" sed -E "s#${SHELLENV_RE}#\\1${BREWAU_ROOT}/bin/brew shellenv#g"
-    echo "updated ${file} (backup: ${file}.brewau-backup)"
+    if brewau_rewrite_file "${file}" sed -E "s#${SHELLENV_RE}#\\1${BREWAU_ROOT}/bin/brew shellenv#g"; then
+      echo "updated ${file} (backup: ${file}.brewau-backup)"
+    else
+      echo "brewau: could not update ${file}" >&2
+    fi
   done
 
   # Profiles can also prepend /opt/homebrew/bin by hand, so finish the rc file
@@ -233,7 +241,7 @@ cmd_restore_shell() {
           blank = ""
           print
         }
-        END { if (blank) print "" }'
+        END { if (blank) print "" }' || { echo "brewau: could not restore ${file}" >&2; continue; }
     echo "restored ${file}"
   done
 }
@@ -246,11 +254,13 @@ cmd_config() {
   # Edit a copy and only install it once it parses; a broken live config
   # makes every brew command fail.
   while true; do
-    # EDITOR may carry arguments (e.g. "code --wait"), and lives in the
-    # administrator's own PATH.
+    # The editor may carry arguments (e.g. "code --wait"), and lives in the
+    # administrator's own PATH. macOS sudo keeps VISUAL and EDITOR.
     # shellcheck disable=SC2086
-    PATH="${USER_PATH}" ${EDITOR:-vi} "${tmp}"
-    if (brewau_load_config "${tmp}"); then
+    PATH="${USER_PATH}" ${VISUAL:-${EDITOR:-vi}} "${tmp}"
+    # Strict: unknown keys and invalid values are refused here rather than
+    # ignored later.
+    if (BREWAU_CONFIG_STRICT=1 brewau_load_config "${tmp}"); then
       break
     fi
     read -r -p "brewau: the configuration is invalid. Edit again? [Y/n] " answer
