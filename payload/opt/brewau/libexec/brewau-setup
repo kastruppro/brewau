@@ -128,7 +128,7 @@ deny_user() {
 ensure_dirs() {
   install -d -o root -g wheel -m 0755 "${BREWAU_ROOT}" "${BREWAU_ROOT}/etc" "${BREWAU_VAR}"
   install -d -o "${BREWAU_USER}" -g "${BREWAU_GROUP}" -m 0755 \
-    "${BREWAU_HOME}" "${BREWAU_LOG_DIR}" "${BREWAU_STATE_DIR}"
+    "${BREWAU_HOME}" "${BREWAU_LOG_DIR}" "${BREWAU_STATE_DIR}" "${BREWAU_APP_STATE_DIR}"
   # Private replacement for the shared, world-writable /tmp.
   install -d -o "${BREWAU_USER}" -g "${BREWAU_GROUP}" -m 0700 "${BREWAU_TMP}"
   local logfile
@@ -194,11 +194,39 @@ take_over_prefix() {
     brewau_die "could not remove group/world write and ACLs from ${HOMEBREW_PREFIX_PATH}"
 }
 
+# Whoever owned the prefix before could have changed Homebrew's code, which
+# _brewau (and so root) now runs. Flags what git can tell: local changes,
+# commits that are not upstream, and config or hooks that run commands. Only
+# runs git on a repository whose config is harmless.
+check_repos() {
+  local dir problems found=0
+  # As _brewau, which owns the repositories now, and without writing the index.
+  local git=(sudo -u "${BREWAU_USER}" -H git --no-optional-locks -c core.fsmonitor=false -c core.hooksPath=/dev/null)
+  while IFS= read -r dir; do
+    problems="$(brewau_repo_problems "${dir}")"
+    if [[ -z "${problems}" ]]; then
+      [[ -z "$(cd / && "${git[@]}" -C "${dir}" status --porcelain 2>/dev/null | head -1)" ]] ||
+        problems="${dir}: files differ from the checked-out commit (git status)"
+      [[ -z "$(cd / && "${git[@]}" -C "${dir}" rev-list -1 HEAD --not --remotes --tags 2>/dev/null)" ]] ||
+        problems="${problems:+${problems}$'\n'}${dir}: has commits that are not upstream"
+    fi
+    [[ -n "${problems}" ]] || continue
+    found=1
+    while IFS= read -r dir; do log "WARNING: ${dir}"; done <<<"${problems}"
+  done < <(brewau_repos)
+  if [[ ${found} -eq 1 ]]; then
+    log "WARNING: _brewau runs this code as root. Unless you made these changes, reset to upstream:"
+    log "  sudo -u ${BREWAU_USER} /opt/homebrew/bin/brew update-reset   (discards local changes)"
+  fi
+  return 0
+}
+
 protect_cask_apps() {
   local json
   if json="$(installed_casks_json)"; then
     brewau_protect_apps "${json}" >/dev/null ||
       log "WARNING: some cask apps could not be protected; brew refuses to upgrade or remove those casks until they are"
+    brewau_record_apps "${json}"
     rm -f "${json}"
   else
     log "WARNING: could not list installed casks; apps in /Applications were not checked"
@@ -377,6 +405,7 @@ cmd_install() {
   fi
 
   take_over_prefix
+  check_repos
   local granted=" "
   for user in ${users[@]+"${users[@]}"}; do
     [[ "${user}" == "${BREWAU_USER}" || "${user}" == "root" ]] && continue
@@ -388,7 +417,11 @@ cmd_install() {
   write_system_files
   write_sudoers
   write_brew_env
+  # Only the first install takes apps as they are; `repair` must not quietly
+  # accept one that was swapped since.
+  BREWAU_APPS_BASELINE="${first_install}"
   protect_cask_apps
+  BREWAU_APPS_BASELINE=0
   write_launchdaemon
   dscacheutil -flushcache 2>/dev/null || true
   touch "${INSTALLED_MARKER}"
@@ -398,30 +431,156 @@ cmd_install() {
 }
 
 # Undoes `brewau setup-shell` for every local user, running as that user so
-# file ownership is kept, and names services whose files brewau moved.
+# file ownership is kept, and hands back services whose files brewau moved.
 restore_users() {
-  local user uid home
+  local owner="$1" user uid home
   while read -r user uid; do
     [[ "${uid}" -ge 500 ]] || continue
-    home="$(dscl . -read "/Users/${user}" NFSHomeDirectory 2>/dev/null | awk '{print $2}')"
-    [[ -n "${home}" && -d "${home}" ]] || continue
+    home="$(user_home "${user}")" || continue
     (cd / && sudo -u "${user}" -H /bin/bash -p "${BREWAU_ROOT}/bin/brewau" restore-shell </dev/null) ||
       log "WARNING: could not restore the shell profile of ${user}"
-    warn_relocated_services "${user}" "${home}"
+    restore_services "${user}" "${home}" "${owner}"
   done < <(dscl . -list /Users UniqueID)
 }
 
-# Services that ran as a user had their files moved out of the prefix. The
-# next `brew services start` or `restart` points them back at it.
-warn_relocated_services() {
-  local user="$1" home="$2" plist name
-  for plist in "${home}"/Library/LaunchAgents/homebrew.mxcl.*.plist; do
-    [[ -f "${plist}" ]] && grep -qF "/Library/Application Support/brewau/var" "${plist}" 2>/dev/null || continue
-    name="${plist##*/homebrew.mxcl.}"
-    name="${name%.plist}"
-    log "WARNING: ${user}'s service ${name} keeps its files in ${home}/Library/Application Support/brewau/var."
-    log "  The next \`brew services start/restart ${name}\` uses ${HOMEBREW_PREFIX_PATH}/var again; move its data there first."
+user_home() {
+  local home
+  home="$(dscl . -read "/Users/$1" NFSHomeDirectory 2>/dev/null | awk '{print $2}')"
+  [[ -n "${home}" && -d "${home}" ]] && echo "${home}"
+}
+
+# Services that ran as a user had their files moved out of the prefix, and
+# the next `brew services start` or `restart` without brewau points them back
+# at it. For the prefix owner, whose services keep working there, stopped
+# services get their data copied back and their agent pointed at it again
+# (the user's copy stays where it was). Running services and other users'
+# are named. Which directories hold data comes from the keg, not from the
+# user's own plist.
+restore_services() {
+  local user="$1" home="$2" owner="$3" plist formula userdir uservar rel ok rels
+  userdir="${home}/Library/Application Support/brewau"
+  uservar="${userdir}/var"
+  for plist in "${home}"/Library/LaunchAgents/sh.brew.*.plist "${home}"/Library/LaunchAgents/homebrew.mxcl.*.plist; do
+    formula="$(brewau_service_formula "${plist}")" || continue
+    sudo -u "${user}" grep -qF "${uservar}" "${plist}" 2>/dev/null || continue
+    ok=0
+    if [[ "${user}" == "${owner}" ]] && rels="$(brewau_service_var_dirs "${formula}")" &&
+      ! brewau_service_loaded "gui/$(id -u "${user}")" "${formula}"; then
+      ok=1
+      while IFS= read -r rel; do
+        [[ -n "${rel}" ]] && sudo -u "${user}" /bin/test -d "${uservar}${rel}" || continue
+        copy_from_user "${user}" "${uservar}${rel}" "${HOMEBREW_PREFIX_PATH}/var${rel}" || ok=0
+      done <<<"${rels}"
+    fi
+    # Back to the prefix's var directory and the prefix's config files.
+    if [[ ${ok} -eq 1 ]] && sudo -u "${user}" /bin/bash -p -c \
+      'source "$1" && brewau_rewrite_file "$2" brewau_replace_literal "$3/var" "$4/var" &&
+        brewau_rewrite_file "$2" brewau_replace_literal "$3/etc/" "$4/etc/"' \
+      brewau "${BREWAU_LIBEXEC}/common.sh" "${plist}" "${userdir}" "${HOMEBREW_PREFIX_PATH}"; then
+      log "${user}'s service ${formula} uses ${HOMEBREW_PREFIX_PATH}/var again (its old files stay in ${uservar})"
+    else
+      log "WARNING: ${user}'s service ${formula} keeps its files in ${uservar}."
+      log "  The next \`brew services start/restart ${formula}\` uses ${HOMEBREW_PREFIX_PATH}/var again; move its data there first."
+    fi
   done
+}
+
+# Copies directory $2, which only root can read, into $3 in user $1's home.
+# The copy is made in a private directory and moved into place as the user,
+# so root never writes where the user could redirect it.
+copy_into_user() {
+  local user="$1" src="$2" dest="$3" tmp result=0
+  [[ -d "${src}" && ! -L "${src}" ]] || return 1
+  tmp="$(mktemp -d /private/tmp/brewau-copy.XXXXXX)" || return 1
+  if ditto --noacl "${src}" "${tmp}/data" && chown -R "${user}:$(id -gn "${user}")" "${tmp}/data" && chown "${user}" "${tmp}" &&
+    sudo -u "${user}" /bin/bash -p -c '[[ ! -e "$2" ]] && mkdir -p "${2%/*}" && mv "$1" "$2"' brewau "${tmp}/data" "${dest}"; then
+    log "copied ${src} to ${dest}"
+  else
+    log "WARNING: could not copy ${src} to ${dest} (does it exist already?)"
+    result=1
+  fi
+  sudo -u "${user}" /bin/rm -rf "${tmp}" 2>/dev/null || true
+  return "${result}"
+}
+
+# Copies user $1's directory $2 to $3 in the prefix, which still belongs to
+# _brewau. The user does the reading, into a directory of theirs inside one of
+# root's (so they cannot swap it for a symlink), so root never follows their
+# paths; root then takes that directory back and the copy over, as it does an
+# app (brewau_lock_tree), before it goes into the prefix.
+copy_from_user() {
+  local user="$1" src="$2" dest="$3" parent work result=1
+  [[ ! -e "${dest}" && ! -L "${dest}" ]] || { log "WARNING: ${dest} exists; leaving ${src} where it is"; return 1; }
+  parent="$(mktemp -d /private/tmp/brewau-copy.XXXXXX)" || return 1
+  work="${parent}/work"
+  if chmod 0755 "${parent}" && mkdir "${work}" && chown "${user}" "${work}" &&
+    sudo -u "${user}" /usr/bin/ditto --noacl "${src}" "${work}/data" 2>/dev/null &&
+    chown -h root "${work}" && chmod -h 0700 "${work}" &&
+    [[ -d "${work}/data" && ! -L "${work}/data" ]] && brewau_lock_tree "${work}/data" &&
+    # A hard link to one of root's files would hand it to the prefix owner.
+    [[ -z "$(find "${work}/data" ! -type d -links +1 ! -user "${BREWAU_USER}" -print | head -1)" ]] &&
+    mkdir -p "${dest%/*}" && mv "${work}/data" "${dest}"; then
+    log "copied ${src} to ${dest}"
+    result=0
+  else
+    log "WARNING: could not copy ${src} to ${dest}"
+  fi
+  # Until root took it back, the user could put anything in it.
+  if [[ -d "${work}" && "$(stat -f %Su "${work}")" == "${user}" ]]; then
+    sudo -u "${user}" /bin/rm -rf "${work}" 2>/dev/null || true
+  fi
+  rm -rf "${parent}"
+  return "${result}"
+}
+
+# Copies the data a service (formula $2) had in the prefix from before brewau
+# to where it looks for it when user $1 runs it. Which directories hold data
+# comes from the keg. The data is whoever ran the service before; the
+# administrator decides who gets it.
+cmd_move_service_data() {
+  require_root
+  local user="$1" formula="$2" home uservar rels rel src var copied=0
+  id "${user}" >/dev/null 2>&1 || brewau_die "no such user: ${user}"
+  [[ "${formula}" =~ ^[A-Za-z0-9][A-Za-z0-9@._+-]*$ ]] || brewau_die "not a formula name: ${formula}"
+  home="$(user_home "${user}")" || brewau_die "${user} has no home directory"
+  uservar="${home}/Library/Application Support/brewau/var"
+  rels="$(brewau_service_var_dirs "${formula}")" || brewau_die "${formula} is not installed or has no service"
+  ! brewau_service_loaded "gui/$(id -u "${user}")" "${formula}" ||
+    brewau_die "${formula} is running; ${user} has to stop it first: brew services stop ${formula}"
+  var="$(cd -P "${HOMEBREW_PREFIX_PATH}/var" && pwd -P)"
+  while IFS= read -r rel; do
+    src="${HOMEBREW_PREFIX_PATH}/var${rel}"
+    [[ -n "${rel}" && -d "${src}" && ! -L "${src}" ]] || continue
+    [[ "$(cd -P "${src}" && pwd -P)" == "${var}"/* ]] || continue
+    copy_into_user "${user}" "${src}" "${uservar}${rel}" && copied=1
+  done <<<"${rels}"
+  [[ ${copied} -eq 1 ]] || brewau_die "found no data of ${formula} to copy"
+  log "${user} can start it again with: brew services start ${formula}"
+}
+
+# An administrator vouches for app $1 after checking it: it is locked, its
+# current signature becomes brewau's record, and brew runs its cask's steps
+# again. For an app that is gone, brewau just forgets it.
+cmd_trust_app() {
+  require_root
+  local app="${1%/}" state team
+  [[ "${app}" == "${BREWAU_APPDIR}"/*.app && "${app}" != *..* ]] || brewau_die "not an app in ${BREWAU_APPDIR}: ${app}"
+  state="$(brewau_app_state "${app}")"
+  if [[ ! -e "${app}" && ! -L "${app}" ]]; then
+    rm -f "${state}.untrusted" "${state}.team"
+    log "forgot ${app}"
+    return 0
+  fi
+  [[ -d "${app}" && ! -L "${app}" ]] || brewau_die "${app} is not an app bundle"
+  brewau_lock_app "${app}" || brewau_die "could not lock ${app} (App Management permission?)"
+  rm -f "${state}.untrusted" "${state}.team"
+  brewau_record_app "${app}" || brewau_die "could not record the signature of ${app}"
+  team="$(cut -f 2 "${state}.team" 2>/dev/null)"
+  if [[ "${team}" == "-" ]]; then
+    log "trusting ${app}, which has no valid Developer ID signature"
+  else
+    log "trusting ${app}, signed by Team ID ${team}"
+  fi
 }
 
 # Ends every process running as _brewau, e.g. a brew command a user started
@@ -470,14 +629,11 @@ restore_prefix_modes() {
 
 # Formulae that run as Homebrew system daemons (root LaunchDaemons).
 system_service_names() {
-  local plist name
-  for plist in /Library/LaunchDaemons/homebrew.mxcl.*.plist; do
+  local plist
+  for plist in /Library/LaunchDaemons/sh.brew.*.plist /Library/LaunchDaemons/homebrew.mxcl.*.plist; do
     [[ -f "${plist}" ]] || continue
-    name="${plist##*/homebrew.mxcl.}"
-    name="${name%.plist}"
-    [[ "${name}" =~ ^[A-Za-z0-9][A-Za-z0-9@._+-]*$ ]] && echo "${name}"
-  done
-  return 0
+    brewau_service_formula "${plist}" || true
+  done | sort -u
 }
 
 # Hands the prefix to its original owner. Everything inside a directory
@@ -521,7 +677,8 @@ cmd_uninstall() {
   launchctl bootout "system/${BREWAU_LABEL}" 2>/dev/null || true
   rm -f "${BREWAU_SUDOERS}"
   stop_service_processes
-  restore_users
+  # While the prefix still belongs to _brewau, so copies into it are safe.
+  restore_users "${owner}"
 
   if [[ -n "${owner}" ]] && id "${owner}" >/dev/null 2>&1 && [[ -d "${HOMEBREW_PREFIX_PATH}" ]]; then
     return_cask_apps "${owner}"
@@ -551,7 +708,9 @@ main() {
     allow-user) require_root; allow_user "${2:?user required}" ;;
     deny-user) require_root; deny_user "${2:?user required}" ;;
     uninstall) cmd_uninstall ;;
-    *) brewau_die "usage: brewau-setup install|reload|allow-user|deny-user|uninstall" ;;
+    trust-app) cmd_trust_app "${2:?app required}" ;;
+    move-service-data) cmd_move_service_data "${2:?user required}" "${3:?formula required}" ;;
+    *) brewau_die "usage: brewau-setup install|reload|allow-user|deny-user|uninstall|trust-app|move-service-data" ;;
   esac
 }
 

@@ -14,8 +14,13 @@ BREWAU_CONF="${BREWAU_ROOT}/etc/brewau.conf"
 BREWAU_VAR="${BREWAU_ROOT}/var"
 BREWAU_HOME="${BREWAU_VAR}/home"
 BREWAU_TMP="${BREWAU_VAR}/tmp"
+# Where root stages copies of apps: only root can change anything there, unlike
+# /Applications, where admins can rename what root is working on.
+BREWAU_STAGING_DIR="${BREWAU_VAR}"
 BREWAU_LOG_DIR="${BREWAU_VAR}/log"
 BREWAU_STATE_DIR="${BREWAU_VAR}/state"
+# What brewau knows about each cask app's code signature (see brewau_app_trusted).
+BREWAU_APP_STATE_DIR="${BREWAU_STATE_DIR}/apps"
 BREWAU_AUDIT_LOG="${BREWAU_LOG_DIR}/audit.log"
 
 # Homebrew's system-wide environment file and the block brewau manages in it.
@@ -48,6 +53,10 @@ UPGRADE_MINUTE="0"
 # administrator edits). Otherwise problems that cannot weaken the policy only
 # warn, so a stale value never locks everyone out of brew.
 BREWAU_CONFIG_STRICT=0
+
+# 1 while brewau first takes over: apps as they are then become the record,
+# since whoever owned them before is trusted (see brewau_protect_apps).
+BREWAU_APPS_BASELINE=0
 
 # Set once by brewau_cache_forbidden_taps for jobs that run brew many times.
 BREWAU_FORBIDDEN_TAPS_CACHE=""
@@ -162,6 +171,70 @@ brewau_tap_allowed() {
   brewau_in_words "${tap}" "${ALLOWED_TAPS}"
 }
 
+# launchd job names Homebrew uses for formula $1: sh.brew.<formula>, and
+# homebrew.mxcl.<formula> for services started by older versions.
+brewau_service_labels() {
+  echo "sh.brew.$1"
+  echo "homebrew.mxcl.$1"
+}
+
+# Prints the plist in directory $1 named after one of formula $2's labels.
+brewau_service_plist() {
+  local label
+  while IFS= read -r label; do
+    [[ -f "$1/${label}.plist" ]] && { echo "$1/${label}.plist"; return 0; }
+  done < <(brewau_service_labels "$2")
+  return 1
+}
+
+# True if a job of formula $2 is loaded in launchd domain $1 (gui/<uid>, system).
+brewau_service_loaded() {
+  local label
+  while IFS= read -r label; do
+    launchctl print "$1/${label}" >/dev/null 2>&1 && return 0
+  done < <(brewau_service_labels "$2")
+  return 1
+}
+
+# Prints the formula that Homebrew service plist $1 belongs to, by its name.
+brewau_service_formula() {
+  local name="${1##*/}"
+  name="${name%.plist}"
+  case "${name}" in
+    sh.brew.?*) name="${name#sh.brew.}" ;;
+    homebrew.mxcl.?*) name="${name#homebrew.mxcl.}" ;;
+    *) return 1 ;;
+  esac
+  [[ "${name}" =~ ^[A-Za-z0-9][A-Za-z0-9@._+-]*$ ]] && echo "${name}"
+}
+
+# Prints, relative to the prefix's var directory, the data directories that
+# formula $1's service uses according to its keg, which only BREWAU_USER can
+# change: paths in its plist, and in config files that plist passes it,
+# except the var directory itself and its logs.
+brewau_service_var_dirs() {
+  local var="${HOMEBREW_PREFIX_PATH}/var" plist path rel seen=$'\n'
+  plist="$(brewau_service_plist "${HOMEBREW_PREFIX_PATH}/opt/$1" "$1")" || return 1
+  while IFS= read -r path; do
+    path="${path#*=}"
+    if [[ "${path}" == "${HOMEBREW_PREFIX_PATH}/etc/"* && -f "${path}" ]]; then
+      # Not in comments; a config without any is fine (pipefail).
+      sed '/^[[:space:]]*[#;]/d' "${path}" 2>/dev/null | grep -oE "${var//./\\.}/[^[:space:]\"';,]+" || true
+    else
+      echo "${path}"
+    fi
+  done < <(brewau_plist_strings "${plist}") |
+    while IFS= read -r path; do
+      [[ "${path}" == "${var}"/* ]] || continue
+      rel="${path#"${var}"}"
+      rel="${rel%/}"
+      [[ -n "${rel}" && "${rel}" != /log && "${rel}" != /log/* && "${rel}/" != */./* && "${rel}/" != */../* ]] || continue
+      [[ "${seen}" == *$'\n'"${rel}"$'\n'* ]] && continue
+      seen="${seen}${rel}"$'\n'
+      echo "${rel}"
+    done
+}
+
 # Prints the `brew services` action that $1 means, resolving Homebrew's
 # aliases (`s` is start, `ls` is list, ...).
 brewau_service_action() {
@@ -252,20 +325,39 @@ brewau_cask_app_paths() {
 # that code. Apps that update themselves as the user lose that ability.
 # $1 is the JSON file; the rest is an optional command prefix that gives root
 # (e.g. sudo -n). Prints the tokens of casks whose apps are still unprotected
-# afterwards (and then fails); progress goes to stderr.
+# afterwards or untrusted (and then fails); progress goes to stderr.
 brewau_protect_apps() {
-  local json="$1" token app result=0
+  local json="$1" token app locked result=0
   shift
   while IFS=$'\t' read -r token app; do
+    if brewau_app_untrusted "${app}"; then
+      echo "brewau: WARNING: ${app} is marked untrusted; an administrator must check it, then run: sudo brewau trust-app '${app}'" >&2
+      echo "${token}"
+      result=1
+      continue
+    fi
     brewau_app_needs_protection "${app}" || continue
     echo "brewau: protecting ${app}" >&2
+    locked=1
     if [[ $# -gt 0 ]]; then
-      "$@" /bin/bash -p -c 'source /opt/brewau/libexec/common.sh && brewau_lock_app "$1"' brewau "${app}" </dev/null >&2
+      "$@" /bin/bash -p -c 'source /opt/brewau/libexec/common.sh && brewau_lock_app "$1"' brewau "${app}" </dev/null >&2 || locked=0
     else
-      (brewau_lock_app "${app}") </dev/null >&2
+      (brewau_lock_app "${app}") </dev/null >&2 || locked=0
     fi
-    if brewau_app_needs_protection "${app}"; then
+    # On the first install apps are taken as they are (see BREWAU_APPS_BASELINE).
+    [[ "${BREWAU_APPS_BASELINE}" == "1" ]] && { brewau_record_app "${app}" || true; }
+    # Locked but not replaced by a fresh copy (see brewau_lock_app): files
+    # someone held open may still be its, so keep reporting it.
+    if [[ ${locked} -eq 0 ]] && ! brewau_app_needs_protection "${app}"; then
+      brewau_write_state "$(brewau_app_state "${app}").untrusted" "${app}" || true
+    fi
+    if [[ ${locked} -eq 0 ]] || brewau_app_needs_protection "${app}"; then
       echo "brewau: WARNING: could not protect ${app} (App Management permission?)" >&2
+      echo "${token}"
+      result=1
+    elif [[ "${BREWAU_APPS_BASELINE}" != "1" ]] && ! brewau_app_trusted "${app}"; then
+      echo "brewau: WARNING: ${app} could be changed by others, and it no longer carries the signature brewau recorded." >&2
+      echo "brewau: an administrator must check it, then run: sudo brewau trust-app '${app}'" >&2
       echo "${token}"
       result=1
     fi
@@ -273,10 +365,105 @@ brewau_protect_apps() {
   return "${result}"
 }
 
-# Locks one app bundle in BREWAU_APPDIR (see brewau_lock_tree). Runs as root.
+# Records the signature of every cask app (see brewau_record_app), after
+# brewau itself installed or upgraded casks. $1 is the JSON file.
+brewau_record_apps() {
+  local token app
+  while IFS=$'\t' read -r token app; do
+    brewau_app_needs_protection "${app}" || brewau_record_app "${app}" || true
+  done < <(brewau_cask_apps "$1")
+  return 0
+}
+
+# Prints the base name of the state files for app $1.
+brewau_app_state() {
+  echo "${BREWAU_APP_STATE_DIR}/$(md5 -qs "$1")"
+}
+
+brewau_app_untrusted() {
+  [[ -e "$(brewau_app_state "$1").untrusted" ]]
+}
+
+# Prints the Team ID of app $1 if its signature is intact and by a
+# certificate Apple issued (a self-made one can claim any Team ID). With $2,
+# the Team ID must be that one.
+brewau_app_team() {
+  local requirement="anchor apple generic" team
+  if [[ -n "${2:-}" ]]; then
+    [[ "$2" =~ ^[A-Z0-9]+$ ]] || return 1
+    requirement="${requirement} and certificate leaf[subject.OU] = \"$2\""
+  fi
+  codesign --verify --deep --strict -R="${requirement}" "$1" >/dev/null 2>&1 || return 1
+  team="$(codesign -dv "$1" 2>&1 | sed -n 's/^TeamIdentifier=//p')"
+  [[ "${team}" =~ ^[A-Z0-9]+$ && ( -z "${2:-}" || "${team}" == "$2" ) ]] || return 1
+  echo "${team}"
+}
+
+# Writes $2 to state file $1 atomically.
+brewau_write_state() {
+  local tmp
+  mkdir -p "${1%/*}" 2>/dev/null
+  tmp="$(mktemp "${1%/*}/.tmp.XXXXXX")" || return 1
+  if printf '%s\n' "$2" >"${tmp}" && chmod 0644 "${tmp}" && mv -f "${tmp}" "$1"; then
+    return 0
+  fi
+  rm -f "${tmp}"
+  return 1
+}
+
+# Remembers who signed app $1 ("-" if nobody did) as brewau put it in place,
+# so a later change can be told apart. Only re-checks an app whose bundle was
+# replaced (another inode) since; never one that is marked untrusted.
+brewau_record_app() {
+  local app="$1" state inode team
+  state="$(brewau_app_state "${app}")"
+  [[ -e "${state}.untrusted" ]] && return 0
+  inode="$(stat -f %i "${app}" 2>/dev/null)" || return 1
+  [[ "$(cut -f 1 "${state}.team" 2>/dev/null)" == "${inode}" ]] && return 0
+  team="$(brewau_app_team "${app}")" || team="-"
+  brewau_write_state "${state}.team" "${inode}"$'\t'"${team}"$'\t'"${app}"
+}
+
+# True if app $1, which others could change until it was just locked, still
+# carries an intact signature by the Team ID brewau recorded for it (or, with
+# no record yet, by any Team ID). Otherwise anyone's code may be in it, so it
+# is marked untrusted, and brew refuses to run its cask's steps, until an
+# administrator runs `sudo brewau trust-app`.
+brewau_app_trusted() {
+  local app="$1" state team recorded
+  state="$(brewau_app_state "${app}")"
+  recorded="$(cut -f 2 "${state}.team" 2>/dev/null)"
+  # An app recorded as unsigned can never be shown to be unchanged.
+  if [[ "${recorded}" != "-" ]] && team="$(brewau_app_team "${app}" "${recorded}")"; then
+    brewau_write_state "${state}.team" "$(stat -f %i "${app}")"$'\t'"${team}"$'\t'"${app}" && return 0
+  fi
+  brewau_write_state "${state}.untrusted" "${app}"
+  return 1
+}
+
+# Locks app bundle $1 in BREWAU_APPDIR (see brewau_lock_tree), then replaces
+# it by a copy of itself: whoever could change it before may still hold one of
+# its files open for writing, which locking cannot take away. Runs as root.
 brewau_lock_app() {
   [[ "$1" == "${BREWAU_APPDIR}"/*.app && "$1" != *..* && -d "$1" && ! -L "$1" ]] || return 1
-  brewau_lock_tree "$1"
+  brewau_lock_tree "$1" && brewau_replace_with_copy "$1"
+}
+
+# Replaces locked app $1 by a fresh copy (new files nobody has open), staged
+# in a directory only root can change. mv -h: if an admin turned the app's
+# path into a symlink meanwhile, it is replaced rather than followed.
+brewau_replace_with_copy() {
+  local app="$1" tmp
+  tmp="$(mktemp -d "${BREWAU_STAGING_DIR}/app-copy.XXXXXX")" || return 1
+  if [[ -d "${app}" && ! -L "${app}" ]] && ditto "${app}" "${tmp}/new" && mv -h "${app}" "${tmp}/old"; then
+    if mv -h "${tmp}/new" "${app}"; then
+      rm -rf "${tmp}"
+      return 0
+    fi
+    mv -h "${tmp}/old" "${app}"
+  fi
+  rm -rf "${tmp}"
+  return 1
 }
 
 # Gives everything under directory $1 that root does not own to BREWAU_USER
@@ -367,6 +554,14 @@ brewau_app_needs_protection() {
   [[ -n "$(find "$1" ! -type l \( ! -user root ! -user "${BREWAU_USER}" -o -perm -g+w -o -perm -o+w -o -acl \) -print 2>/dev/null | head -1)" ]]
 }
 
+# Prints every string value in plist $1 (ProgramArguments, environment
+# variables, paths), one per line; - reads the plist from stdin.
+brewau_plist_strings() {
+  plutil -convert xml1 -o - "$1" 2>/dev/null |
+    sed -n 's#.*<string>\(.*\)</string>.*#\1#p' |
+    sed 's#&amp;#\&#g; s#&lt;#<#g; s#&gt;#>#g'
+}
+
 # Runs a filter command over a file and writes the result back in place, so
 # symlinked files (stow, chezmoi, ...) stay symlinks and keep their owner.
 brewau_rewrite_file() {
@@ -439,6 +634,68 @@ _brewau_exec_brew() {
     HOMEBREW_FORBIDDEN_TAPS="${forbidden_taps}" \
     ${BREWAU_PASSTHROUGH_ENV} \
     "${HOMEBREW_BIN}" "$@"
+}
+
+# Prints what in git repository $1 (Homebrew or a tap) could make git, and so
+# Homebrew as BREWAU_USER, run something other than upstream code: any repo
+# config beyond the plain settings git and Homebrew write, hooks, a .git that
+# is not a plain directory, or (for Homebrew) another remote. Reads the files
+# only, never runs git on them.
+brewau_repo_problems() {
+  local dir="$1" file key value hook
+  [[ -e "${dir}/.git" || -L "${dir}/.git" ]] || return 0
+  if [[ ! -d "${dir}/.git" || -L "${dir}/.git" || -e "${dir}/.git/commondir" ]]; then
+    echo "${dir}: .git is not a plain repository directory"
+    return 0
+  fi
+  # git follows them, to files someone else may still control.
+  if [[ -n "$(find "${dir}/.git" -type l -print 2>/dev/null | head -1)" ]]; then
+    echo "${dir}: .git contains symlinks"
+    return 0
+  fi
+  for file in "${dir}/.git/config" "${dir}/.git/config.worktree"; do
+    [[ -f "${file}" ]] || continue
+    while IFS= read -r key; do
+      value="${key#*=}"
+      key="$(brewau_lower "${key%%=*}")"
+      brewau_git_setting_harmless "${dir}" "${key}" "${value}" || echo "${dir}: git config sets ${key}"
+    done < <(git config --file "${file}" --list 2>/dev/null)
+  done
+  for hook in "${dir}"/.git/hooks/*; do
+    [[ -e "${hook}" && "${hook}" != *.sample ]] && echo "${dir}: git hook ${hook##*/}"
+  done
+  return 0
+}
+
+# True for repository settings (key $2, value $3, in repository $1) that
+# cannot make git run anything or fetch from elsewhere.
+brewau_git_setting_harmless() {
+  case "$2" in
+    core.repositoryformatversion | core.filemode | core.bare | core.logallrefupdates | core.ignorecase | \
+      core.precomposeunicode | core.autocrlf | core.symlinks | core.untrackedcache | core.checkstat | \
+      core.trustctime | remote.origin.fetch | remote.origin.tagopt | remote.origin.prune | \
+      remote.origin.prunetags | remote.origin.followremotehead | fetch.prune | fetch.prunetags | \
+      fetch.writecommitgraph | gc.auto | gc.autodetach | branch.*.remote | branch.*.merge | branch.*.rebase | \
+      pull.rebase | pull.ff | homebrew.*) return 0 ;;
+    core.fsmonitor) [[ "$3" == "false" ]] ;;
+    # Taps are blocked or allowed by their remote elsewhere.
+    remote.origin.url)
+      [[ "$1" != "${HOMEBREW_PREFIX_PATH}" ]] && return 0
+      case "$(brewau_lower "${3%.git}")" in https://github.com/homebrew/brew | https://github.com/homebrew/brew/) return 0 ;; esac
+      return 1
+      ;;
+    *) return 1 ;;
+  esac
+}
+
+# Homebrew's repository and its taps.
+brewau_repos() {
+  local dir
+  echo "${HOMEBREW_PREFIX_PATH}"
+  for dir in "${HOMEBREW_PREFIX_PATH}"/Library/Taps/*/*; do
+    [[ -e "${dir}/.git" || -L "${dir}/.git" ]] && echo "${dir}"
+  done
+  return 0
 }
 
 # `brew services start` as root makes the service's keg root-owned (and

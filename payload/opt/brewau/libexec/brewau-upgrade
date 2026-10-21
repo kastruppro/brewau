@@ -115,7 +115,7 @@ restart_system_services() {
   for name in "$@"; do
     name="${name##*/}"
     brewau_service_allowed "${name}" || continue
-    launchctl print "system/homebrew.mxcl.${name}" >/dev/null 2>&1 || continue
+    brewau_service_loaded system "${name}" || continue
     log "restarting system service ${name}"
     if ! (BREWAU_PASSTHROUGH_ENV="" brewau_exec_brew_as_root services restart "${name}"); then
       log "could not restart ${name}"
@@ -132,14 +132,16 @@ clean_tmp() {
   return 0
 }
 
-# Locks every cask app (see brewau_protect_apps). Prints the casks whose apps
-# are still unprotected and returns 1, or returns 2 if the installed casks
-# could not be listed.
+# Locks every cask app (see brewau_protect_apps) and records the signatures of
+# those that are locked. Prints the casks whose apps are still unprotected or
+# untrusted and returns 1, or returns 2 if the installed casks could not be
+# listed.
 protect_apps() {
   local json result=0
   json="$(mktemp "${BREWAU_TMP}/casks.XXXXXX")" || return 2
   if brew_run info --json=v2 --installed --cask >"${json}" 2>/dev/null; then
     brewau_protect_apps "${json}" /usr/bin/sudo -n || result=1
+    brewau_record_apps "${json}"
   else
     log "could not list installed casks to protect their apps"
     result=2

@@ -278,13 +278,15 @@ runs_cask_uninstall() {
 # Locks every cask app (see brewau_protect_apps). Casks can ship apps with
 # group/world-writable files, and a user who changed one could have the next
 # cask upgrade or uninstall run their code as _brewau. Prints the casks whose
-# apps are still unprotected and returns 1, or returns 2 if the installed
-# casks could not be listed.
+# apps are still unprotected or untrusted and returns 1, or returns 2 if the
+# installed casks could not be listed. With --record, also records the
+# signatures of apps brew just put in place.
 protect_cask_apps() {
   local json result=0
   json="$(mktemp "${BREWAU_TMP}/casks.XXXXXX")" || return 2
   if (brewau_exec_brew info --json=v2 --installed --cask) >"${json}" 2>/dev/null; then
     brewau_protect_apps "${json}" /usr/bin/sudo -n || result=1
+    [[ "${1:-}" == "--record" ]] && brewau_record_apps "${json}"
   else
     echo "brewau: WARNING: could not list installed casks to protect their apps" >&2
     result=2
@@ -308,10 +310,10 @@ cask_apps_protected() {
     [[ "${arg}" == -* ]] && continue
     names=1
     brewau_in_words "${arg##*/}" "${unprotected}" &&
-      { deny "the app of ${arg##*/} could not be protected, so its code cannot be trusted"; return; }
+      { deny "the app of ${arg##*/} could not be protected or verified, so its code cannot be trusted"; return; }
   done
   [[ ${names} -eq 0 ]] || return 0
-  deny "the apps of ${unprotected//$'\n'/ } could not be protected, so their code cannot be trusted"
+  deny "the apps of ${unprotected//$'\n'/ } could not be protected or verified, so their code cannot be trusted"
 }
 
 # Runs brew, then locks the cask apps, also when brew fails or is interrupted.
@@ -322,7 +324,7 @@ run_then_protect_apps() {
   (brewau_exec_brew "$@") || rc=$?
   # ...but the locking, and the root helper it runs, must not be stopped.
   trap '' INT TERM HUP QUIT PIPE
-  protect_cask_apps >/dev/null
+  protect_cask_apps --record >/dev/null
   trap - INT TERM HUP QUIT PIPE
   return "${rc}"
 }

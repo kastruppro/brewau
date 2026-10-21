@@ -62,18 +62,30 @@ holds if nothing but the policy can steer `_brewau`:
   as root over files users may still be changing, so it works top-down, never follows a symlink,
   and replaces hard-linked files by copies rather than change the file they share. `--adopt` is
   refused: it would register an app you own, and can keep changing, as a cask.
+- Locking stops changes; it cannot undo one. So brewau records who signed each app (its Team ID,
+  from a certificate Apple issued) when it puts the app in place. When it finds an app that
+  someone else could have changed, it locks it, replaces it by a fresh copy (so that files they
+  still hold open are no longer the app's), and checks the copy's signature: it must be intact
+  (`codesign --verify --deep --strict`) and by the same Team ID. If not, or if the app is
+  unsigned, the app is marked untrusted and brew refuses the commands that would run its code,
+  until an administrator has checked it and runs `sudo brewau trust-app /Applications/<App>.app`
+  (`brewau doctor` lists such apps).
+- At install, brewau checks Homebrew's repository and taps for local changes, commits that are
+  not upstream, hooks, and any repository git config beyond the plain settings git and Homebrew
+  write (code the previous owner could have left for `_brewau` to run); `brewau doctor` keeps
+  checking the config and hooks.
 - Every invocation is logged with the calling user to `/opt/brewau/var/log/audit.log`.
 
 Residual risk, shared with Workbrew:
 - A cask that ships a `.pkg` runs its installer as root. You are trusting the casks you install
   and the taps in `ALLOWED_TAPS`.
-- Whoever owned `/opt/homebrew` and the cask apps before brewau took them over is trusted:
-  anything they planted there beforehand runs as `_brewau` later. Locking an app stops further
-  changes; it cannot undo changes made while the app was writable.
-- Admins can write to `/Applications` itself, so an admin account can swap a protected app for
-  its own copy and then run `brew uninstall`/`upgrade` on that cask. For admin members of
-  `brewau_users`, app protection closes accidental drift (self-updaters), not a deliberate attack.
-  Standard users cannot do this.
+- Whoever owned `/opt/homebrew` and the cask apps before brewau took them over is trusted beyond
+  what the install check sees: changed bottles in the Cellar, Homebrew's bundled Ruby, and the
+  apps as they were at the first install (their signatures become the record).
+- Admins can write to `/Applications` itself and swap a protected app. The swapped app is then
+  owned by them, so brewau checks its signature before running any of its code: a signed app has
+  to come from the same developer. An admin could still put in an older, genuine version from
+  that developer.
 - Everyone in `brewau_users` shares one package set: they can uninstall or untap what others use.
 
 ## Install
@@ -111,15 +123,18 @@ brewau restore-shell   # undo setup-shell
 sudo brewau config     # edit policy/schedule ($VISUAL/$EDITOR); only applied if it validates
 sudo brewau allow-user alice
 sudo brewau repair     # re-apply ownership, permissions and system files
+sudo brewau trust-app /Applications/Foo.app   # after checking an app brewau marked untrusted
+sudo brewau move-service-data alice postgresql@17   # data from before brewau, see Services
 sudo brewau uninstall  # closes access to _brewau first, then returns /opt/homebrew, apps,
                        # permissions and shell profiles
 ```
 
 On uninstall, Homebrew system daemons keep running; their kegs stay owned by root, as
 `sudo brew services start` leaves them, and brewau warns if the new owner of `/opt/homebrew`
-is not an administrator. It also names services whose data is still in
-`~/Library/Application Support/brewau/var`: move it back to `/opt/homebrew/var` before the
-next `brew services start` or `restart` of that service.
+is not an administrator. Services the owner of `/opt/homebrew` ran as themselves get their data
+copied back to `/opt/homebrew/var` and are pointed at it again, if they are stopped and nothing
+is in the way there (the copy in `~/Library/Application Support/brewau/var` stays). Other
+users' and running services are named: move their data before the next `brew services start`.
 
 ## Configuration
 
@@ -149,18 +164,26 @@ stale one).
 
 `brew services` works, in two modes:
 
-- **As you (default).** Homebrew starts the service as a LaunchAgent for your account, like
-  vanilla Homebrew, without any extra privileges. Because you cannot write to
-  `/opt/homebrew/var`, brewau moves the service's paths there (logs, data, working directory) to
-  `~/Library/Application Support/brewau/var`. Only the agent of the service you start is moved.
-  Data directories that a formula normally creates during installation (e.g. a database cluster)
-  start out empty there, and brewau names them; initialise them yourself, e.g.
+- **As you (default).** The service runs as a LaunchAgent for your account, like vanilla
+  Homebrew, without any extra privileges. Because you cannot write to `/opt/homebrew/var`, its
+  paths there (logs, data, working directory) are moved to
+  `~/Library/Application Support/brewau/var`: brewau writes the agent itself from the plist
+  Homebrew put in the formula's keg, with those paths, and loads it the way Homebrew does
+  (`brew services list`, `info` and `stop` work as usual). Formulae without such a plist,
+  services whose environment you override in `~/.homebrew/services/<formula>.env`, and `--all`
+  or `--file` go through Homebrew and are moved afterwards. Data directories that a
+  formula normally creates during installation (e.g. a database cluster) start out empty there,
+  and brewau names them; initialise them yourself, e.g.
   `initdb -D ~/Library/Application\ Support/brewau/var/postgresql@17`. Data the service had in
-  `/opt/homebrew/var` before brewau is now `_brewau`'s; brewau prints the command an
-  administrator can use to copy it over. Config files in `/opt/homebrew/etc` that point into
-  `/opt/homebrew/var` (e.g. `redis.conf`) are named too: run the service with a copy that uses
-  your own paths. `brew services run` is not supported, because Homebrew would run the service
-  with its files in `/opt/homebrew/var`; use `start` and `stop`.
+  `/opt/homebrew/var` before brewau (the directories its keg's plist and config name) can be
+  copied over by an administrator, with the service stopped:
+  `sudo brewau move-service-data <user> <formula>`. That data belongs to whoever ran the
+  service before; the administrator decides who gets a copy. A config file the service is given
+  as an argument (e.g. `redis.conf`) that points into `/opt/homebrew/var` is copied to
+  `~/Library/Application Support/brewau/etc` with your paths (by way of `~/Library/brewau/var`,
+  which has no spaces), and the service reads the copy; edit that one. Config files a service
+  finds by itself (e.g. nginx's) are not moved. `brew services run` is not supported, because
+  Homebrew would run the service with its files in `/opt/homebrew/var`; use `start` and `stop`.
 - **As a system daemon (root).** Formulae listed in `ALLOWED_SERVICES` run as root
   LaunchDaemons, started at boot. Use it for services that need root, which Homebrew marks as
   `require_root` (e.g. `tailscale`, `dnsmasq`, `unbound`); brewau refuses to start those as you.

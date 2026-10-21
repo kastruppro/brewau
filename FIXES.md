@@ -68,24 +68,50 @@ All fixed items have tests (`make test`) except where root is needed (noted).
 | 32 | `daemon_loaded` existed twice. | R3 #10 | `brewau_daemon_loaded` in `common.sh`. |
 | 33 | `brewau config` ignored `VISUAL`. | V | Uses `$VISUAL`, then `$EDITOR`. |
 
-## Mitigated, not fully solved
+## Follow-up (0.4.0): what the first round left open
 
-- **Formula config files hard-code `/opt/homebrew/var`** (R0 #8). Rewriting them generically is
-  unsafe: the user var path contains a space (`Application Support`), which most config syntaxes
-  would split. Relocation now names such config files (e.g. `redis.conf`) so the user can run the
-  service with their own copy.
-- **Service data stranded at uninstall** (R3 #3). Uninstall names every relocated service and
-  where its data is, but does not move databases automatically.
-- **Pre-brewau service data** (R0 #4). It is owned by `_brewau` after install, so the user cannot
-  copy it; relocation prints the `sudo ditto … && sudo chown …` command for an admin.
-- **Generating the user plist instead of relocating Homebrew's** (R3 #9) would remove the
-  start/stop/relocate dance, but means re-implementing Homebrew's service logic. Not done.
+| # | Was open | Now |
+|---|---|---|
+| 34 | Locking stops changes to an app but cannot undo one made while it was writable; admins can swap an app in `/Applications`. | brewau records each app's Team ID when it puts the app in place (first install, its own installs and upgrades, the nightly run). An app that someone else could have changed must, once locked, have an intact signature (`codesign --verify --deep --strict`) by the recorded Team ID; otherwise, or if it is unsigned, it is marked untrusted and brew refuses its cask's code-running commands until an admin runs `sudo brewau trust-app <app>`. `doctor` lists such apps. Only the first install takes apps as they are; `repair` does not. |
+| 35 | User services were started by Homebrew with prefix paths and relocated afterwards (failed `mkdir`s in the prefix, a first load with the wrong paths). | `start`/`restart` write the agent from the keg's plist, relocated before it is ever loaded, and enable and bootstrap it as Homebrew does. Formulae without a keg plist, `--all` and `--file` still go through Homebrew plus relocation. |
+| 36 | Config files that hard-code `/opt/homebrew/var` (R0 #8). | A config file given as an argument (e.g. `redis.conf`) is copied once to `~/Library/Application Support/brewau/etc` with the var path replaced by `~/Library/brewau/var`, a symlink without spaces, and the agent reads the copy. An edited copy is kept. |
+| 37 | Pre-brewau service data was `_brewau`'s and could not be copied by the user (R0 #4). | `sudo brewau move-service-data <user> <formula>` copies it, with the service stopped: as root into a private directory, then moved into place as the user. Which directories, comes from the keg (#44). |
+| 38 | Service data stranded at uninstall (R3 #3). | For the prefix owner's stopped services, uninstall copies the data back into the prefix (read as the user, taken over with `brewau_lock_tree`, refused if it holds a hard link to someone else's file) and points the agent at it again. Other users' and running services are named. |
+| 39 | The previous prefix owner was trusted without any check. | Install checks Homebrew's repository and taps (as `_brewau`, without writing the index) for local changes, commits not upstream, a non-official Homebrew remote, and git config or hooks that run commands, and suggests `brew update-reset`. `doctor` keeps checking config and hooks. |
+| 40 | `VERSION` was still 0.3.0. | 0.4.0. |
+
+A review of this follow-up found, and these fix:
+
+| # | Finding | Fix |
+|---|---|---|
+| 41 | Homebrew 7 names launchd jobs `sh.brew.<formula>`; `homebrew.mxcl.<formula>` is only the old name. Relocation, `restart_system_services` (since 0.3.0) and all the new service code looked for the old name only, so with current Homebrew user services were never relocated and system services never restarted after upgrades. | Every lookup tries both names (`brewau_service_labels`); starting a service replaces its job under either name, as Homebrew does. |
+| 42 | `codesign --verify` accepts any certificate, so a self-made one could claim the recorded Team ID. | Verified against `anchor apple generic and certificate leaf[subject.OU] = "<Team ID>"`. |
+| 43 | A user who held a file in the app open for writing before it was locked could still change it after the check. | A re-locked app is replaced by a fresh copy, which is what gets checked and used; a failed copy counts as unprotected. |
+| 44 | `move-service-data` and the uninstall copy-back took the directories to copy from the user's own plist, so a user could have any directory under `/opt/homebrew/var` copied to them. Data named only in a config file (redis `dir`) was missed. | The directories come from the keg's plist and the config files it passes, and must resolve inside the prefix's var directory. Uninstall also points the agent back at the prefix's config files. |
+| 45 | `copy_from_user`: until root took the temp directory back, the user could swap the copy for a symlink, which `brewau_lock_tree` would have followed. | The copy must be a real directory once root owns the temp directory again. |
+| 46 | The git check read only `.git/config` against a denylist: `config.worktree`, a `.git` file and keys like `http.proxy` got through. | Allowlist of plain settings; `config.worktree` is read too; a `.git` that is not a plain directory is flagged. |
+| 47 | `brewau_record_apps` could end `brewau-setup install` under `set -e`; `trust-app` could fail silently after deleting the record. | Guarded; `trust-app` reports the failure. |
+| 48 | `start_agent` wrote the agent into `LaunchAgents` before relocating it; ignored Homebrew's per-user `services/<formula>.env`; and could reuse a `~/Library/brewau/var` that was not its link. | Prepared in a temp file; Homebrew starts services with an env override (then relocated); an existing directory there is left alone and the config file named. |
+
+A second review of those fixes found, and these fix:
+
+| # | Finding | Fix |
+|---|---|---|
+| 49 | The fresh copy of an app was staged in `/Applications`, where any admin can rename the staging directory and point root's `ditto`/`mv` elsewhere (admin to root without a password). | Staged under `/opt/brewau/var` (root only, same volume); the app's path is re-checked, and `mv -h` replaces rather than follows a symlink put there meanwhile. |
+| 50 | Uninstall's copy-back changed the owner and mode of its temp directory by a path the user owned (in sticky `/tmp`), so they could swap it for a symlink to any file. | The user's directory sits inside one of root's; root takes it back with `chown -h`/`chmod -h`. |
+| 51 | An app that was locked but could not be replaced by a copy was reported once, then trusted on the next run although old write handles could still reach it. | It is marked untrusted until a copy succeeds and an admin trusts it. |
+| 52 | Taps whose `.git` is a file were never checked; symlinks inside `.git` (to config or hooks someone else still controls) passed. | Such taps are checked; any symlink in `.git` is flagged. |
+| 53 | `brewau_service_var_dirs` failed under `pipefail` when the last plist string was a config file without var paths, so `move-service-data` and the copy-back gave up; commented-out config lines counted. | Fixed; comments are skipped. |
 
 ## Residual risk (documented in README)
 
-- Whoever owned `/opt/homebrew` and the cask apps before brewau took them over is trusted:
-  locking stops further changes but cannot undo changes made while something was writable.
-- Admins can write to `/Applications` and so swap a protected app.
+- What git cannot see from before brewau: changed bottles in the Cellar, Homebrew's bundled Ruby,
+  and apps as they were at the first install.
+- An admin could swap an app for an older, genuine version by the same developer.
+- Config files a service finds by itself (e.g. nginx's compiled-in path) still point into
+  `/opt/homebrew/var`.
+- The keg's plist is what Homebrew generated when the keg was installed; a formula whose service
+  definition changed without a new keg starts with the old one.
 
 ## Review claims that did not hold
 
@@ -93,7 +119,3 @@ All fixed items have tests (`make test`) except where root is needed (noted).
   nothing falls through. The services path is restructured anyway.
 - R2 security 3 (`EDITOR` lost under sudo): macOS's default sudoers keeps `EDITOR` and `VISUAL`.
   `sudo -E` would hand the whole environment to root.
-
-## Open
-
-- `VERSION` is still `0.3.0`; bump it before the next release.

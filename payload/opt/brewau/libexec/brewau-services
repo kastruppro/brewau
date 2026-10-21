@@ -20,7 +20,11 @@ source "${BREWAU_LIBEXEC}/common.sh"
 
 POLICY="${BREWAU_LIBEXEC}/brew-policy"
 PREFIX_VAR="${HOMEBREW_PREFIX_PATH}/var"
-BREWAU_USER_VAR="${BREWAU_USER_VAR:-${HOME}/Library/Application Support/brewau/var}"
+BREWAU_USER_DIR="${BREWAU_USER_DIR:-${HOME}/Library/Application Support/brewau}"
+BREWAU_USER_VAR="${BREWAU_USER_DIR}/var"
+# The same directory by a path without spaces, for config files: most config
+# syntaxes would split "Application Support".
+BREWAU_USER_VAR_LINK="${BREWAU_USER_VAR_LINK:-${HOME}/Library/brewau/var}"
 LAUNCH_AGENTS="${LAUNCH_AGENTS:-${HOME}/Library/LaunchAgents}"
 
 # Homebrew run as the user, like vanilla Homebrew. It never writes to the
@@ -39,74 +43,173 @@ requires_root() {
   [[ "$(plutil -extract formulae.0.service.require_root raw -o - - <<<"${json}" 2>/dev/null)" == "true" ]]
 }
 
-# Prints every string value in plist $1 (ProgramArguments, environment
-# variables, paths), one per line.
-plist_strings() {
-  plutil -convert xml1 -o - "$1" 2>/dev/null |
-    sed -n 's#.*<string>\(.*\)</string>.*#\1#p' |
-    sed 's#&amp;#\&#g; s#&lt;#<#g; s#&gt;#>#g'
+# Copies prefix config file $1 into the user's own etc directory with the
+# prefix's var directory replaced, and prints the copy's path. An existing
+# copy is kept: the user may have edited it.
+config_copy() {
+  local copy="${BREWAU_USER_DIR}/etc/${1#"${HOMEBREW_PREFIX_PATH}/etc/"}"
+  [[ "${BREWAU_USER_VAR_LINK}" != *[[:space:]]* ]] || return 1
+  mkdir -p "${BREWAU_USER_VAR}" "${BREWAU_USER_VAR_LINK%/*}" "${copy%/*}" || return 1
+  # Never take over something else the user has there.
+  if [[ -L "${BREWAU_USER_VAR_LINK}" ]]; then
+    [[ "$(readlink "${BREWAU_USER_VAR_LINK}")" == "${BREWAU_USER_VAR}" ]] || return 1
+  elif [[ -e "${BREWAU_USER_VAR_LINK}" ]]; then
+    return 1
+  else
+    ln -s "${BREWAU_USER_VAR}" "${BREWAU_USER_VAR_LINK}" || return 1
+  fi
+  if [[ ! -e "${copy}" ]]; then
+    brewau_replace_literal "${PREFIX_VAR}" "${BREWAU_USER_VAR_LINK}" <"$1" >"${copy}" || { rm -f "${copy}"; return 1; }
+  fi
+  echo "${copy}"
 }
 
-# Points a Homebrew LaunchAgent at BREWAU_USER_VAR instead of the prefix's
-# var directory and reloads it. Idempotent: returns 2 when there was nothing
-# to relocate, 0 when the agent was relocated and loaded.
-relocate_agent() {
-  local plist="$1" label key path old missing="" moved="" configs=""
-  [[ -f "${plist}" ]] && grep -qF "${PREFIX_VAR}" "${plist}" || return 2
-  label="$(plutil -extract Label raw -o - "${plist}" 2>/dev/null)" || return 2
-
-  local i
-  launchctl bootout "gui/$(id -u)/${label}" 2>/dev/null
-  # bootout returns before the job is gone, and bootstrap fails until it is.
-  for ((i = 0; i < 25; i++)); do
-    launchctl print "gui/$(id -u)/${label}" >/dev/null 2>&1 || break
-    sleep 0.2
-  done
+# Rewrites LaunchAgent $1 (not loaded) of formula $2 to use BREWAU_USER_VAR
+# instead of the prefix's var directory, and copies of config files that name
+# it, then creates the directories it logs to and runs in. Prints what the
+# user may still have to do.
+prepare_agent() {
+  local plist="$1" formula="$2" key path rel copy configs="" copies="" missing="" moved=0 unfixed=""
+  # Config files the service is given as arguments.
+  while IFS= read -r path; do
+    path="${path#*=}"
+    [[ "${path}" == "${HOMEBREW_PREFIX_PATH}/etc/"* && -f "${path}" ]] && grep -qF "${PREFIX_VAR}" "${path}" 2>/dev/null &&
+      configs="${configs}${path}"$'\n'
+  done < <(brewau_plist_strings "${plist}")
+  while IFS= read -r path; do
+    [[ -n "${path}" ]] || continue
+    if copy="$(config_copy "${path}")"; then
+      # Whole plist strings only (or the value of an --option=).
+      brewau_rewrite_file "${plist}" brewau_replace_literal ">${path}<" ">${copy}<" &&
+        brewau_rewrite_file "${plist}" brewau_replace_literal "=${path}<" "=${copy}<" || return 1
+      copies="${copies}    ${copy}  (from ${path})"$'\n'
+    else
+      unfixed="${unfixed}    ${path}"$'\n'
+    fi
+  done <<<"${configs}"
   brewau_rewrite_file "${plist}" brewau_replace_literal "${PREFIX_VAR}" "${BREWAU_USER_VAR}" ||
     { echo "brewau: could not rewrite ${plist}; not loading it" >&2; return 1; }
   plutil -lint -s "${plist}" || { echo "brewau: ${plist} became invalid; not loading it" >&2; return 1; }
 
   mkdir -p "${BREWAU_USER_VAR}/log"
-  for key in StandardOutPath StandardErrorPath; do
+  for key in StandardOutPath StandardErrorPath StandardInPath; do
     path="$(plutil -extract "${key}" raw -o - "${plist}" 2>/dev/null)" && mkdir -p "$(dirname "${path}")"
   done
   path="$(plutil -extract WorkingDirectory raw -o - "${plist}" 2>/dev/null)" && mkdir -p "${path}"
 
   # Data directories (e.g. a database cluster) cannot be created generically;
-  # name the ones the service expects but that do not exist yet, and point
-  # at data the service had in the prefix before brewau. Config files in the
-  # prefix can name the prefix's var directory too, which plists cannot fix.
-  while IFS= read -r path; do
-    path="${path#*=}"
-    if [[ "${path}" == "${BREWAU_USER_VAR}"/* && ! -e "${path}" ]]; then
-      old="${PREFIX_VAR}${path#"${BREWAU_USER_VAR}"}"
-      if [[ -e "${old}" ]]; then
-        moved="${moved}    sudo ditto '${old}' '${path}' && sudo chown -R $(id -un) '${path}'"$'\n'
-      else
-        missing="${missing}    ${path}"$'\n'
-      fi
-    elif [[ "${path}" == "${HOMEBREW_PREFIX_PATH}/etc/"* && -f "${path}" ]] && grep -qF "${PREFIX_VAR}" "${path}" 2>/dev/null; then
-      configs="${configs}    ${path}"$'\n'
+  # name the ones the service expects (in its plist, or its keg's config)
+  # that do not exist yet, and say when it has data from before brewau.
+  while IFS= read -r rel; do
+    [[ -n "${rel}" && "${rel}" != /log && "${rel}" != /log/* && ! -e "${BREWAU_USER_VAR}${rel}" ]] || continue
+    if [[ -d "${PREFIX_VAR}${rel}" ]]; then
+      moved=1
+    else
+      missing="${missing}    ${BREWAU_USER_VAR}${rel}"$'\n'
     fi
-  done < <(plist_strings "${plist}")
+  done < <({
+    brewau_service_var_dirs "${formula}"
+    brewau_plist_strings "${plist}" | while IFS= read -r path; do
+      path="${path#*=}"
+      [[ "${path}" == "${BREWAU_USER_VAR}"/* ]] && echo "${path#"${BREWAU_USER_VAR}"}"
+    done
+  } | sort -u)
 
-  launchctl bootstrap "gui/$(id -u)" "${plist}" 2>/dev/null || true
-  echo "brewau: ${label#homebrew.mxcl.} runs as $(id -un); its files from ${PREFIX_VAR} are in ${BREWAU_USER_VAR}"
-  if [[ -n "${moved}" ]]; then
-    printf 'brewau: the service has data from before brewau in %s; an administrator can copy it over (with the service stopped):\n%s' "${PREFIX_VAR}" "${moved}"
+  echo "brewau: ${formula} runs as $(id -un); its files from ${PREFIX_VAR} are in ${BREWAU_USER_VAR}"
+  if [[ -n "${copies}" ]]; then
+    printf 'brewau: it reads its own copy of its config, with your paths; edit that one:\n%s' "${copies}"
+  fi
+  if [[ ${moved} -eq 1 ]]; then
+    printf 'brewau: it has data from before brewau in %s; an administrator can copy it over (with the service stopped):\n    sudo brewau move-service-data %s %s\n' \
+      "${PREFIX_VAR}" "$(id -un)" "${formula}"
   fi
   if [[ -n "${missing}" ]]; then
     printf 'brewau: these paths do not exist yet; the service may need them created or initialised first:\n%s' "${missing}"
   fi
-  if [[ -n "${configs}" ]]; then
-    printf 'brewau: these config files still use %s, which you cannot write to; point the service at a copy with your own paths:\n%s' "${PREFIX_VAR}" "${configs}"
+  if [[ -n "${unfixed}" ]]; then
+    printf 'brewau: these config files still use %s, which you cannot write to; point the service at a copy with your own paths:\n%s' "${PREFIX_VAR}" "${unfixed}"
   fi
+  return 0
+}
+
+# Waits until launchd has let go of job $1 in the user's domain.
+wait_unloaded() {
+  local i
+  for ((i = 0; i < 25; i++)); do
+    launchctl print "gui/$(id -u)/$1" >/dev/null 2>&1 || return 0
+    sleep 0.2
+  done
+}
+
+# Homebrew's per-user configuration directory, as bin/brew works it out.
+user_config_home() {
+  if [[ -n "${XDG_CONFIG_HOME:-}" ]]; then
+    echo "${XDG_CONFIG_HOME}/homebrew"
+  elif [[ -n "${HOMEBREW_XDG_CONFIG_HOME:-}" ]]; then
+    echo "${HOMEBREW_XDG_CONFIG_HOME}/homebrew"
+  else
+    echo "${HOME}/.homebrew"
+  fi
+}
+
+# Starts (or restarts, $2) formula $1 as the user, as Homebrew's `start` does
+# but from a plist that never points into the prefix: the one Homebrew put in
+# the keg, relocated before it is first loaded. Returns 2, without doing
+# anything, if the keg has no such plist or the user overrides the service's
+# environment (services/<formula>.env), which Homebrew then handles.
+start_agent() {
+  local formula="$1" action="$2" src label dest domain old tmp
+  domain="gui/$(id -u)"
+  src="$(brewau_service_plist "${HOMEBREW_PREFIX_PATH}/opt/${formula}" "${formula}")" || return 2
+  [[ -e "$(user_config_home)/services/${formula}.env" ]] && return 2
+  label="${src##*/}"
+  label="${label%.plist}"
+  dest="${LAUNCH_AGENTS}/${label}.plist"
+  if [[ "${action}" == "start" ]] && brewau_service_loaded "${domain}" "${formula}"; then
+    echo "Service \`${formula}\` already started, use \`brew services restart ${formula}\` to restart."
+    return 0
+  fi
+  # Replace the agent under any of its names, as Homebrew does.
+  while IFS= read -r old; do
+    launchctl bootout "${domain}/${old}" 2>/dev/null && wait_unloaded "${old}"
+    [[ "${LAUNCH_AGENTS}/${old}.plist" == "${dest}" ]] || rm -f "${LAUNCH_AGENTS}/${old}.plist"
+  done < <(brewau_service_labels "${formula}")
+  # Prepared elsewhere, so launchd never finds a half-done agent at login.
+  tmp="$(mktemp "${TMPDIR:-/tmp}/brewau-agent.XXXXXX")" || return 1
+  if ! cp "${src}" "${tmp}" || ! prepare_agent "${tmp}" "${formula}" ||
+    ! mkdir -p "${LAUNCH_AGENTS}" || ! mv -f "${tmp}" "${dest}"; then
+    rm -f "${tmp}"
+    return 1
+  fi
+  chmod 0644 "${dest}"
+  launchctl enable "${domain}/${label}" 2>/dev/null
+  if ! launchctl bootstrap "${domain}" "${dest}"; then
+    echo "brewau: could not load ${dest}" >&2
+    return 1
+  fi
+  echo "==> Successfully started \`${formula}\` (label: ${label})"
+}
+
+# Relocates a LaunchAgent that Homebrew itself generated (and loaded) and
+# reloads it. Idempotent: returns 2 when there was nothing to relocate, 0 when
+# the agent was relocated and loaded.
+relocate_agent() {
+  local plist="$1" label
+  local formula
+  [[ -f "${plist}" ]] && grep -qF "${PREFIX_VAR}" "${plist}" || return 2
+  label="$(plutil -extract Label raw -o - "${plist}" 2>/dev/null)" || return 2
+  formula="$(brewau_service_formula "${plist}")" || return 2
+  launchctl bootout "gui/$(id -u)/${label}" 2>/dev/null
+  # bootout returns before the job is gone, and bootstrap fails until it is.
+  wait_unloaded "${label}"
+  prepare_agent "${plist}" "${formula}" || return 1
+  launchctl bootstrap "gui/$(id -u)" "${plist}" 2>/dev/null || true
   launchctl print "gui/$(id -u)/${label}" >/dev/null 2>&1
 }
 
 relocate_agents() {
   local plist
-  for plist in "${LAUNCH_AGENTS}"/homebrew.mxcl.*.plist; do
+  for plist in "${LAUNCH_AGENTS}"/sh.brew.*.plist "${LAUNCH_AGENTS}"/homebrew.mxcl.*.plist; do
     relocate_agent "${plist}"
   done
   return 0
@@ -114,12 +217,11 @@ relocate_agents() {
 
 # True if the user has their own LaunchAgent for formula $1.
 user_agent_exists() {
-  [[ -f "${LAUNCH_AGENTS}/homebrew.mxcl.$1.plist" ]] ||
-    launchctl print "gui/$(id -u)/homebrew.mxcl.$1" >/dev/null 2>&1
+  brewau_service_plist "${LAUNCH_AGENTS}" "$1" >/dev/null || brewau_service_loaded "gui/$(id -u)" "$1"
 }
 
 system_daemon_loaded() {
-  launchctl print "system/homebrew.mxcl.$1" >/dev/null 2>&1
+  brewau_service_loaded system "$1"
 }
 
 # `brew services list --json` as one JSON array: the user's services, but
@@ -209,6 +311,14 @@ main() {
       ;;
   esac
 
+  # Started from the keg's plist, unless the user names their own (--file)
+  # or wants every service (--all, left to Homebrew).
+  if [[ "${action}" =~ ^(start|restart)$ && -n "${name}" && ${all} -eq 0 && "$*" != *--file* ]]; then
+    rc=0
+    start_agent "${formula}" "${action}" || rc=$?
+    [[ ${rc} -eq 2 ]] || return "${rc}"
+  fi
+
   user_brew services "$@"
   rc=$?
   case "${action}" in
@@ -217,8 +327,12 @@ main() {
       if [[ -n "${name}" ]]; then
         # Homebrew fails creating directories in the prefix after writing the
         # plist; once relocated and loaded, the service is running after all.
-        local relocated=0
-        relocate_agent "${LAUNCH_AGENTS}/homebrew.mxcl.${formula}.plist" || relocated=$?
+        local relocated=0 plist
+        if plist="$(brewau_service_plist "${LAUNCH_AGENTS}" "${formula}")"; then
+          relocate_agent "${plist}" || relocated=$?
+        else
+          relocated=2
+        fi
         if [[ ${relocated} -eq 0 && ${rc} -ne 0 ]]; then
           echo "brewau: ${formula} is running; the error above came from Homebrew creating directories in ${PREFIX_VAR}." >&2
           rc=0

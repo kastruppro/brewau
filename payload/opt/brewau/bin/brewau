@@ -35,6 +35,9 @@ Administrator commands (run with sudo):
   repair              re-apply ownership, permissions and system files
   allow-user <user>   allow a user to run brew
   deny-user <user>    revoke a user's access to brew
+  trust-app <app>     trust a cask app again after checking it (see brewau doctor)
+  move-service-data <user> <formula>
+                      copy a service's data from before brewau to where it now runs
   uninstall           remove brewau and return Homebrew to its original owner
 EOF
 }
@@ -142,6 +145,24 @@ cmd_doctor() {
   brewau_daemon_loaded && ok "upgrade daemon is loaded" || bad "upgrade daemon is not loaded; run: sudo brewau reload"
   in_users_group && ok "$(id -un) is in ${BREWAU_USERS_GROUP}" ||
     bad "$(id -un) is not in ${BREWAU_USERS_GROUP}; run: sudo brewau allow-user $(id -un)"
+
+  # The previous owner of the prefix, or anyone who could write to it, could
+  # have made git run commands as _brewau.
+  local dir problem repos_ok=1
+  while IFS= read -r dir; do
+    while IFS= read -r problem; do
+      [[ -n "${problem}" ]] || continue
+      bad "${problem}; review it (git runs it as ${BREWAU_USER})"
+      repos_ok=0
+    done < <(brewau_repo_problems "${dir}")
+  done < <(brewau_repos)
+  [[ ${repos_ok} -eq 0 ]] || ok "Homebrew's repository and taps have no git config or hooks that run commands"
+
+  local marker
+  for marker in "${BREWAU_APP_STATE_DIR}"/*.untrusted; do
+    [[ -f "${marker}" ]] || continue
+    bad "$(cat "${marker}") may have been changed by someone else; check it, then: sudo brewau trust-app '$(cat "${marker}")'"
+  done
 
   local forbidden
   forbidden="$(brewau_forbidden_taps)"
@@ -291,7 +312,7 @@ case "${1:-}" in
     [[ "$(id -u)" -eq 0 ]] || brewau_die "run with sudo: sudo brewau repair"
     root_command install
     ;;
-  reload | allow-user | deny-user | uninstall) root_command "$@" ;;
+  reload | allow-user | deny-user | uninstall | trust-app | move-service-data) root_command "$@" ;;
   version | --version | -v) echo "${VERSION}" ;;
   "" | help | -h | --help) usage ;;
   *) usage >&2; exit 1 ;;

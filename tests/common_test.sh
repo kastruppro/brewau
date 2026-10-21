@@ -92,6 +92,8 @@ check "yes" "$(brewau_app_needs_protection "${BREWAU_APPDIR}/Safe.app" && echo y
   "a group-writable directory inside the app is detected"
 
 # --- brewau_lock_app ---------------------------------------------------------
+BREWAU_STAGING_DIR="${WORK}/staging"
+mkdir -p "${BREWAU_STAGING_DIR}"
 APP="${BREWAU_APPDIR}/Open.app"
 OUTSIDE="${WORK}/outside"
 mkdir -p "${APP}/Contents/MacOS" "${APP}/Contents/Resources" "${OUTSIDE}/deep"
@@ -103,7 +105,11 @@ chmod +a "everyone allow add_file" "${APP}/Contents/Resources"
 ln -s "${OUTSIDE}" "${APP}/Contents/Link"
 ln -s "${OUTSIDE}/deep/target" "${APP}/Contents/MacOS/linked"
 check "yes" "$(brewau_app_needs_protection "${APP}" && echo yes || echo no)" "an open app needs protection"
+INODE="$(stat -f %i "${APP}/Contents/MacOS/run")"
 check "ok" "$( (brewau_lock_app "${APP}") && echo ok || echo fail)" "locking it succeeds"
+check "yes" "$([[ "$(stat -f %i "${APP}/Contents/MacOS/run")" != "${INODE}" && -f "${APP}/Contents/MacOS/run" ]] && echo yes || echo no)" \
+  "and replaces it by a copy, so files someone held open are not the app's any more"
+check "" "$(ls -A "${BREWAU_STAGING_DIR}")" "staged where only root can change it, leaving nothing behind"
 check "no" "$(brewau_app_needs_protection "${APP}" && echo yes || echo no)" "and leaves nothing writable or ACL'd"
 check "777 777 777" "$(stat -f '%Lp' "${OUTSIDE}" "${OUTSIDE}/deep" "${OUTSIDE}/deep/target" | tr '\n' ' ' | sed 's/ $//')" \
   "targets of symlinks inside the app are untouched"
@@ -123,7 +129,7 @@ mkdir -p "${APP}/Contents/Stuck" "${APP}/Contents/Open"
 touch "${APP}/Contents/Stuck/run" "${APP}/Contents/Open/run"
 chmod 777 "${APP}/Contents/Stuck" "${APP}/Contents/Stuck/run" "${APP}/Contents/Open" "${APP}/Contents/Open/run"
 chflags uchg "${APP}/Contents/Stuck"
-check "fail" "$( (brewau_lock_app "${APP}") && echo ok || echo fail)" "locking reports a directory it cannot lock"
+check "fail" "$( (brewau_lock_app "${APP}") 2>/dev/null && echo ok || echo fail)" "locking reports a directory it cannot lock"
 check "755 755" "$(stat -f '%Lp' "${APP}/Contents/Open" "${APP}/Contents/Open/run" | tr '\n' ' ' | sed 's/ $//')" \
   "but still locks the rest"
 check "777" "$(stat -f '%Lp' "${APP}/Contents/Stuck/run")" "and leaves files in the unlocked directory alone"
@@ -142,6 +148,129 @@ check "fail" "$(brewau_unlink_copy "${BREWAU_APPDIR}/Linked.app/Contents/flagged
   "a hard link with user flags is left alone"
 chflags nouchg "${OUTSIDE}/shared"
 check "fail" "$( (brewau_lock_app "${BREWAU_APPDIR}/Link.app") && echo ok || echo fail)" "a symlinked app is refused"
+
+# --- code signatures ---------------------------------------------------------
+BREWAU_APP_STATE_DIR="${WORK}/state/apps"
+APP="${BREWAU_APPDIR}/Signed.app"
+mkdir -p "${APP}/Contents/MacOS"
+printf '<?xml version="1.0" encoding="UTF-8"?>\n<plist version="1.0"><dict><key>CFBundleIdentifier</key><string>test.signed</string><key>CFBundleExecutable</key><string>run</string></dict></plist>\n' \
+  >"${APP}/Contents/Info.plist"
+cp /usr/bin/true "${APP}/Contents/MacOS/run"
+codesign -s - --force "${APP}" 2>/dev/null
+check "fail" "$(brewau_app_team "${APP}" || echo fail)" "an ad-hoc signature has no Team ID"
+check "ok" "$(brewau_record_app "${APP}" && echo ok)" "an app is recorded"
+check "-" "$(cut -f 2 "$(brewau_app_state "${APP}").team")" "as unsigned"
+STATE="$(brewau_app_state "${APP}")"
+
+# With a signed app (codesign mocked).
+brewau_app_team() { [[ -n "${MOCK_TEAM}" && ( -z "${2:-}" || "$2" == "${MOCK_TEAM}" ) ]] && echo "${MOCK_TEAM}"; }
+rm -f "${STATE}.team"
+MOCK_TEAM="TEAM1"
+check "yes" "$(brewau_app_trusted "${APP}" && echo yes || echo no)" "without a record, an intact signature is trusted"
+check "TEAM1" "$(cut -f 2 "${STATE}.team")" "and becomes the record"
+check "yes" "$(brewau_app_trusted "${APP}" && echo yes || echo no)" "the same Team ID stays trusted"
+MOCK_TEAM="OTHER"
+check "no" "$(brewau_app_trusted "${APP}" && echo yes || echo no)" "another Team ID is not"
+check "yes" "$(brewau_app_untrusted "${APP}" && echo yes || echo no)" "and the app is marked untrusted"
+MOCK_TEAM="TEAM1"
+check "yes" "$(brewau_app_untrusted "${APP}" && echo yes || echo no)" "until an administrator trusts it again"
+cat >"${WORK}/signed.json" <<EOF
+{"casks": [{"token": "signed", "artifacts": [{"app": ["Signed.app"], "target": "${APP}"}]}]}
+EOF
+check "signed" "$(brewau_protect_apps "${WORK}/signed.json" 2>/dev/null)" "an untrusted app's cask is reported though the app is locked"
+rm -f "${STATE}.untrusted"
+check "" "$(brewau_protect_apps "${WORK}/signed.json" 2>/dev/null)" "a trusted, locked app is not"
+# Locked, but the fresh copy failed: files someone held open may still be its.
+chmod g+w "${APP}/Contents"
+BREWAU_STAGING_DIR="${WORK}/missing"
+check "signed" "$(brewau_protect_apps "${WORK}/signed.json" 2>/dev/null)" "an app that could not be copied is reported"
+check "signed" "$(brewau_protect_apps "${WORK}/signed.json" 2>/dev/null)" "and stays reported"
+BREWAU_STAGING_DIR="${WORK}/staging"
+rm -f "${STATE}.untrusted"
+MOCK_TEAM=""
+chmod g+w "${APP}/Contents"
+check "signed" "$(brewau_protect_apps "${WORK}/signed.json" 2>/dev/null)" "a writable app whose signature broke is reported"
+check "yes" "$(brewau_app_untrusted "${APP}" && echo yes || echo no)" "and marked untrusted"
+rm -f "${STATE}.untrusted" "${STATE}.team"
+chmod g+w "${APP}/Contents"
+BREWAU_APPS_BASELINE=1
+check "" "$(brewau_protect_apps "${WORK}/signed.json" 2>/dev/null)" "on first install, apps are taken as they are"
+brewau_record_apps "${WORK}/signed.json"
+check "no -" "$(brewau_app_untrusted "${APP}" && echo yes || echo no) $(cut -f 2 "${STATE}.team")" "and recorded"
+BREWAU_APPS_BASELINE=0
+unset -f brewau_app_team
+
+# --- git repositories ---------------------------------------------------------
+REPO="${WORK}/repo"
+mkdir -p "${REPO}/.git/hooks"
+printf '[core]\n\tfsmonitor = false\n[remote "origin"]\n\turl = https://github.com/acme/brew\n' >"${REPO}/.git/config"
+touch "${REPO}/.git/hooks/pre-commit.sample"
+check "" "$(brewau_repo_problems "${REPO}")" "a plain repository has no problems"
+HOMEBREW_PREFIX_PATH="${REPO}"
+check "${REPO}: git config sets remote.origin.url" "$(brewau_repo_problems "${REPO}")" "Homebrew's own repository must use the official remote"
+printf '[filter "x"]\n\tclean = evil\n[core]\n\tfsmonitor = /tmp/evil\n' >>"${REPO}/.git/config"
+touch "${REPO}/.git/hooks/post-checkout"
+check "4" "$(brewau_repo_problems "${REPO}" | wc -l | tr -d ' ')" "config that runs commands and hooks are flagged"
+HOMEBREW_PREFIX_PATH="${WORK}/prefix"
+REPO="${WORK}/repo2"
+mkdir -p "${REPO}/.git"
+printf '[core]\n\trepositoryformatversion = 0\n\tautocrlf = false\n[branch "main"]\n\tremote = origin\n\tmerge = refs/heads/main\n[homebrew]\n\tforceautoupdate = true\n' >"${REPO}/.git/config"
+check "" "$(brewau_repo_problems "${REPO}")" "plain settings git and Homebrew write pass"
+printf '[http]\n\tproxy = http://evil\n' >"${REPO}/.git/config.worktree"
+check "${REPO}: git config sets http.proxy" "$(brewau_repo_problems "${REPO}")" "anything else is flagged, in config.worktree too"
+rm -f "${REPO}/.git/config.worktree"
+ln -s "${WORK}/elsewhere" "${REPO}/.git/hooks"
+check "${REPO}: .git contains symlinks" "$(brewau_repo_problems "${REPO}")" "symlinks inside .git are flagged"
+rm -rf "${REPO}/.git"
+echo "gitdir: /tmp/elsewhere" >"${REPO}/.git"
+check "${REPO}: .git is not a plain repository directory" "$(brewau_repo_problems "${REPO}")" "a .git file is flagged"
+HOMEBREW_PREFIX_PATH="${WORK}/brewprefix"
+mkdir -p "${HOMEBREW_PREFIX_PATH}/Library/Taps/acme/homebrew-file"
+echo "gitdir: /tmp/elsewhere" >"${HOMEBREW_PREFIX_PATH}/Library/Taps/acme/homebrew-file/.git"
+check "yes" "$(brewau_repos | grep -qx "${HOMEBREW_PREFIX_PATH}/Library/Taps/acme/homebrew-file" && echo yes || echo no)" \
+  "a tap whose .git is a file is checked too"
+HOMEBREW_PREFIX_PATH="${WORK}/prefix"
+
+# --- service names and data directories ---------------------------------------
+check "sh.brew.redis homebrew.mxcl.redis" "$(brewau_service_labels redis | tr '\n' ' ' | sed 's/ $//')" "both of Homebrew's names"
+check "redis postgresql@17" "$(brewau_service_formula /x/sh.brew.redis.plist) $(brewau_service_formula /x/homebrew.mxcl.postgresql@17.plist)" \
+  "the formula comes from either name"
+check "fail" "$(brewau_service_formula /x/com.example.plist || echo fail)" "other plists are not Homebrew's"
+mkdir -p "${WORK}/prefix/opt/redis" "${WORK}/prefix/etc"
+VAR="${WORK}/prefix/var"
+printf 'dir %s/db/redis/\nlogfile "%s/log/redis.log"\n' "${VAR}" "${VAR}" >"${WORK}/prefix/etc/redis.conf"
+cat >"${WORK}/prefix/opt/redis/sh.brew.redis.plist" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0"><dict>
+  <key>Label</key><string>sh.brew.redis</string>
+  <key>ProgramArguments</key><array>
+    <string>${WORK}/prefix/opt/redis/bin/redis-server</string>
+    <string>${WORK}/prefix/etc/redis.conf</string>
+    <string>--dir=${VAR}/redis-extra</string>
+    <string>${VAR}/../escape</string>
+  </array>
+  <key>StandardErrorPath</key><string>${VAR}/log/redis.log</string>
+  <key>WorkingDirectory</key><string>${VAR}</string>
+</dict></plist>
+EOF
+check "/db/redis /redis-extra" "$(brewau_service_var_dirs redis | tr '\n' ' ' | sed 's/ $//')" \
+  "data directories come from the keg's plist and config, without the var directory, logs or escapes"
+check "fail" "$(brewau_service_var_dirs nothere || echo fail)" "a formula without a keg plist has none"
+# The last string a config without var paths in it, under pipefail.
+mkdir -p "${WORK}/prefix/opt/svc"
+echo "# dir ${VAR}/commented" >"${WORK}/prefix/etc/svc.conf"
+cat >"${WORK}/prefix/opt/svc/sh.brew.svc.plist" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0"><dict>
+  <key>Label</key><string>sh.brew.svc</string>
+  <key>ProgramArguments</key><array>
+    <string>${VAR}/svc-data</string>
+    <string>${WORK}/prefix/etc/svc.conf</string>
+  </array>
+</dict></plist>
+EOF
+check "/svc-data ok" "$( (set -o pipefail; brewau_service_var_dirs svc | tr '\n' ' '; echo ok))" \
+  "succeeds, and skips commented-out config"
 
 # --- brewau_rewrite_file -----------------------------------------------------
 echo "keep" >"${WORK}/file"

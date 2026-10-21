@@ -12,8 +12,9 @@ FAIL=0
 
 sed "s#^BREWAU_LIBEXEC=.*#BREWAU_LIBEXEC=\"${PAYLOAD}/libexec\"#" "${PAYLOAD}/libexec/brewau-services" >"${WORK}/brewau-services"
 BREWAU_SERVICES_TEST=1
-BREWAU_USER_VAR="${WORK}/home/Library/Application Support/brewau/var"
-LAUNCH_AGENTS="${WORK}/home/Library/LaunchAgents"
+# Everything the script writes for the user derives from HOME.
+HOME="${WORK}/home"
+LAUNCH_AGENTS="${HOME}/Library/LaunchAgents"
 # shellcheck source=/dev/null
 source "${WORK}/brewau-services"
 BREWAU_CONF="${WORK}/brewau.conf"
@@ -56,7 +57,7 @@ scenario() {
   NAME="$1"
   : >"${CALLS}"
   printf 'ALLOWED_SERVICES="%s"\n' "${2:-}" >"${BREWAU_CONF}"
-  rm -rf "${LAUNCH_AGENTS}" "${WORK}/home/Library/Application Support"
+  rm -rf "${LAUNCH_AGENTS}" "${HOME}/Library/Application Support" "${HOME}/Library/brewau"
   mkdir -p "${LAUNCH_AGENTS}"
   MOCK_LOADED=""
   unset MOCK_USER_JSON MOCK_SYSTEM_JSON MOCK_USER_RC
@@ -202,8 +203,79 @@ HOMEBREW_PREFIX_PATH="${WORK}/prefix"
 echo "dir ${PREFIX_VAR}/redis" >"${WORK}/prefix/etc/redis.conf"
 write_agent redis "${PREFIX_VAR}/redis" "${WORK}/prefix/etc/redis.conf"
 OUTPUT="$(main services start redis 2>&1)"
-check '[[ "${OUTPUT}" == *"sudo ditto '"'"'${PREFIX_VAR}/redis'"'"' '"'"'${BREWAU_USER_VAR}/redis'"'"'"* ]]' "says how to copy the data over"
-check '[[ "${OUTPUT}" == *"still use"*"${WORK}/prefix/etc/redis.conf"* ]]' "names the config file that points into the prefix"
+PLIST="${LAUNCH_AGENTS}/homebrew.mxcl.redis.plist"
+COPY="${BREWAU_USER_DIR}/etc/redis.conf"
+check '[[ "${OUTPUT}" == *"sudo brewau move-service-data $(id -un) redis"* ]]' "says how to copy the data over"
+check '[[ "$(plutil -extract ProgramArguments.4 raw -o - "${PLIST}")" == "${COPY}" ]]' "the service reads a copy of its config"
+check '[[ "$(cat "${COPY}")" == "dir ${BREWAU_USER_VAR_LINK}/redis" ]]' "which uses the user var by a path without spaces"
+check '[[ "$(cd -P "${BREWAU_USER_VAR_LINK}" && pwd -P)" == "$(cd -P "${BREWAU_USER_VAR}" && pwd -P)" ]]' "that leads to the user var"
+check '[[ "$(cat "${WORK}/prefix/etc/redis.conf")" == "dir ${PREFIX_VAR}/redis" ]]' "the original is untouched"
+echo "dir /edited" >"${COPY}"
+write_agent redis "${PREFIX_VAR}/redis" "${WORK}/prefix/etc/redis.conf"
+main services restart redis >/dev/null 2>&1
+check '[[ "$(cat "${COPY}")" == "dir /edited" ]]' "a copy the user edited is kept"
+
+# --- starting from the keg's plist -------------------------------------------
+scenario "start from the keg" ""
+mkdir -p "${WORK}/prefix/opt/memcached"
+write_agent memcached "${PREFIX_VAR}/memcached"
+mv "${LAUNCH_AGENTS}/homebrew.mxcl.memcached.plist" "${WORK}/prefix/opt/memcached/"
+PLIST="${LAUNCH_AGENTS}/homebrew.mxcl.memcached.plist"
+# Not in a subshell: launchd's mock state has to persist.
+RC=0
+main services start memcached >"${WORK}/output" 2>&1 || RC=$?
+OUTPUT="$(cat "${WORK}/output")"
+check '[[ ${RC} -eq 0 ]] && ! grep -q "^user services start" "${CALLS}"' "starts it without Homebrew"
+check '! grep -q "${PREFIX_VAR}" "${PLIST}"' "from a relocated copy"
+check '[[ "$(grep -c "^launchctl bootstrap" "${CALLS}")" -eq 1 ]]' "that was never loaded with prefix paths"
+check 'called "launchctl enable ${UID_DOMAIN}/homebrew.mxcl.memcached" && called "launchctl bootstrap ${UID_DOMAIN} ${PLIST}"' "enabled and loaded like Homebrew does"
+check '[[ -d "${BREWAU_USER_VAR}/log" ]]' "its log directory exists"
+check '[[ "${OUTPUT}" == *"Successfully started"* ]]' "and says so"
+: >"${CALLS}"
+main services start memcached >/dev/null 2>&1
+check '! grep -q "^launchctl bootstrap" "${CALLS}"' "starting it again leaves it running"
+: >"${CALLS}"
+main services restart memcached >/dev/null 2>&1
+check 'called "launchctl bootout ${UID_DOMAIN}/homebrew.mxcl.memcached" && called "launchctl bootstrap ${UID_DOMAIN} ${PLIST}"' "restart reloads it"
+: >"${CALLS}"
+main services start --file=/tmp/x.plist memcached >/dev/null 2>&1
+check 'called "user services start --file=/tmp/x.plist memcached"' "a plist of the user's own is left to Homebrew"
+
+scenario "current Homebrew names jobs sh.brew" ""
+mkdir -p "${WORK}/prefix/opt/valkey"
+write_agent valkey "${PREFIX_VAR}/valkey"
+sed 's/homebrew.mxcl.valkey/sh.brew.valkey/' "${LAUNCH_AGENTS}/homebrew.mxcl.valkey.plist" >"${WORK}/prefix/opt/valkey/sh.brew.valkey.plist"
+# An agent from an older Homebrew, still loaded under the old name.
+MOCK_LOADED="${UID_DOMAIN}/homebrew.mxcl.valkey"
+main services restart valkey >/dev/null 2>&1
+check 'called "launchctl bootout ${UID_DOMAIN}/homebrew.mxcl.valkey"' "the old job is stopped"
+check '[[ ! -e "${LAUNCH_AGENTS}/homebrew.mxcl.valkey.plist" && -f "${LAUNCH_AGENTS}/sh.brew.valkey.plist" ]]' "and replaced under the new name"
+check 'called "launchctl bootstrap ${UID_DOMAIN} ${LAUNCH_AGENTS}/sh.brew.valkey.plist"' "which is loaded"
+check '! grep -q "${PREFIX_VAR}" "${LAUNCH_AGENTS}/sh.brew.valkey.plist"' "relocated"
+
+scenario "Homebrew writes the agent when the user overrides its environment" ""
+mkdir -p "${HOME}/.homebrew/services"
+touch "${HOME}/.homebrew/services/memcached.env"
+main services start memcached >/dev/null 2>&1
+check 'called "user services start memcached"' "Homebrew starts it"
+rm -rf "${HOME}/.homebrew"
+
+scenario "an sh.brew agent written by Homebrew is relocated" ""
+write_agent memcached "${PREFIX_VAR}/memcached"
+mv "${LAUNCH_AGENTS}/homebrew.mxcl.memcached.plist" "${LAUNCH_AGENTS}/sh.brew.memcached.plist"
+mkdir -p "${HOME}/.homebrew/services"
+touch "${HOME}/.homebrew/services/memcached.env"
+main services start memcached >/dev/null 2>&1
+check '! grep -q "${PREFIX_VAR}" "${LAUNCH_AGENTS}/sh.brew.memcached.plist"' "after Homebrew started it"
+rm -rf "${HOME}/.homebrew"
+
+scenario "the space-free link is the user's" ""
+mkdir -p "${BREWAU_USER_VAR_LINK}"
+echo "dir ${PREFIX_VAR}/redis" >"${WORK}/prefix/etc/redis.conf"
+write_agent redis "${PREFIX_VAR}/redis" "${WORK}/prefix/etc/redis.conf"
+OUTPUT="$(main services start redis 2>&1)"
+check '[[ "${OUTPUT}" == *"still use"*"redis.conf"* && ! -e "${BREWAU_USER_VAR_LINK}/var" ]]' "something else there is left alone, and the config named"
+rmdir "${BREWAU_USER_VAR_LINK}"
 
 echo "${PASS} passed, ${FAIL} failed"
 [[ ${FAIL} -eq 0 ]]

@@ -51,5 +51,21 @@ check "644" "$(stat -f '%Lp' "${WORK}/outside/target")" "symlinks and paths outs
 check "755 755" "$(stat -f '%Lp' "${WORK}" "${HOMEBREW_PREFIX_PATH}/var" | tr '\n' ' ' | sed 's/ $//')" \
   "paths ending in /. or /.. are refused"
 
+# --- trust-app ---------------------------------------------------------------
+require_root() { :; }
+BREWAU_USER="$(id -un)"
+BREWAU_APPDIR="${WORK}/Applications"
+BREWAU_APP_STATE_DIR="${WORK}/state/apps"
+BREWAU_STAGING_DIR="${WORK}"
+mkdir -p "${BREWAU_APPDIR}/Odd.app/Contents"
+chmod 777 "${BREWAU_APPDIR}/Odd.app/Contents"
+STATE="$(brewau_app_state "${BREWAU_APPDIR}/Odd.app")"
+brewau_write_state "${STATE}.untrusted" "${BREWAU_APPDIR}/Odd.app"
+cmd_trust_app "${BREWAU_APPDIR}/Odd.app" >/dev/null
+check "no -" "$([[ -e "${STATE}.untrusted" ]] && echo yes || echo no) $(cut -f 2 "${STATE}.team")" \
+  "trusting an app clears the mark and records it afresh"
+check "755" "$(stat -f '%Lp' "${BREWAU_APPDIR}/Odd.app/Contents")" "and locks it"
+check "fail" "$( (cmd_trust_app "${WORK}/elsewhere.app") 2>/dev/null && echo ok || echo fail)" "apps outside the app directory are refused"
+
 echo "${PASS} passed, ${FAIL} failed"
 [[ ${FAIL} -eq 0 ]]
