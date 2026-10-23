@@ -26,7 +26,7 @@ log() {
 }
 
 brew_run() {
-  (BREWAU_PASSTHROUGH_ENV="" brewau_exec_brew "$@")
+  (brewau_exec_brew "$@")
 }
 
 write_state() {
@@ -117,7 +117,7 @@ restart_system_services() {
     brewau_service_allowed "${name}" || continue
     brewau_service_loaded system "${name}" || continue
     log "restarting system service ${name}"
-    if ! (BREWAU_PASSTHROUGH_ENV="" brewau_exec_brew_as_root services restart "${name}"); then
+    if ! (brewau_exec_brew_as_root services restart "${name}"); then
       log "could not restart ${name}"
       result=1
     fi
@@ -132,24 +132,6 @@ clean_tmp() {
   return 0
 }
 
-# Locks every cask app (see brewau_protect_apps) and records the signatures of
-# those that are locked. Prints the casks whose apps are still unprotected or
-# untrusted and returns 1, or returns 2 if the installed casks could not be
-# listed.
-protect_apps() {
-  local json result=0
-  json="$(mktemp "${BREWAU_TMP}/casks.XXXXXX")" || return 2
-  if brew_run info --json=v2 --installed --cask >"${json}" 2>/dev/null; then
-    brewau_protect_apps "${json}" /usr/bin/sudo -n || result=1
-    brewau_record_apps "${json}"
-  else
-    log "could not list installed casks to protect their apps"
-    result=2
-  fi
-  rm -f "${json}"
-  return "${result}"
-}
-
 run_upgrade() {
   local status="ok" greedy="" formulae="" casks="" output json name
   [[ "${UPGRADE_GREEDY}" == "1" ]] && greedy="--greedy"
@@ -161,7 +143,7 @@ run_upgrade() {
   # at any time. Upgrading a cask runs code from its app, so a cask whose app
   # could not be locked is not upgraded.
   local unprotected="" protect_rc=0
-  unprotected="$(protect_apps)" || protect_rc=$?
+  unprotected="$(brewau_protect_installed_apps /usr/bin/sudo -n)" || protect_rc=$?
   if [[ ${protect_rc} -ne 0 ]]; then
     log "not upgrading casks whose apps could not be protected: ${unprotected:-all of them}"
     status="protect-failed"
@@ -215,7 +197,7 @@ run_upgrade() {
     # shellcheck disable=SC2086
     brew_run upgrade --cask ${greedy} ${casks} || status="upgrade-failed"
     # The new versions can ship with group/world-writable files.
-    protect_apps >/dev/null
+    brewau_protect_installed_apps /usr/bin/sudo -n >/dev/null
   fi
   [[ -z "${formulae}${casks}" && "${status}" == "ok" ]] && log "everything is up to date"
 

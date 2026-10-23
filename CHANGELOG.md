@@ -8,6 +8,15 @@ and versions follow [Semantic Versioning](https://semver.org/). Details of each 
 
 ### Security
 
+- `brew install` gets the same check as `upgrade` before it runs: it upgrades an outdated cask,
+  which runs code from the old app.
+- A cask app path that is a symlink is refused instead of skipped, so brew no longer runs a
+  cask's steps from wherever an admin pointed it.
+- Cask apps are locked inside a directory only root can change, so an admin renaming things in
+  `/Applications` can no longer point root's locking at other folders. Two runs locking the same
+  app at once can no longer nest one copy inside the other.
+- Locked cask apps are pinned in place with an `everyone deny delete` ACL, so admins can no
+  longer swap one between brewau's signature check and Homebrew running its code.
 - `brew install --adopt` is refused: it registered an app the user owned, and could keep
   changing, as a cask whose steps then ran that code as `_brewau`.
 - Cask apps are locked right after every `install`, `reinstall` and `upgrade`, before any
@@ -61,7 +70,8 @@ and versions follow [Semantic Versioning](https://semver.org/). Details of each 
   every nightly run fail.
 - `brew -v services` and `brew services --json` list system services.
 - Taps with a custom remote ending in `/` are blocked.
-- A first install that failed part-way grants users access when run again.
+- A first install that failed part-way grants users access when run again, including the
+  previous owner of `/opt/homebrew`.
 - `deny-user` on a user without access, and `doctor` with an unreadable last-run file.
 - Upgrading from 0.2.0 with old config values no longer blocks brew.
 

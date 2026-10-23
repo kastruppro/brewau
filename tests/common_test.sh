@@ -69,10 +69,10 @@ cat >"${WORK}/casks.json" <<EOF
   {"token": "elsewhere", "artifacts": [{"app": ["X.app"], "target": "/tmp/X.app"}]}
 ]}
 EOF
-check "${BREWAU_APPDIR}/One.app ${BREWAU_APPDIR}/Two.app" \
+check "${BREWAU_APPDIR}/One.app ${BREWAU_APPDIR}/Two.app ${BREWAU_APPDIR}/Link.app" \
   "$(brewau_cask_app_paths "${WORK}/casks.json" | tr '\n' ' ' | sed 's/ $//')" \
-  "only existing, non-symlinked app targets inside the app directory are returned"
-check "one two" "$(brewau_cask_apps "${WORK}/casks.json" | cut -f 1 | tr '\n' ' ' | sed 's/ $//')" \
+  "only existing app targets inside the app directory are returned, symlinks included"
+check "one two link" "$(brewau_cask_apps "${WORK}/casks.json" | cut -f 1 | tr '\n' ' ' | sed 's/ $//')" \
   "each app comes with its cask"
 
 # --- brewau_app_needs_protection ---------------------------------------------
@@ -90,6 +90,20 @@ chmod -N "${BREWAU_APPDIR}/Safe.app/Contents/run.sh"
 chmod g+w "${BREWAU_APPDIR}/Safe.app/Contents"
 check "yes" "$(brewau_app_needs_protection "${BREWAU_APPDIR}/Safe.app" && echo yes || echo no)" \
   "a group-writable directory inside the app is detected"
+chmod g-w "${BREWAU_APPDIR}/Safe.app/Contents"
+check "ok" "$(brewau_pin_app "${BREWAU_APPDIR}/Safe.app" && echo ok)" "an app is pinned"
+check "ok" "$(brewau_pin_app "${BREWAU_APPDIR}/Safe.app" && echo ok)" "pinning twice is fine"
+check "group:everyone deny delete" "$(brewau_acl "${BREWAU_APPDIR}/Safe.app")" "with one entry"
+check "fail" "$(mv "${BREWAU_APPDIR}/Safe.app" "${BREWAU_APPDIR}/Moved.app" 2>/dev/null && echo ok || echo fail)" \
+  "which stops it from being renamed"
+check "no" "$(brewau_app_needs_protection "${BREWAU_APPDIR}/Safe.app" && echo yes || echo no)" \
+  "and does not count as an ACL that needs protection"
+chmod +a "everyone allow add_subdirectory" "${BREWAU_APPDIR}/Safe.app"
+check "yes" "$(brewau_app_needs_protection "${BREWAU_APPDIR}/Safe.app" && echo yes || echo no)" \
+  "but any other entry on the app's folder does"
+chmod -N "${BREWAU_APPDIR}/Safe.app"
+check "yes" "$(brewau_app_needs_protection "${BREWAU_APPDIR}/Link.app" && echo yes || echo no)" \
+  "a symlinked app always needs protection"
 
 # --- brewau_lock_app ---------------------------------------------------------
 BREWAU_STAGING_DIR="${WORK}/staging"
@@ -106,7 +120,13 @@ ln -s "${OUTSIDE}" "${APP}/Contents/Link"
 ln -s "${OUTSIDE}/deep/target" "${APP}/Contents/MacOS/linked"
 check "yes" "$(brewau_app_needs_protection "${APP}" && echo yes || echo no)" "an open app needs protection"
 INODE="$(stat -f %i "${APP}/Contents/MacOS/run")"
+# Records where the app was locked; admins can rename what is in the app directory.
+eval "$(declare -f brewau_lock_tree | sed '1s/brewau_lock_tree/real_lock_tree/')"
+brewau_lock_tree() { echo "$1" >"${WORK}/locked-at"; real_lock_tree "$@"; }
 check "ok" "$( (brewau_lock_app "${APP}") && echo ok || echo fail)" "locking it succeeds"
+check "yes" "$([[ "$(cat "${WORK}/locked-at")" == "${BREWAU_STAGING_DIR}"/* ]] && echo yes || echo no)" \
+  "it is locked where only root can change it, not at its path"
+eval "$(declare -f real_lock_tree | sed '1s/real_lock_tree/brewau_lock_tree/')"
 check "yes" "$([[ "$(stat -f %i "${APP}/Contents/MacOS/run")" != "${INODE}" && -f "${APP}/Contents/MacOS/run" ]] && echo yes || echo no)" \
   "and replaces it by a copy, so files someone held open are not the app's any more"
 check "" "$(ls -A "${BREWAU_STAGING_DIR}")" "staged where only root can change it, leaving nothing behind"
@@ -114,6 +134,16 @@ check "no" "$(brewau_app_needs_protection "${APP}" && echo yes || echo no)" "and
 check "777 777 777" "$(stat -f '%Lp' "${OUTSIDE}" "${OUTSIDE}/deep" "${OUTSIDE}/deep/target" | tr '\n' ' ' | sed 's/ $//')" \
   "targets of symlinks inside the app are untouched"
 check "fail" "$( (brewau_lock_app "${WORK}/outside") && echo ok || echo fail)" "paths outside the app directory are refused"
+
+# Another run (or an admin) puts something at the app's path while it is staged.
+APP="${BREWAU_APPDIR}/Raced.app"
+mkdir -p "${APP}/Contents"
+chmod 777 "${APP}/Contents"
+ditto() { /usr/bin/ditto "$@" && mkdir -p "${APP}/Contents"; }
+check "fail" "$( (brewau_lock_app "${APP}") 2>/dev/null && echo ok || echo fail)" "the copy is not put over it"
+check "Contents" "$(ls "${APP}")" "and not moved into it either"
+unset -f ditto
+rm -rf "${APP}" "${BREWAU_STAGING_DIR:?}"/*
 
 # A directory name ending in a newline must not stop the locking.
 APP="${BREWAU_APPDIR}/Newline.app"
@@ -180,18 +210,27 @@ EOF
 check "signed" "$(brewau_protect_apps "${WORK}/signed.json" 2>/dev/null)" "an untrusted app's cask is reported though the app is locked"
 rm -f "${STATE}.untrusted"
 check "" "$(brewau_protect_apps "${WORK}/signed.json" 2>/dev/null)" "a trusted, locked app is not"
+check "group:everyone deny delete" "$(brewau_acl "${APP}")" "and is pinned in place"
+printf '{"casks": [{"token": "link", "artifacts": [{"app": ["Link.app"], "target": "%s"}]}]}\n' \
+  "${BREWAU_APPDIR}/Link.app" >"${WORK}/link.json"
+check "link" "$(brewau_protect_apps "${WORK}/link.json" 2>/dev/null)" "a symlinked app's cask is reported"
 # Locked, but the fresh copy failed: files someone held open may still be its.
+# Root, which locks apps, is not bound by the pin; this test user is.
+chmod -N "${APP}"
 chmod g+w "${APP}/Contents"
-BREWAU_STAGING_DIR="${WORK}/missing"
-check "signed" "$(brewau_protect_apps "${WORK}/signed.json" 2>/dev/null)" "an app that could not be copied is reported"
+ditto() { return 1; }
+check "signed" "$(brewau_protect_apps "${WORK}/signed.json" 2>/dev/null)" "an app that was locked but could not be copied is reported"
+unset -f ditto
 check "signed" "$(brewau_protect_apps "${WORK}/signed.json" 2>/dev/null)" "and stays reported"
-BREWAU_STAGING_DIR="${WORK}/staging"
+check "no" "$(brewau_app_needs_protection "${APP}" && echo yes || echo no)" "though it is locked"
 rm -f "${STATE}.untrusted"
 MOCK_TEAM=""
+chmod -N "${APP}"
 chmod g+w "${APP}/Contents"
 check "signed" "$(brewau_protect_apps "${WORK}/signed.json" 2>/dev/null)" "a writable app whose signature broke is reported"
 check "yes" "$(brewau_app_untrusted "${APP}" && echo yes || echo no)" "and marked untrusted"
 rm -f "${STATE}.untrusted" "${STATE}.team"
+chmod -N "${APP}"
 chmod g+w "${APP}/Contents"
 BREWAU_APPS_BASELINE=1
 check "" "$(brewau_protect_apps "${WORK}/signed.json" 2>/dev/null)" "on first install, apps are taken as they are"

@@ -56,12 +56,18 @@ holds if nothing but the policy can steer `_brewau`:
 - Apps installed by casks are owned by `_brewau`, without group/world write or ACLs, because cask
   upgrade/uninstall steps can run code from inside the app (e.g. `uninstall script:`). They are
   locked right after every `install`, `reinstall` and `upgrade`, and again before any command
-  that can run their code (`uninstall`, `upgrade`, `reinstall`, `install --force`) and on every
-  nightly run, in case an updater replaced them. If an app cannot be locked, brew refuses those
-  commands for its cask and the nightly job skips it (`brewau doctor` reports it). Locking runs
-  as root over files users may still be changing, so it works top-down, never follows a symlink,
-  and replaces hard-linked files by copies rather than change the file they share. `--adopt` is
-  refused: it would register an app you own, and can keep changing, as a cask.
+  that can run their code (`uninstall`, `upgrade`, `reinstall`, and `install`, which upgrades an
+  outdated cask) and on every nightly run, in case an updater replaced them. If an app cannot be
+  locked, brew refuses those commands for its cask and the nightly job skips it (`brewau doctor`
+  reports it). Locking runs as root over files users may still be changing, so it moves the app
+  into a directory only root can change first, works top-down, never follows a symlink, and
+  replaces hard-linked files by copies rather than change the file they share. An app path that
+  is a symlink is refused. `--adopt` is refused: it would register an app you own, and can keep
+  changing, as a cask.
+- Admins can rename anything in `/Applications`, so a locked app is also pinned in place with an
+  `everyone deny delete` ACL, as macOS does for the folders in your home directory: nobody but
+  root can rename, move or delete it, so it cannot be swapped between brewau's check and the
+  moment brew runs its code. Homebrew (which moves apps as root) is not affected.
 - Locking stops changes; it cannot undo one. So brewau records who signed each app (its Team ID,
   from a certificate Apple issued) when it puts the app in place. When it finds an app that
   someone else could have changed, it locks it, replaces it by a fresh copy (so that files they
@@ -82,10 +88,10 @@ Residual risk, shared with Workbrew:
 - Whoever owned `/opt/homebrew` and the cask apps before brewau took them over is trusted beyond
   what the install check sees: changed bottles in the Cellar, Homebrew's bundled Ruby, and the
   apps as they were at the first install (their signatures become the record).
-- Admins can write to `/Applications` itself and swap a protected app. The swapped app is then
-  owned by them, so brewau checks its signature before running any of its code: a signed app has
-  to come from the same developer. An admin could still put in an older, genuine version from
-  that developer.
+- An admin could swap an app before brewau first pins it, or in the moment between Homebrew
+  putting a new version in place and brewau pinning it. The swapped app is then owned by them, so
+  brewau checks its signature before running any of its code: a signed app has to come from the
+  same developer. An admin could still put in an older, genuine version from that developer.
 - Everyone in `brewau_users` shares one package set: they can uninstall or untap what others use.
 
 ## Install

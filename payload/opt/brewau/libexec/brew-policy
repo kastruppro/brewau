@@ -51,8 +51,8 @@ ALLOWED_OPTIONS=" -v --verbose -q --quiet -f --force -n --dry-run -h --help
 CASK_INSTALL_COMMANDS=" install reinstall upgrade "
 
 # Commands that can run a cask's uninstall steps, i.e. code from inside its
-# app (as can `install --force` over an installed cask).
-CASK_UNINSTALL_COMMANDS=" uninstall remove rm reinstall upgrade "
+# app (`install` upgrades an installed cask that is outdated).
+CASK_UNINSTALL_COMMANDS=" install uninstall remove rm reinstall upgrade "
 
 NAME_RE='^[A-Za-z0-9][A-Za-z0-9@._+-]*$'
 TAP_RE='^[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]*$'
@@ -67,14 +67,10 @@ deny() {
   return 1
 }
 
-in_list() {
-  brewau_in_words "$1" "$2"
-}
-
 option_allowed() {
   local opt="$1"
-  in_list "${opt}" "${ALLOWED_OPTIONS}" && return 0
-  in_list "${opt}" "${EXTRA_ALLOWED_OPTIONS}" && return 0
+  brewau_in_words "${opt}" "${ALLOWED_OPTIONS}" && return 0
+  brewau_in_words "${opt}" "${EXTRA_ALLOWED_OPTIONS}" && return 0
   [[ "${opt}" =~ ^--prune=([0-9]+|all)$ ]] && return 0
   [[ "${opt}" =~ ^--shell=(bash|zsh|fish|csh|pwsh)$ ]] && return 0
   return 1
@@ -160,7 +156,7 @@ check_command() {
     return
   fi
 
-  if ! in_list "${cmd}" "${READ_COMMANDS}" && ! in_list "${cmd}" "${WRITE_COMMANDS}"; then
+  if ! brewau_in_words "${cmd}" "${READ_COMMANDS}" && ! brewau_in_words "${cmd}" "${WRITE_COMMANDS}"; then
     deny "'brew ${cmd}' is not allowed by policy"
     return
   fi
@@ -207,7 +203,7 @@ check_command() {
       ;;
   esac
 
-  if in_list "${cmd}" "${FREE_TEXT_COMMANDS}"; then
+  if brewau_in_words "${cmd}" "${FREE_TEXT_COMMANDS}"; then
     for arg in "$@"; do
       [[ "${arg}" == -* ]] && ! option_allowed "${arg}" && { deny "option '${arg}' is not allowed"; return; }
     done
@@ -249,50 +245,16 @@ passthrough_env() {
   echo "${out}"
 }
 
-# True if subcommand $1 with the arguments after it (an already allowed command
-# line) can install or upgrade casks.
-installs_casks() {
-  local cmd="$1" arg
-  shift
-  in_list "${cmd}" "${CASK_INSTALL_COMMANDS}" || return 1
+# True if subcommand $2 with the arguments after it (an already allowed
+# command line) is in list $1 and can act on casks.
+cask_command() {
+  local list="$1" cmd="$2" arg
+  shift 2
+  brewau_in_words "${cmd}" "${list}" || return 1
   for arg in "$@"; do
     case "${arg}" in --formula | --formulae) return 1 ;; esac
   done
   return 0
-}
-
-# True if subcommand $1 with the arguments after it can run cask uninstall
-# steps.
-runs_cask_uninstall() {
-  local cmd="$1" arg force=0
-  shift
-  for arg in "$@"; do
-    case "${arg}" in
-      --formula | --formulae) return 1 ;;
-      -f | --force) force=1 ;;
-    esac
-  done
-  in_list "${cmd}" "${CASK_UNINSTALL_COMMANDS}" || [[ "${cmd}" == "install" && ${force} -eq 1 ]]
-}
-
-# Locks every cask app (see brewau_protect_apps). Casks can ship apps with
-# group/world-writable files, and a user who changed one could have the next
-# cask upgrade or uninstall run their code as _brewau. Prints the casks whose
-# apps are still unprotected or untrusted and returns 1, or returns 2 if the
-# installed casks could not be listed. With --record, also records the
-# signatures of apps brew just put in place.
-protect_cask_apps() {
-  local json result=0
-  json="$(mktemp "${BREWAU_TMP}/casks.XXXXXX")" || return 2
-  if (brewau_exec_brew info --json=v2 --installed --cask) >"${json}" 2>/dev/null; then
-    brewau_protect_apps "${json}" /usr/bin/sudo -n || result=1
-    [[ "${1:-}" == "--record" ]] && brewau_record_apps "${json}"
-  else
-    echo "brewau: WARNING: could not list installed casks to protect their apps" >&2
-    result=2
-  fi
-  rm -f "${json}"
-  return "${result}"
 }
 
 # Locks the cask apps before a command that can run code from them, and fails
@@ -301,7 +263,7 @@ protect_cask_apps() {
 # without package names, every cask counts.
 cask_apps_protected() {
   local unprotected rc=0 arg names=0
-  unprotected="$(protect_cask_apps)" || rc=$?
+  unprotected="$(brewau_protect_installed_apps /usr/bin/sudo -n)" || rc=$?
   case "${rc}" in
     0) return 0 ;;
     2) deny "the installed casks could not be listed to check their apps"; return ;;
@@ -324,7 +286,7 @@ run_then_protect_apps() {
   (brewau_exec_brew "$@") || rc=$?
   # ...but the locking, and the root helper it runs, must not be stopped.
   trap '' INT TERM HUP QUIT PIPE
-  protect_cask_apps --record >/dev/null
+  brewau_protect_installed_apps /usr/bin/sudo -n >/dev/null
   trap - INT TERM HUP QUIT PIPE
   return "${rc}"
 }
@@ -365,12 +327,12 @@ main() {
     run_system_services "$@"
     exit
   fi
-  if runs_cask_uninstall "${cmd}" ${args[@]+"${args[@]}"} && ! cask_apps_protected ${args[@]+"${args[@]}"}; then
+  if cask_command "${CASK_UNINSTALL_COMMANDS}" "${cmd}" ${args[@]+"${args[@]}"} && ! cask_apps_protected ${args[@]+"${args[@]}"}; then
     echo "brewau: denied: ${DENY_REASON}" >&2
     echo "brewau: an administrator needs to look at it; see: brewau doctor" >&2
     exit 1
   fi
-  if installs_casks "${cmd}" ${args[@]+"${args[@]}"}; then
+  if cask_command "${CASK_INSTALL_COMMANDS}" "${cmd}" ${args[@]+"${args[@]}"}; then
     run_then_protect_apps "$@"
     exit
   fi

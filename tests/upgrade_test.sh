@@ -48,7 +48,7 @@ brew_run() {
   esac
   return 0
 }
-protect_apps() {
+brewau_protect_installed_apps() {
   echo "protect" >>"${CALLS}"
   [[ -n "${MOCK_UNPROTECTED:-}" ]] && echo "${MOCK_UNPROTECTED}"
   return "${MOCK_PROTECT_RC:-0}"

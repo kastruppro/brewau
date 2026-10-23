@@ -103,11 +103,25 @@ A second review of those fixes found, and these fix:
 | 52 | Taps whose `.git` is a file were never checked; symlinks inside `.git` (to config or hooks someone else still controls) passed. | Such taps are checked; any symlink in `.git` is flagged. |
 | 53 | `brewau_service_var_dirs` failed under `pipefail` when the last plist string was a config file without var paths, so `move-service-data` and the copy-back gave up; commented-out config lines counted. | Fixed; comments are skipped. |
 
+A third review found, and these fix:
+
+| # | Finding | Fix |
+|---|---|---|
+| 54 | `brewau_cask_apps` skipped app paths that are symlinks, so the check passed and Homebrew ran the cask's `uninstall script:` from wherever an admin pointed the symlink. | Symlinked apps are listed and reported; brew refuses their casks. |
+| 55 | `brew install` upgrades an outdated installed cask (Homebrew's `cmd/install.rb`), running the old app's uninstall steps without the check `upgrade` gets. | `install` is checked like `upgrade`. |
+| 56 | An app was locked at its path in `/Applications`, which admins can rename, so swapping it for a symlink midway made root lock (`chown`, `chmod go-w`, `chmod -N`) another folder, e.g. `/private/tmp` or another user's home. | The app is moved into the root-only staging directory first and locked there. |
+| 57 | Between the check and Homebrew running the old app's code (after the download), an admin could swap the app for their own. | Locked apps carry an `everyone deny delete` ACL, which stops anyone but root from renaming them. Homebrew moves apps as root and removes ACLs in its way. |
+| 58 | Two runs locking the same app at once (the nightly job and a user's brew) could `mv` one copy into the other and report success. | Copies are moved into the app's directory, which fails if anything is at the app's path. |
+| 59 | A retried first install read the prefix owner after it had been handed to `_brewau`, so the previous owner got no access. | It reads `original-owner` first. |
+| 60 | The policy and the job had their own copies of "list casks, protect, record". | `brewau_protect_installed_apps` in `common.sh`. |
+
 ## Residual risk (documented in README)
 
 - What git cannot see from before brewau: changed bottles in the Cellar, Homebrew's bundled Ruby,
   and apps as they were at the first install.
 - An admin could swap an app for an older, genuine version by the same developer.
+- An admin could swap an app before brewau first pins it, or right after Homebrew puts a new
+  version in place and before brewau pins that one.
 - Config files a service finds by itself (e.g. nginx's compiled-in path) still point into
   `/opt/homebrew/var`.
 - The keg's plist is what Homebrew generated when the keg was installed; a formula whose service

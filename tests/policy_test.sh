@@ -161,12 +161,12 @@ cask_lock() {
   local want="$1"
   shift
   local got=no
-  installs_casks "$@" && got=yes
+  cask_command "${CASK_INSTALL_COMMANDS}" "$@" && got=yes
   if [[ "${got}" == "${want}" ]]; then
     PASS=$((PASS + 1))
   else
     FAIL=$((FAIL + 1))
-    echo "FAIL: installs_casks $* is ${got}, expected ${want}"
+    echo "FAIL: cask install command $* is ${got}, expected ${want}"
   fi
 }
 cask_lock yes install install --cask firefox
@@ -185,23 +185,25 @@ code_from_apps() {
   local want="$1"
   shift
   local got=no
-  runs_cask_uninstall "$@" && got=yes
+  cask_command "${CASK_UNINSTALL_COMMANDS}" "$@" && got=yes
   if [[ "${got}" == "${want}" ]]; then
     PASS=$((PASS + 1))
   else
     FAIL=$((FAIL + 1))
-    echo "FAIL: runs_cask_uninstall $* is ${got}, expected ${want}"
+    echo "FAIL: cask uninstall command $* is ${got}, expected ${want}"
   fi
 }
 code_from_apps yes uninstall --cask firefox
 code_from_apps yes upgrade
 code_from_apps yes reinstall firefox
 code_from_apps yes install --force firefox
-code_from_apps no install firefox
+# Installing an outdated cask upgrades it.
+code_from_apps yes install firefox
+code_from_apps no install --formula wget
 code_from_apps no uninstall --formula wget
 code_from_apps no list
 
-protect_cask_apps() { [[ -z "${MOCK_UNPROTECTED}" ]] || { echo "${MOCK_UNPROTECTED}"; return 1; }; }
+brewau_protect_installed_apps() { [[ -z "${MOCK_UNPROTECTED}" ]] || { echo "${MOCK_UNPROTECTED}"; return 1; }; }
 protected() {
   local want="$1"
   shift

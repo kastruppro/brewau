@@ -6,7 +6,7 @@ set -u
 HERE="$(cd "$(dirname "$0")" && pwd -P)"
 PAYLOAD="${HERE}/../payload/opt/brewau"
 WORK="$(mktemp -d)"
-trap 'rm -rf "${WORK}"' EXIT
+trap 'chmod -RN "${WORK}" 2>/dev/null; rm -rf "${WORK}"' EXIT
 PASS=0
 FAIL=0
 
@@ -65,6 +65,7 @@ cmd_trust_app "${BREWAU_APPDIR}/Odd.app" >/dev/null
 check "no -" "$([[ -e "${STATE}.untrusted" ]] && echo yes || echo no) $(cut -f 2 "${STATE}.team")" \
   "trusting an app clears the mark and records it afresh"
 check "755" "$(stat -f '%Lp' "${BREWAU_APPDIR}/Odd.app/Contents")" "and locks it"
+check "group:everyone deny delete" "$(brewau_acl "${BREWAU_APPDIR}/Odd.app")" "and pins it in place"
 check "fail" "$( (cmd_trust_app "${WORK}/elsewhere.app") 2>/dev/null && echo ok || echo fail)" "apps outside the app directory are refused"
 
 echo "${PASS} passed, ${FAIL} failed"

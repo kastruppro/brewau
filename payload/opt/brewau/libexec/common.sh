@@ -62,6 +62,14 @@ BREWAU_APPS_BASELINE=0
 BREWAU_FORBIDDEN_TAPS_CACHE=""
 BREWAU_FORBIDDEN_TAPS_CACHED=0
 
+# NAME=value pairs brewau_exec_brew passes on (set by the policy).
+BREWAU_PASSTHROUGH_ENV=""
+
+# The one ACL entry a cask app's own folder may carry (see brewau_pin_app),
+# and how `ls -le` shows it.
+BREWAU_APP_ACL="everyone deny delete"
+BREWAU_APP_ACL_SHOWN="group:everyone deny delete"
+
 brewau_die() {
   echo "brewau: $*" >&2
   exit 1
@@ -309,7 +317,8 @@ brewau_cask_apps() {
       plutil -extract "casks.${i}.artifacts.${j}.app" raw -o - "${json}" >/dev/null 2>&1 || continue
       target="$(plutil -extract "casks.${i}.artifacts.${j}.target" raw -o - "${json}" 2>/dev/null)" || continue
       [[ "${target}" == "${BREWAU_APPDIR}"/*.app && "${target}" != *..* ]] || continue
-      [[ -d "${target}" && ! -L "${target}" ]] && printf '%s\t%s\n' "${token}" "${target}"
+      # Symlinks too: brew would run the cask's steps from wherever one points.
+      [[ -d "${target}" || -L "${target}" ]] && printf '%s\t%s\n' "${token}" "${target}"
     done
   done
 }
@@ -319,10 +328,11 @@ brewau_cask_app_paths() {
   brewau_cask_apps "$1" | cut -f 2-
 }
 
-# Makes cask-installed apps unwritable by users. Cask upgrade and uninstall
-# steps can run code from inside the app (e.g. `uninstall script:`) as
-# _brewau, and so as root; an app its user can write to would let them plant
-# that code. Apps that update themselves as the user lose that ability.
+# Makes cask-installed apps unwritable by users and pins them in place. Cask
+# upgrade and uninstall steps can run code from inside the app (e.g.
+# `uninstall script:`) as _brewau, and so as root; an app its user can write
+# to, or an admin can swap, would let them plant that code. Apps that update
+# themselves as the user lose that ability.
 # $1 is the JSON file; the rest is an optional command prefix that gives root
 # (e.g. sudo -n). Prints the tokens of casks whose apps are still unprotected
 # afterwards or untrusted (and then fails); progress goes to stderr.
@@ -336,33 +346,85 @@ brewau_protect_apps() {
       result=1
       continue
     fi
-    brewau_app_needs_protection "${app}" || continue
-    echo "brewau: protecting ${app}" >&2
-    locked=1
-    if [[ $# -gt 0 ]]; then
-      "$@" /bin/bash -p -c 'source /opt/brewau/libexec/common.sh && brewau_lock_app "$1"' brewau "${app}" </dev/null >&2 || locked=0
-    else
-      (brewau_lock_app "${app}") </dev/null >&2 || locked=0
-    fi
-    # On the first install apps are taken as they are (see BREWAU_APPS_BASELINE).
-    [[ "${BREWAU_APPS_BASELINE}" == "1" ]] && { brewau_record_app "${app}" || true; }
-    # Locked but not replaced by a fresh copy (see brewau_lock_app): files
-    # someone held open may still be its, so keep reporting it.
-    if [[ ${locked} -eq 0 ]] && ! brewau_app_needs_protection "${app}"; then
-      brewau_write_state "$(brewau_app_state "${app}").untrusted" "${app}" || true
-    fi
-    if [[ ${locked} -eq 0 ]] || brewau_app_needs_protection "${app}"; then
-      echo "brewau: WARNING: could not protect ${app} (App Management permission?)" >&2
+    if [[ -L "${app}" ]]; then
+      echo "brewau: WARNING: ${app} is a symlink; an administrator must remove it, then reinstall the cask" >&2
       echo "${token}"
       result=1
-    elif [[ "${BREWAU_APPS_BASELINE}" != "1" ]] && ! brewau_app_trusted "${app}"; then
-      echo "brewau: WARNING: ${app} could be changed by others, and it no longer carries the signature brewau recorded." >&2
-      echo "brewau: an administrator must check it, then run: sudo brewau trust-app '${app}'" >&2
+      continue
+    fi
+    if brewau_app_needs_protection "${app}"; then
+      echo "brewau: protecting ${app}" >&2
+      locked=1
+      if [[ $# -gt 0 ]]; then
+        "$@" /bin/bash -p -c 'source /opt/brewau/libexec/common.sh && brewau_lock_app "$1"' brewau "${app}" </dev/null >&2 || locked=0
+      else
+        (brewau_lock_app "${app}") </dev/null >&2 || locked=0
+      fi
+      # On the first install apps are taken as they are (see BREWAU_APPS_BASELINE).
+      [[ "${BREWAU_APPS_BASELINE}" == "1" ]] && { brewau_record_app "${app}" || true; }
+      # Locked but not replaced by a fresh copy (see brewau_lock_app): files
+      # someone held open may still be its, so keep reporting it.
+      if [[ ${locked} -eq 0 ]] && ! brewau_app_needs_protection "${app}"; then
+        brewau_write_state "$(brewau_app_state "${app}").untrusted" "${app}" || true
+      fi
+      if [[ ${locked} -eq 0 ]] || brewau_app_needs_protection "${app}"; then
+        echo "brewau: WARNING: could not protect ${app} (App Management permission?)" >&2
+        echo "${token}"
+        result=1
+        continue
+      elif [[ "${BREWAU_APPS_BASELINE}" != "1" ]] && ! brewau_app_trusted "${app}"; then
+        echo "brewau: WARNING: ${app} could be changed by others, and it no longer carries the signature brewau recorded." >&2
+        echo "brewau: an administrator must check it, then run: sudo brewau trust-app '${app}'" >&2
+        echo "${token}"
+        result=1
+        continue
+      fi
+    fi
+    if ! brewau_pin_app "${app}" "$@"; then
+      echo "brewau: WARNING: could not pin ${app} in place (App Management permission?)" >&2
       echo "${token}"
       result=1
     fi
   done < <(brewau_cask_apps "${json}")
   return "${result}"
+}
+
+# Protects every installed cask app (see brewau_protect_apps) and records the
+# signatures of those that are protected. Runs as BREWAU_USER; the arguments
+# are the command prefix that gives root. Prints the casks whose apps are
+# still unprotected or untrusted and returns 1, or returns 2 if the installed
+# casks could not be listed.
+brewau_protect_installed_apps() {
+  local json result=0
+  json="$(mktemp "${BREWAU_TMP}/casks.XXXXXX")" || return 2
+  if (brewau_exec_brew info --json=v2 --installed --cask) >"${json}" 2>/dev/null; then
+    brewau_protect_apps "${json}" "$@" || result=1
+    brewau_record_apps "${json}"
+  else
+    echo "brewau: WARNING: could not list installed casks to protect their apps" >&2
+    result=2
+  fi
+  rm -f "${json}"
+  return "${result}"
+}
+
+# Prints the ACL entries of $1 as `ls -le` shows them, without their numbers.
+brewau_acl() {
+  ls -lde "$1" 2>/dev/null | sed -n 's/^ [0-9][0-9]*: //p'
+}
+
+# Admins can rename anything in BREWAU_APPDIR, so they could swap a checked
+# app for their own between brewau's check and the moment brew runs its code.
+# Like the folders in a home directory, a pinned app denies deletion, which
+# includes renaming, to everyone. Root, which Homebrew and brewau use to move
+# apps, is not bound by ACLs, and Homebrew removes ACLs that get in its way.
+# The rest of the arguments are the optional command prefix that gives root.
+brewau_pin_app() {
+  local app="$1"
+  shift
+  [[ "$(brewau_acl "${app}")" == "${BREWAU_APP_ACL_SHOWN}" ]] && return 0
+  "$@" /bin/chmod -h +a "${BREWAU_APP_ACL}" "${app}" 2>/dev/null &&
+    [[ "$(brewau_acl "${app}")" == "${BREWAU_APP_ACL_SHOWN}" ]]
 }
 
 # Records the signature of every cask app (see brewau_record_app), after
@@ -442,25 +504,29 @@ brewau_app_trusted() {
 }
 
 # Locks app bundle $1 in BREWAU_APPDIR (see brewau_lock_tree), then replaces
-# it by a copy of itself: whoever could change it before may still hold one of
-# its files open for writing, which locking cannot take away. Runs as root.
+# it by a fresh copy of itself: whoever could change it before may still hold
+# one of its files open for writing, which locking cannot take away. Admins
+# can rename anything in BREWAU_APPDIR, so the app is first moved into a
+# directory only root can change and locked there; locked in place, its path
+# could be pointed elsewhere midway. Moving into the app's directory, rather
+# than to its path, fails instead of moving into (or through) whatever was put
+# there meanwhile, by an admin or by another brewau run. Runs as root.
 brewau_lock_app() {
-  [[ "$1" == "${BREWAU_APPDIR}"/*.app && "$1" != *..* && -d "$1" && ! -L "$1" ]] || return 1
-  brewau_lock_tree "$1" && brewau_replace_with_copy "$1"
-}
-
-# Replaces locked app $1 by a fresh copy (new files nobody has open), staged
-# in a directory only root can change. mv -h: if an admin turned the app's
-# path into a symlink meanwhile, it is replaced rather than followed.
-brewau_replace_with_copy() {
-  local app="$1" tmp
+  local app="$1" dir="${1%/*}" name="${1##*/}" tmp
+  [[ "${app}" == "${BREWAU_APPDIR}"/*.app && "${app}" != *..* && -d "${app}" && ! -L "${app}" ]] || return 1
   tmp="$(mktemp -d "${BREWAU_STAGING_DIR}/app-copy.XXXXXX")" || return 1
-  if [[ -d "${app}" && ! -L "${app}" ]] && ditto "${app}" "${tmp}/new" && mv -h "${app}" "${tmp}/old"; then
-    if mv -h "${tmp}/new" "${app}"; then
+  # With uchg (which its owner may set), not even root can move it.
+  /usr/bin/chflags -h nouchg,nouappnd "${app}" 2>/dev/null
+  if mkdir "${tmp}/old" "${tmp}/new" && mv -h "${app}" "${tmp}/old/"; then
+    if [[ -d "${tmp}/old/${name}" && ! -L "${tmp}/old/${name}" ]] && brewau_lock_tree "${tmp}/old/${name}" &&
+      ditto "${tmp}/old/${name}" "${tmp}/new/${name}" && mv -h "${tmp}/new/${name}" "${dir}/"; then
       rm -rf "${tmp}"
       return 0
     fi
-    mv -h "${tmp}/old" "${app}"
+    if ! mv -h "${tmp}/old/${name}" "${dir}/"; then
+      echo "brewau: WARNING: could not put ${app} back; it is in ${tmp}/old" >&2
+      return 1
+    fi
   fi
   rm -rf "${tmp}"
   return 1
@@ -548,10 +614,15 @@ brewau_lock_path() {
   /bin/chmod -h go-w "$1" && /bin/chmod -h -N "$1"
 }
 
-# True if anything in the app is owned by someone other than root/_brewau, is
-# group/world-writable, or carries an ACL (which can grant write access).
+# True if the app is a symlink, or anything in it is owned by someone other
+# than root/_brewau, is group/world-writable, or carries an ACL (which can
+# grant write access); the app's own folder only brewau's (see brewau_pin_app).
 brewau_app_needs_protection() {
-  [[ -n "$(find "$1" ! -type l \( ! -user root ! -user "${BREWAU_USER}" -o -perm -g+w -o -perm -o+w -o -acl \) -print 2>/dev/null | head -1)" ]]
+  local acl
+  [[ -L "$1" ]] && return 0
+  [[ -n "$(find "$1" ! -type l \( ! -user root ! -user "${BREWAU_USER}" -o -perm -g+w -o -perm -o+w -o -acl ! -depth 0 \) -print 2>/dev/null | head -1)" ]] && return 0
+  acl="$(brewau_acl "$1")"
+  [[ -n "${acl}" && "${acl}" != "${BREWAU_APP_ACL_SHOWN}" ]]
 }
 
 # Prints every string value in plist $1 (ProgramArguments, environment
