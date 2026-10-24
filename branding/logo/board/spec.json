@@ -1,0 +1,35 @@
+{
+  "brand": "brewau",
+  "tagline": "Homebrew, opdateret mens du arbejder",
+  "brief": "En native macOS menu bar-app, der holder Homebrew og apps opdateret uden opsyn, isoleret under en separat tjenestekonto. Den skal føles stille, indkapslet og pålidelig og være en del af Mac'en, ikke et larmende værktøj.",
+  "adjectives": ["stille", "indkapslet", "pålidelig", "automatisk"],
+  "criteria": "Undgå ølkrus, skjolde og cirkulære pile; genkendelig ved 16 px; virker i én farve; føles Mac-nativ.",
+  "industry": "software",
+  "nav": ["Sådan virker det", "Sikkerhed", "Download"],
+  "brand_color": "#12343B",
+  "tile_color": "#12343B",
+  "greyscale": false,
+  "final": true,
+  "designer": "kastruppro",
+  "concepts": [
+    {
+      "name": "Lukkede bobler",
+      "symbol": "../final/brewau-symbol.svg",
+      "lockup": "../final/brewau-horizontal.svg",
+      "stacked": "../final/brewau-stacked.svg",
+      "symbol_on_tile": "../final/brewau-symbol-reversed.svg",
+      "symbol_on_dark": "../final/brewau-symbol-reversed.svg",
+      "lockup_on_dark": "../final/brewau-horizontal-reversed.svg",
+      "stacked_on_tile": "../final/brewau-stacked-reversed.svg",
+      "stacked_on_dark": "../final/brewau-stacked-reversed.svg",
+      "idea": "Bobler stiger inde i en lukket ramme: bryg der kører af sig selv, isoleret.",
+      "rationale": [
+        "Rammen er privilegiegrænsen omkring _brewau, vist uden skjold eller hængelås",
+        "Boblerne er bryggen, der arbejder af sig selv, og de vokser, mens de stiger",
+        "Afrundet firkant passer til macOS' ikonsprog; egen 16 px-version"
+      ]
+    }
+  ],
+  "recommendation": "Lukkede bobler i Kedel og Malt: rolig mørk ramme, varme bobler, ordmærke bygget af de samme buer.",
+  "next_steps": ["Godkend kittet", "Skift app/Icon.swift til det nye ikon og menu bar-symbol", "Varemærkesøgning"]
+}

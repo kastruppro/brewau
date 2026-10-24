@@ -33,6 +33,8 @@ brewau setup-shell
 check grep -qF '/opt/brewau/bin/brew shellenv' "${WORK}/home/.zprofile"
 check grep -qF 'eval $(/opt/brewau/bin/brew shellenv)' "${WORK}/home/.zshrc"
 check test -L "${WORK}/home/.zprofile"
+check grep -qF 'fpath=(/opt/brewau/share/zsh/site-functions ${fpath:#/opt/homebrew/*})' "${WORK}/home/.zshrc"
+check grep -qF '# BEGIN brewau completions' "${WORK}/home/.zprofile"
 
 # Running it twice must not change anything.
 cp "${WORK}/home/.zshrc" "${WORK}/zshrc.once"
@@ -43,6 +45,7 @@ brewau restore-shell
 check cmp -s "${WORK}/zprofile.orig" "${WORK}/home/.zprofile"
 check test -L "${WORK}/home/.zprofile"
 check cmp -s <(printf 'alias ll=ls\neval $(/opt/homebrew/bin/brew shellenv)\n') "${WORK}/home/.zshrc"
+check test "$(grep -c 'brewau completions' "${WORK}/home/.zshrc")" -eq 0
 
 echo "${PASS} passed, ${FAIL} failed"
 [[ ${FAIL} -eq 0 ]]

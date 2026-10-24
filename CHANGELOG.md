@@ -4,6 +4,33 @@ All notable changes to brewau. The format follows [Keep a Changelog](https://kee
 and versions follow [Semantic Versioning](https://semver.org/). Details of each finding behind
 0.4.0 are in [FIXES.md](FIXES.md).
 
+## [0.5.0] - 2026-10-24
+
+### Added
+
+- Native Apple Silicon menu bar app with current/available version lists, settings,
+  independent scans, interval/daily/weekly upgrade schedules and multiple times.
+- Local notifications, launch at login, pending-restart detection and explicit per-app
+  permission for forced restarts. Session actions remain in the logged-in GUI.
+- A narrow native helper for validated schedule changes and trusted completion copies.
+- Persistent scheduler and manual scan/upgrade LaunchDaemons with a shared OS lock,
+  wake catch-up, atomic snapshots, failure reporting and safe reload behavior.
+- Root-owned zsh completion copies, automatic shell setup with backups, and a repair
+  action. zsh security checks remain enabled.
+- brewau logo, app icon and menu bar icon (masters, exports and guidelines in
+  `branding/logo/`). The menu bar icon shows waiting updates and running jobs.
+
+### Fixed
+
+- Unattended Homebrew upgrades no longer wait for the new default confirmation prompt.
+- Homebrew leaves running cask apps open; restart is coordinated by the session app.
+- A failed Homebrew refresh stops an upgrade before using stale metadata.
+- The menu bar popover no longer shows an empty update list: `MenuBarExtra` windows
+  sized its scroll view to zero, so it now gets the measured content height.
+- Login Items lists the LaunchDaemons under brewau.app (`AssociatedBundleIdentifiers`)
+  instead of the signing developer name. The app icon uses a larger mark, and the
+  popover and settings headers use the brewau mark instead of a system symbol.
+
 ## [0.4.0] - Unreleased
 
 ### Security

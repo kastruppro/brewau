@@ -1,8 +1,12 @@
 # brewau
 
 Unattended, isolated Homebrew for macOS, modelled on [Workbrew](https://workbrew.com)'s agent
-but local and self-hosted. Apps and formulae stay up to date every night, including casks that
+but local and self-hosted. Apps and formulae stay up to date on your schedule, including casks that
 need `sudo`, without anyone typing a password.
+
+Includes a native SwiftUI menu bar app for Apple Silicon, with an update list,
+independent scanning and upgrade schedules, notifications, and per-app restart
+permissions. Requires macOS 14+. See [the app guide](app/README.md).
 
 ## How it works
 
@@ -18,7 +22,8 @@ you ── brew ──▶ /opt/brewau/bin/brew                     (wrapper, roo
                    ▼
                root: pkg installers, /Applications moves
 
-launchd ── daily ──▶ brewau-upgrade as _brewau ──▶ brew update / upgrade --greedy / cleanup
+launchd ── scheduler ──▶ brewau-agent as _brewau ──▶ brewau-upgrade ──▶ brew update / upgrade / cleanup
+GUI ── validated schedule settings / scan / upgrade requests ──▶ existing privilege boundary
 ```
 
 | Piece | Workbrew equivalent |
@@ -121,6 +126,7 @@ leave group membership alone, so `deny-user` sticks.
 ```sh
 brewau status          # schedule, last run, what was upgraded
 brewau run             # run the upgrade job now
+brewau scan            # refresh the GUI's update list without installing
 brewau log -f          # follow the upgrade log
 brewau log --audit     # who ran which brew command
 brewau doctor          # health check
@@ -236,6 +242,8 @@ apps by hand (`brewau doctor` reports it).
 
 ```sh
 make test                  # policy, config and shell-profile tests
+make app-check             # native schedule, parsing, locking and completion checks
+make app                   # build/brewau.app (development signature)
 make pkg                   # unsigned build/brewau-<version>-unsigned.pkg
 make install               # install this checkout locally (sudo)
 
@@ -245,3 +253,10 @@ xcrun notarytool store-credentials <profile> --apple-id <id> --team-id <TEAMID>
 make release INSTALLER_IDENTITY="Developer ID Installer: Your Name (TEAMID)" NOTARY_PROFILE=<profile>
 # upload build/brewau.pkg to a GitHub release
 ```
+
+The package installs `/Applications/brewau.app`, the native helper and three
+LaunchDaemons (scheduler, manual scan, manual upgrade). Existing configuration
+and access rules are preserved. The installer prepares shell profiles, with
+backups, for existing local members of `brewau_users`. Open the app and enable
+notifications and launch at login in its settings. No GUI is needed for scans
+or scheduled upgrades to continue.

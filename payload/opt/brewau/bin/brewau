@@ -24,6 +24,7 @@ Usage: brewau <command>
 
   status              show schedule, last run and access
   run                 start the scheduled upgrade now
+  scan                refresh the update list without installing anything
   log [-f] [--audit]  show the upgrade log (or the brew audit log)
   doctor              check that the installation is healthy
   setup-shell         point your shell profile at the brewau wrapper
@@ -53,7 +54,11 @@ in_users_group() {
 cmd_status() {
   brewau_load_config
   echo "brewau ${VERSION}"
-  if [[ "${AUTO_UPGRADE}" == "1" ]]; then
+  if [[ -x "${BREWAU_LIBEXEC}/brewau-agent" && "${AUTO_UPGRADE}" == "1" && "${UPGRADE_MODE}" == "interval" ]]; then
+    echo "Schedule:   every ${UPGRADE_INTERVAL_HOURS} hour(s)"
+  elif [[ "${AUTO_UPGRADE}" == "1" && -n "${UPGRADE_TIMES}" ]]; then
+    echo "Schedule:   ${UPGRADE_MODE}, minute(s) of day: ${UPGRADE_TIMES} (weekday ${UPGRADE_WEEKDAY}; Sunday=1)"
+  elif [[ "${AUTO_UPGRADE}" == "1" ]]; then
     printf 'Schedule:   daily at %02d:%02d%s\n' "$((10#${UPGRADE_HOUR}))" "$((10#${UPGRADE_MINUTE}))" \
       "$([[ "${UPGRADE_GREEDY}" == "1" ]] && echo " (including self-updating casks)")"
   else
@@ -70,6 +75,7 @@ cmd_status() {
     echo "Last run:   never"
   fi
   echo "Taps:       homebrew/* ${ALLOWED_TAPS}"
+  echo "Scanning:   every ${SCAN_MINUTES} minutes"
   if in_users_group; then
     echo "Access:     $(id -un) may use brew"
   else
@@ -78,9 +84,9 @@ cmd_status() {
 }
 
 cmd_run() {
-  local err
+  local err label="${1:-${BREWAU_LABEL}}"
   in_users_group || brewau_die "$(id -un) is not in ${BREWAU_USERS_GROUP}; ask an administrator to run: sudo brewau allow-user $(id -un)"
-  if ! err="$(/usr/bin/sudo -n /bin/launchctl kickstart "system/${BREWAU_LABEL}" 2>&1)"; then
+  if ! err="$(/usr/bin/sudo -n /bin/launchctl kickstart "system/${label}" 2>&1)"; then
     brewau_daemon_loaded || brewau_die "the upgrade daemon is not loaded; run: sudo brewau reload"
     brewau_die "could not start the upgrade: ${err:-launchctl failed}"
   fi
@@ -169,7 +175,8 @@ cmd_doctor() {
   [[ -n "${forbidden}" ]] &&
     echo "  - installed taps outside ALLOWED_TAPS (blocked): ${forbidden}"
 
-  local last_run="${BREWAU_STATE_DIR}/last-run" finished since age
+  local last_run="${BREWAU_STATE_DIR}/last-run" finished since age stale_seconds=$((48 * 3600))
+  [[ "${UPGRADE_MODE}" == "weekly" ]] && stale_seconds=$((8 * 86400))
   if [[ "${AUTO_UPGRADE}" == "1" && -r "${last_run}" ]]; then
     if grep -q '^status=ok' "${last_run}"; then
       ok "last scheduled run succeeded"
@@ -179,7 +186,7 @@ cmd_doctor() {
     finished="$(sed -n 's/^finished=//p' "${last_run}")"
     if since="$(date -j -u -f '%Y-%m-%dT%H:%M:%SZ' "${finished}" +%s 2>/dev/null)"; then
       age=$(($(date +%s) - since))
-      if [[ ${age} -gt $((48 * 3600)) ]]; then
+      if [[ ${age} -gt ${stale_seconds} ]]; then
         bad "no scheduled run for $((age / 86400)) days (the Mac is off at $(printf '%02d:%02d' "$((10#${UPGRADE_HOUR}))" "$((10#${UPGRADE_MINUTE}))")?); run: brewau run"
       fi
     else
@@ -198,6 +205,33 @@ cmd_doctor() {
 
 SHELLENV_RE="(^|[^/[:alnum:]_])(${HOMEBREW_PREFIX_PATH}/bin/)?brew shellenv"
 PATH_MARKER="# brewau: keep the wrapper first in PATH"
+ZSH_BEGIN="# BEGIN brewau completions"
+ZSH_END="# END brewau completions"
+
+zsh_completions_block() {
+  cat <<'EOF'
+# BEGIN brewau completions
+# Keep zsh's security checks; use root-owned copies of Homebrew completions.
+fpath=(/opt/brewau/share/zsh/site-functions ${fpath:#/opt/homebrew/*})
+# END brewau completions
+EOF
+}
+
+setup_zsh_completions() {
+  local file
+  for file in "${HOME}/.zprofile" "${HOME}/.zshrc"; do
+    [[ -f "${file}" ]] && backup_once "${file}"
+    if ! grep -qF "${ZSH_BEGIN}" "${file}" 2>/dev/null; then
+      touch "${file}"
+      brewau_rewrite_file "${file}" prepend_zsh_completions || return 1
+    fi
+  done
+}
+
+prepend_zsh_completions() {
+  zsh_completions_block
+  cat
+}
 
 PROFILES=(.zprofile .zshrc .bash_profile .bashrc .profile .config/fish/config.fish)
 
@@ -207,6 +241,7 @@ backup_once() {
 
 cmd_setup_shell() {
   local file rc shell
+  setup_zsh_completions || brewau_die "could not prepare zsh completions"
   # Point every `brew shellenv` (with or without the full path) at the wrapper.
   for file in "${PROFILES[@]/#/${HOME}/}"; do
     [[ -f "${file}" ]] || continue
@@ -247,6 +282,11 @@ cmd_setup_shell() {
 # longer exists after uninstall and lose Homebrew from PATH.
 cmd_restore_shell() {
   local file
+  for file in "${HOME}/.zprofile" "${HOME}/.zshrc"; do
+    [[ -f "${file}" ]] || continue
+    brewau_rewrite_file "${file}" awk -v begin="${ZSH_BEGIN}" -v end="${ZSH_END}" \
+      '$0 == begin { skip = 1; next } $0 == end { skip = 0; next } !skip' || return 1
+  done
   for file in "${PROFILES[@]/#/${HOME}/}"; do
     [[ -f "${file}" ]] || continue
     grep -qF -e "${BREWAU_ROOT}/bin" "${file}" || continue
@@ -303,6 +343,7 @@ root_command() {
 case "${1:-}" in
   status) cmd_status ;;
   run) cmd_run ;;
+  scan) cmd_run com.kastruppro.brewau.scan ;;
   log) shift; cmd_log "$@" ;;
   doctor) cmd_doctor ;;
   setup-shell) cmd_setup_shell ;;

@@ -1,6 +1,15 @@
 #!/bin/bash
 # Installer preinstall: refuse to install where brewau cannot work.
 
+PATH="/usr/bin:/bin:/usr/sbin:/sbin"
+export PATH
+
+major="$(/usr/bin/sw_vers -productVersion)"
+if [[ "${major%%.*}" -lt 14 ]]; then
+  echo "brewau requires macOS 14 or later." >&2
+  exit 1
+fi
+
 if [[ "$(uname -m)" != "arm64" ]]; then
   echo "brewau requires an Apple Silicon Mac (Homebrew in /opt/homebrew)." >&2
   exit 1
@@ -10,5 +19,13 @@ if [[ ! -x /opt/homebrew/bin/brew ]]; then
   echo "Homebrew was not found in /opt/homebrew. Install Homebrew first: https://brew.sh" >&2
   exit 1
 fi
+
+# Do not replace executables while a worker is using them.
+for label in upgrade scan scheduler; do
+  if /bin/launchctl print "system/com.kastruppro.brewau.${label}" 2>/dev/null | /usr/bin/grep -q 'state = running'; then
+    echo "brewau is working. Wait for the scan or upgrade to finish, then install again." >&2
+    exit 1
+  fi
+done
 
 exit 0

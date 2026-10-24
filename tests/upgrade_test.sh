@@ -44,6 +44,7 @@ brew_run() {
       [[ "${MOCK_OUTDATED_RC:-0}" -eq 0 ]] || return "${MOCK_OUTDATED_RC}"
       printf '{%s, %s}\n' "$(json_entries formulae ${MOCK_OUTDATED_FORMULAE:-})" "$(json_entries casks ${MOCK_OUTDATED_CASKS:-})"
       ;;
+    "info --json=v2 --installed --cask") echo '{"casks": []}' ;;
     "upgrade --formula"*) return "${MOCK_UPGRADE_RC:-0}" ;;
   esac
   return 0
@@ -210,6 +211,25 @@ run
 check '[[ "${STATUS}" == "pin-failed" ]]' "status is pin-failed (got ${STATUS})"
 check '! grep -q "^upgrade --formula" "${CALLS}"' "skips formula upgrades rather than risk excluded ones"
 check '[[ "$(sed -n "s/^upgraded=//p" "${LAST_RUN}")" == "" ]]' "records nothing as upgraded"
+
+scenario "scan does not install"
+MOCK_OUTDATED_CASKS="postman"
+UPDATE_HOMEBREW=1
+run_scan >/dev/null 2>&1
+check '[[ $? -eq 0 ]]' "scan succeeds"
+check 'called "update"' "refreshes Homebrew"
+check '! grep -q "^upgrade" "${CALLS}"' "installs nothing"
+check '[[ -s "${BREWAU_STATE_DIR}/updates.json" && -s "${BREWAU_STATE_DIR}/catalog.json" ]]' "publishes both snapshots"
+cp "${BREWAU_STATE_DIR}/updates.json" "${WORK}/last-good.json"
+MOCK_OUTDATED_RC=1
+run_scan >/dev/null 2>&1
+check '[[ $? -ne 0 ]]' "failed scan is reported"
+check 'cmp -s "${WORK}/last-good.json" "${BREWAU_STATE_DIR}/updates.json"' "failed scan preserves last good snapshot"
+
+scenario "scan without Homebrew refresh"
+UPDATE_HOMEBREW=0
+run_scan >/dev/null 2>&1
+check '! called "update"' "optional Homebrew refresh is respected"
 
 echo "${PASS} passed, ${FAIL} failed"
 [[ ${FAIL} -eq 0 ]]

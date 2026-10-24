@@ -88,6 +88,16 @@ printf '# comment\n\nFORBIDDEN_CASKS = "firefox"\n' >"${WORK}/brewau.conf"
 check "1" "$( (brewau_load_config "${WORK}/brewau.conf") 2>&1 | grep -c 'line 3')" \
   "a line that does not parse is reported with its number"
 
+expect valid valid 'UPGRADE_MODE="weekly"' 'UPGRADE_WEEKDAY="2"' 'UPGRADE_TIMES="180 900"' 'SCAN_MINUTES="15"'
+expect invalid valid 'UPGRADE_MODE="cron"'
+expect invalid valid 'SCAN_MINUTES="1"'
+expect invalid valid 'UPGRADE_TIMES="1440"'
+expect invalid valid 'UPGRADE_TIMES="180 180"'
+expect invalid valid 'UPGRADE_WEEKDAY="8"'
+expect invalid valid 'UPGRADE_INTERVAL_HOURS="0"'
+check "0" "$(value AUTO_UPGRADE 'UPGRADE_MODE="cron"')" "invalid mode disables upgrades"
+check "0" "$(value AUTO_UPGRADE 'UPGRADE_TIMES="9999"')" "invalid time disables upgrades"
+
 # --- brewau_in_words -------------------------------------------------------
 LIST=" one two
   three	four "

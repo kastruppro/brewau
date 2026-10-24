@@ -25,3 +25,14 @@ UPGRADE_GREEDY="1"
 UPGRADE_EXCLUDE=""
 UPGRADE_HOUR="4"
 UPGRADE_MINUTE="0"
+
+# Independent scans and upgrade scheduling. Times are minutes since midnight;
+# an empty UPGRADE_TIMES uses UPGRADE_HOUR / UPGRADE_MINUTE for compatibility.
+SCAN_MINUTES="60"
+UPDATE_HOMEBREW="1"
+UPGRADE_MODE="daily"
+UPGRADE_INTERVAL_HOURS="1"
+# Sunday=1, Monday=2, ..., Saturday=7.
+UPGRADE_WEEKDAY="2"
+# For daily at 03:00 and 15:00: "180 900".
+UPGRADE_TIMES=""

@@ -245,6 +245,9 @@ ${BREWAU_USER} ALL=(root) NOPASSWD: ALL
 # Members of ${BREWAU_USERS_GROUP} may run brew, but only through the policy.
 %${BREWAU_USERS_GROUP} ALL=(${BREWAU_USER}) NOPASSWD: ${BREWAU_LIBEXEC}/brew-policy
 %${BREWAU_USERS_GROUP} ALL=(root) NOPASSWD: /bin/launchctl kickstart system/${BREWAU_LABEL}
+%${BREWAU_USERS_GROUP} ALL=(root) NOPASSWD: /bin/launchctl kickstart system/com.kastruppro.brewau.scan
+# This helper accepts only validated schedule JSON; it cannot change policy keys.
+%${BREWAU_USERS_GROUP} ALL=(root) NOPASSWD: ${BREWAU_LIBEXEC}/brewau-agent configure, ${BREWAU_LIBEXEC}/brewau-agent completions
 EOF
   if ! visudo -cqf "${tmp}"; then
     rm -f "${tmp}"
@@ -288,77 +291,59 @@ remove_brew_env() {
   rm -f "${tmp}"
 }
 
+# Jobs share one OS lock in brewau-agent; manual requests never overlap scheduled work.
+# AssociatedBundleIdentifiers makes Login Items show brewau.app's name and icon
+# instead of the signing certificate's developer name.
 write_launchdaemon() {
-  local tmp="${BREWAU_PLIST}.tmp" i schedule=""
-  # brewau_load_config has validated UPGRADE_HOUR and UPGRADE_MINUTE. With
-  # AUTO_UPGRADE=0 the job has no schedule but `brewau run` still starts it.
-  if [[ "${AUTO_UPGRADE}" == "1" ]]; then
-    schedule="  <key>StartCalendarInterval</key>
-  <dict>
-    <key>Hour</key>
-    <integer>$((10#${UPGRADE_HOUR}))</integer>
-    <key>Minute</key>
-    <integer>$((10#${UPGRADE_MINUTE}))</integer>
-  </dict>"
-  fi
-  cat >"${tmp}" <<EOF
+  local suffix command label plist tmp i schedule
+  for suffix in upgrade scan scheduler; do
+    command="${suffix}"
+    schedule=""
+    if [[ "${suffix}" == "scheduler" ]]; then
+      command="scheduled"
+      schedule='<key>StartInterval</key><integer>60</integer><key>RunAtLoad</key><true/>'
+    fi
+    label="com.kastruppro.brewau.${suffix}"
+    plist="$(dirname "${BREWAU_PLIST}")/${label}.plist"
+    tmp="${plist}.tmp"
+    cat >"${tmp}" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>Label</key>
-  <string>${BREWAU_LABEL}</string>
-  <key>ProgramArguments</key>
-  <array>
-    <string>${BREWAU_LIBEXEC}/brewau-upgrade</string>
+<plist version="1.0"><dict>
+  <key>Label</key><string>${label}</string>
+  <key>AssociatedBundleIdentifiers</key><array><string>com.kastruppro.brewau.app</string></array>
+  <key>ProgramArguments</key><array>
+    <string>${BREWAU_LIBEXEC}/brewau-agent</string><string>${command}</string>
   </array>
-  <key>UserName</key>
-  <string>${BREWAU_USER}</string>
-  <key>GroupName</key>
-  <string>${BREWAU_GROUP}</string>
-${schedule}
-  <key>StandardOutPath</key>
-  <string>${BREWAU_LOG_DIR}/upgrade.log</string>
-  <key>StandardErrorPath</key>
-  <string>${BREWAU_LOG_DIR}/upgrade.log</string>
-  <key>ProcessType</key>
-  <string>Background</string>
-  <key>LowPriorityIO</key>
-  <true/>
-</dict>
-</plist>
+  <key>UserName</key><string>${BREWAU_USER}</string>
+  <key>GroupName</key><string>${BREWAU_GROUP}</string>
+  ${schedule}
+  <key>StandardOutPath</key><string>${BREWAU_LOG_DIR}/upgrade.log</string>
+  <key>StandardErrorPath</key><string>${BREWAU_LOG_DIR}/upgrade.log</string>
+  <key>ProcessType</key><string>Background</string>
+  <key>LowPriorityIO</key><true/>
+</dict></plist>
 EOF
-  plutil -lint -s "${tmp}" || brewau_die "generated LaunchDaemon plist is invalid"
-  chown root:wheel "${tmp}"
-  chmod 0644 "${tmp}"
-
-  # Reloading kills a running upgrade, so leave an unchanged daemon alone.
-  if [[ -f "${BREWAU_PLIST}" ]] && cmp -s "${tmp}" "${BREWAU_PLIST}" && brewau_daemon_loaded; then
-    rm -f "${tmp}"
-    return 0
-  fi
-
-  if brewau_daemon_loaded; then
-    launchctl bootout "system/${BREWAU_LABEL}" 2>/dev/null || true
-    # bootout returns before the job is gone, and bootstrap fails until it is.
+    plutil -lint -s "${tmp}" || brewau_die "generated LaunchDaemon plist is invalid"
+    chown root:wheel "${tmp}"
+    chmod 0644 "${tmp}"
+    if [[ -f "${plist}" ]] && cmp -s "${tmp}" "${plist}" && launchctl print "system/${label}" >/dev/null 2>&1; then
+      rm -f "${tmp}"
+      continue
+    fi
+    # Never terminate an upgrade to apply settings or install a new scheduler.
+    if launchctl print "system/${label}" 2>/dev/null | grep -q 'state = running'; then
+      rm -f "${tmp}"
+      brewau_die "${label} is running; wait for it to finish and run sudo brewau reload"
+    fi
+    launchctl bootout "system/${label}" 2>/dev/null || true
     for ((i = 0; i < 50; i++)); do
-      brewau_daemon_loaded || break
+      launchctl print "system/${label}" >/dev/null 2>&1 || break
       sleep 0.2
     done
-  fi
-  mv -f "${tmp}" "${BREWAU_PLIST}"
-  for ((i = 0; i < 5; i++)); do
-    if launchctl bootstrap system "${BREWAU_PLIST}" 2>/dev/null; then
-      if [[ -n "${schedule}" ]]; then
-        log "scheduled daily upgrade at $(printf '%02d:%02d' "$((10#${UPGRADE_HOUR}))" "$((10#${UPGRADE_MINUTE}))")"
-      else
-        log "scheduled upgrades are off (AUTO_UPGRADE=0); start one with: brewau run"
-      fi
-      return 0
-    fi
-    sleep 1
+    mv -f "${tmp}" "${plist}"
+    launchctl bootstrap system "${plist}" || brewau_die "could not load ${plist}"
   done
-  launchctl bootstrap system "${BREWAU_PLIST}" || brewau_die "could not load ${BREWAU_PLIST}"
 }
 
 write_system_files() {
@@ -423,12 +408,26 @@ cmd_install() {
   BREWAU_APPS_BASELINE="${first_install}"
   protect_cask_apps
   BREWAU_APPS_BASELINE=0
+  "${BREWAU_LIBEXEC}/brewau-agent" completions
+  setup_users_shells
   write_launchdaemon
   dscacheutil -flushcache 2>/dev/null || true
   touch "${INSTALLED_MARKER}"
 
   log "installed. Open a new terminal; \`brew\` now runs through brewau."
-  log "if your shell profile runs \`/opt/homebrew/bin/brew shellenv\`, run \`/opt/brewau/bin/brewau setup-shell\`."
+  log "shell profiles of brewau users are configured with backups. Open /Applications/brewau.app for settings."
+}
+
+# Run as each user, so symlinked dotfiles never grant root access to user-controlled paths.
+setup_users_shells() {
+  local user uid
+  while read -r user uid; do
+    [[ "${uid}" -ge 500 ]] || continue
+    case " $(id -Gn "${user}" 2>/dev/null) " in *" ${BREWAU_USERS_GROUP} "*) ;; *) continue ;; esac
+    user_home "${user}" >/dev/null || continue
+    (cd / && sudo -u "${user}" -H /bin/bash -p "${BREWAU_ROOT}/bin/brewau" setup-shell </dev/null) ||
+      log "WARNING: could not prepare ${user}'s shell; use Reparer terminal-completions in the app"
+  done < <(dscl . -list /Users UniqueID)
 }
 
 # Undoes `brewau setup-shell` for every local user, running as that user so
@@ -679,6 +678,8 @@ cmd_uninstall() {
   # user-writable again; otherwise a user could edit Homebrew's code and run
   # it through the still-valid policy rule.
   launchctl bootout "system/${BREWAU_LABEL}" 2>/dev/null || true
+  launchctl bootout system/com.kastruppro.brewau.scan 2>/dev/null || true
+  launchctl bootout system/com.kastruppro.brewau.scheduler 2>/dev/null || true
   rm -f "${BREWAU_SUDOERS}"
   stop_service_processes
   # While the prefix still belongs to _brewau, so copies into it are safe.
@@ -694,7 +695,9 @@ cmd_uninstall() {
     log "fix with: sudo chown -hR <you>:admin ${HOMEBREW_PREFIX_PATH}"
   fi
 
-  rm -f "${BREWAU_PLIST}" "${BREWAU_PATHS_D}" "${NEWSYSLOG_CONF}"
+  rm -f "${BREWAU_PLIST}" /Library/LaunchDaemons/com.kastruppro.brewau.scan.plist \
+    /Library/LaunchDaemons/com.kastruppro.brewau.scheduler.plist "${BREWAU_PATHS_D}" "${NEWSYSLOG_CONF}"
+  rm -rf /Applications/brewau.app
   remove_brew_env
   dscl . -delete "/Users/${BREWAU_USER}" 2>/dev/null || true
   dscl . -delete "/Groups/${BREWAU_GROUP}" 2>/dev/null || true

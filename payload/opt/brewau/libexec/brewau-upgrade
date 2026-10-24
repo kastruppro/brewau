@@ -1,9 +1,7 @@
 #!/bin/bash -p
 # brewau-upgrade: scheduled unattended update, run by launchd as _brewau.
 #
-# There is no lock file: launchd never starts a second instance of a running
-# job (and `kickstart` without -k is a no-op then), and a lock left behind by
-# a killed run would silently stop every later run.
+# brewau-agent serializes scheduled and manual work with an OS file lock.
 
 set -u
 
@@ -15,6 +13,7 @@ export PATH
 BREWAU_LIBEXEC="/opt/brewau/libexec"
 # shellcheck source=common.sh
 source "${BREWAU_LIBEXEC}/common.sh"
+BREWAU_PASSTHROUGH_ENV="HOMEBREW_NO_AUTO_UPDATE=1"
 
 LAST_RUN="${BREWAU_STATE_DIR}/last-run"
 # Formulae this job pinned because of UPGRADE_EXCLUDE, so it only ever unpins
@@ -137,7 +136,10 @@ run_upgrade() {
   [[ "${UPGRADE_GREEDY}" == "1" ]] && greedy="--greedy"
 
   log "brew update"
-  brew_run update || status="update-failed"
+  if ! brew_run update; then
+    write_state "update-failed" ""
+    return 1
+  fi
 
   # Every run, not only when casks are outdated: an updater can replace an app
   # at any time. Upgrading a cask runs code from its app, so a cask whose app
@@ -205,9 +207,41 @@ run_upgrade() {
   brew_run cleanup --prune=30 || true
   clean_tmp
 
+  if ! refresh_snapshot; then
+    log "could not refresh the GUI snapshot"
+    [[ "${status}" == "ok" ]] && status="snapshot-failed"
+  fi
+
   write_state "${status}" "$(echo ${formulae} ${casks})"
   log "done (${status})"
   [[ "${status}" == "ok" ]]
+}
+
+# Publish complete JSON files atomically; a failed scan leaves the last good data intact.
+refresh_snapshot() {
+  local greedy="" json catalog version
+  [[ "${UPGRADE_GREEDY}" == "1" ]] && greedy="--greedy"
+  # shellcheck disable=SC2086
+  json="$(brew_run outdated --json=v2 ${greedy})" || return 1
+  plutil -extract formulae raw -o - - <<<"${json}" >/dev/null 2>&1 || return 1
+  plutil -extract casks raw -o - - <<<"${json}" >/dev/null 2>&1 || return 1
+  catalog="$(brew_run info --json=v2 --installed --cask)" || return 1
+  plutil -extract casks raw -o - - <<<"${catalog}" >/dev/null 2>&1 || return 1
+  printf '%s\n' "${catalog}" >"${BREWAU_STATE_DIR}/catalog.json.tmp" &&
+    mv -f "${BREWAU_STATE_DIR}/catalog.json.tmp" "${BREWAU_STATE_DIR}/catalog.json" || return 1
+  printf '%s\n' "${json}" >"${BREWAU_STATE_DIR}/updates.json.tmp" &&
+    mv -f "${BREWAU_STATE_DIR}/updates.json.tmp" "${BREWAU_STATE_DIR}/updates.json" || return 1
+  version="$(brew_run --version)" || return 1
+  printf '%s\n' "${version%%$'\n'*}" >"${BREWAU_STATE_DIR}/homebrew-version.tmp" &&
+    mv -f "${BREWAU_STATE_DIR}/homebrew-version.tmp" "${BREWAU_STATE_DIR}/homebrew-version"
+}
+
+run_scan() {
+  if [[ "${UPDATE_HOMEBREW}" == "1" ]]; then
+    log "brew update (scan)"
+    brew_run update || return 1
+  fi
+  refresh_snapshot
 }
 
 # With AUTO_UPGRADE=0 the LaunchDaemon has no schedule, so the job only runs
@@ -220,7 +254,11 @@ main() {
     write_state "tap-check-failed" ""
     exit 1
   fi
-  run_upgrade
+  case "${1:-upgrade}" in
+    scan) run_scan ;;
+    upgrade) run_upgrade ;;
+    *) brewau_die "expected scan or upgrade" ;;
+  esac
 }
 
 if [[ -z "${BREWAU_UPGRADE_TEST:-}" ]]; then

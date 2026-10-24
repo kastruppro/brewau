@@ -287,6 +287,7 @@ run_then_protect_apps() {
   # ...but the locking, and the root helper it runs, must not be stopped.
   trap '' INT TERM HUP QUIT PIPE
   brewau_protect_installed_apps /usr/bin/sudo -n >/dev/null
+  brewau_refresh_completions || true
   trap - INT TERM HUP QUIT PIPE
   return "${rc}"
 }
@@ -335,6 +336,12 @@ main() {
   if cask_command "${CASK_INSTALL_COMMANDS}" "${cmd}" ${args[@]+"${args[@]}"}; then
     run_then_protect_apps "$@"
     exit
+  fi
+  if brewau_in_words "${cmd}" "install reinstall upgrade uninstall remove rm update update-reset cleanup link unlink"; then
+    local rc=0
+    (brewau_exec_brew "$@") || rc=$?
+    brewau_refresh_completions || true
+    return "${rc}"
   fi
   brewau_exec_brew "$@"
 }

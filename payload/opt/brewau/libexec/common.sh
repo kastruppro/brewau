@@ -48,6 +48,12 @@ UPGRADE_EXCLUDE=""
 ALLOWED_SERVICES=""
 UPGRADE_HOUR="4"
 UPGRADE_MINUTE="0"
+SCAN_MINUTES="60"
+UPGRADE_MODE="daily"
+UPGRADE_INTERVAL_HOURS="1"
+UPGRADE_WEEKDAY="2"
+UPGRADE_TIMES=""
+UPDATE_HOMEBREW="1"
 
 # 1 makes every problem in brewau.conf fatal (`brewau config` sets it while an
 # administrator edits). Otherwise problems that cannot weaken the policy only
@@ -116,7 +122,8 @@ brewau_load_config() {
     [[ "${value}" =~ ^[A-Za-z0-9@/._+=[:space:]-]*$ ]] || brewau_die "${file} line ${n}: invalid value for ${key}"
     case "${key}" in
       ALLOWED_TAPS | FORBIDDEN_FORMULAE | FORBIDDEN_CASKS | EXTRA_ALLOWED_OPTIONS | \
-        AUTO_UPGRADE | UPGRADE_GREEDY | UPGRADE_EXCLUDE | UPGRADE_HOUR | UPGRADE_MINUTE | ALLOWED_SERVICES)
+        AUTO_UPGRADE | UPGRADE_GREEDY | UPGRADE_EXCLUDE | UPGRADE_HOUR | UPGRADE_MINUTE | ALLOWED_SERVICES | \
+        SCAN_MINUTES | UPGRADE_MODE | UPGRADE_INTERVAL_HOURS | UPGRADE_WEEKDAY | UPGRADE_TIMES | UPDATE_HOMEBREW)
         printf -v "${key}" '%s' "${value}"
         ;;
       *) brewau_die "${file} line ${n}: unknown key ${key}" ;;
@@ -159,6 +166,34 @@ brewau_check_config() {
   local file="$1"
   brewau_config_bool AUTO_UPGRADE 1 "${file}"
   brewau_config_bool UPGRADE_GREEDY 1 "${file}"
+  brewau_config_bool UPDATE_HOMEBREW 1 "${file}"
+  case "${SCAN_MINUTES}" in
+    15 | 30 | 60 | 360 | 720 | 1440) ;;
+    *) brewau_config_problem "SCAN_MINUTES must be 15, 30, 60, 360, 720 or 1440 in ${file}" "using 60"; SCAN_MINUTES=60 ;;
+  esac
+  case "${UPGRADE_MODE}" in
+    daily | weekly | interval) ;;
+    *) brewau_config_problem "UPGRADE_MODE must be daily, weekly or interval in ${file}" "disabling upgrades"; AUTO_UPGRADE=0; UPGRADE_MODE=daily ;;
+  esac
+  case "${UPGRADE_INTERVAL_HOURS}" in
+    1 | 2 | 4 | 6 | 12 | 24) ;;
+    *) brewau_config_problem "UPGRADE_INTERVAL_HOURS must be 1, 2, 4, 6, 12 or 24 in ${file}" "using 24"; UPGRADE_INTERVAL_HOURS=24 ;;
+  esac
+  if ! [[ "${UPGRADE_WEEKDAY}" =~ ^[1-7]$ ]]; then
+    brewau_config_problem "UPGRADE_WEEKDAY must be 1-7 (Sunday=1) in ${file}" "using Monday"
+    UPGRADE_WEEKDAY=2
+  fi
+  local time times="" count=0
+  for time in ${UPGRADE_TIMES}; do
+    if [[ "${time}" =~ ^[0-9]{1,4}$ ]] && ((10#${time} < 1440)) && [[ ${count} -lt 24 ]] && ! brewau_in_words "$((10#${time}))" "${times}"; then
+      times="${times:+${times} }$((10#${time}))"
+      count=$((count + 1))
+    else
+      brewau_config_problem "UPGRADE_TIMES must contain at most 24 distinct minutes of the day (0-1439) in ${file}" "disabling upgrades"
+      AUTO_UPGRADE=0
+    fi
+  done
+  UPGRADE_TIMES="${times}"
   if ! [[ "${UPGRADE_HOUR}" =~ ^[0-9]{1,2}$ ]] || ((10#${UPGRADE_HOUR} > 23)); then
     brewau_config_problem "UPGRADE_HOUR must be 0-23 in ${file}" "using 4"
     UPGRADE_HOUR=4
@@ -667,6 +702,14 @@ brewau_exec_brew() {
   _brewau_exec_brew "${BREWAU_USER}" "$@"
 }
 
+brewau_refresh_completions() {
+  [[ -x "${BREWAU_ROOT}/libexec/brewau-agent" ]] || return 0
+  /usr/bin/sudo -n "${BREWAU_ROOT}/libexec/brewau-agent" completions >/dev/null || {
+    echo "brewau: could not refresh terminal completions; use the app's terminal repair action" >&2
+    return 1
+  }
+}
+
 # Run brew as root, for `brew services` on ALLOWED_SERVICES (system daemons).
 # Homebrew permits root only for `brew services`. Root gets its own HOME and
 # temp directory so it never leaves root-owned files where _brewau works.
@@ -699,6 +742,8 @@ _brewau_exec_brew() {
     TMPDIR="${tmp}" \
     HOMEBREW_TEMP="${tmp}" \
     HOMEBREW_NO_ENV_HINTS=1 \
+    HOMEBREW_NO_ASK=1 \
+    HOMEBREW_NO_UPGRADE_QUIT_CASKS=1 \
     HOMEBREW_FORBID_PACKAGES_FROM_PATHS=1 \
     HOMEBREW_FORBIDDEN_FORMULAE="${FORBIDDEN_FORMULAE}" \
     HOMEBREW_FORBIDDEN_CASKS="${FORBIDDEN_CASKS}" \
@@ -792,6 +837,8 @@ HOMEBREW_SYSTEM_ENV_TAKES_PRIORITY=1
 HOMEBREW_FORBID_PACKAGES_FROM_PATHS=1
 HOMEBREW_FORBIDDEN_FORMULAE=${FORBIDDEN_FORMULAE}
 HOMEBREW_FORBIDDEN_CASKS=${FORBIDDEN_CASKS}
+HOMEBREW_NO_ASK=1
+HOMEBREW_NO_UPGRADE_QUIT_CASKS=1
 ${BREWAU_BREW_ENV_END}
 EOF
 }

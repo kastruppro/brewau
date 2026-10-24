@@ -68,5 +68,34 @@ check "755" "$(stat -f '%Lp' "${BREWAU_APPDIR}/Odd.app/Contents")" "and locks it
 check "group:everyone deny delete" "$(brewau_acl "${BREWAU_APPDIR}/Odd.app")" "and pins it in place"
 check "fail" "$( (cmd_trust_app "${WORK}/elsewhere.app") 2>/dev/null && echo ok || echo fail)" "apps outside the app directory are refused"
 
+# --- LaunchDaemons: fixed entry points, validation, and safe reload -----------
+BREWAU_PLIST="${WORK}/launch/com.kastruppro.brewau.upgrade.plist"
+mkdir -p "${WORK}/launch" "${WORK}/loaded"
+chown() { :; }
+launchctl() {
+  local label="${2##*/}"
+  label="${label%.plist}"
+  case "$1" in
+    print)
+      [[ -f "${WORK}/loaded/${label}" ]] || return 1
+      echo "state = ${MOCK_JOB_STATE:-waiting}"
+      ;;
+    bootstrap) touch "${WORK}/loaded/$(basename "$3" .plist)"; echo bootstrap >>"${WORK}/launch-calls" ;;
+    bootout) rm -f "${WORK}/loaded/${label}"; echo bootout >>"${WORK}/launch-calls" ;;
+    *) return 1 ;;
+  esac
+}
+write_launchdaemon
+check "60" "$(plutil -extract StartInterval raw -o - "${WORK}/launch/com.kastruppro.brewau.scheduler.plist")" "scheduler checks once a minute"
+check "scheduled" "$(plutil -extract ProgramArguments.1 raw -o - "${WORK}/launch/com.kastruppro.brewau.scheduler.plist")" "scheduler has a fixed entry point"
+check "scan" "$(plutil -extract ProgramArguments.1 raw -o - "${WORK}/launch/com.kastruppro.brewau.scan.plist")" "manual scan has a fixed entry point"
+check "upgrade" "$(plutil -extract ProgramArguments.1 raw -o - "${BREWAU_PLIST}")" "manual upgrade remains available"
+cp "${WORK}/launch-calls" "${WORK}/launch-before"
+write_launchdaemon
+check "yes" "$(cmp -s "${WORK}/launch-before" "${WORK}/launch-calls" && echo yes)" "unchanged jobs are not reloaded"
+printf '\n' >>"${BREWAU_PLIST}"
+MOCK_JOB_STATE=running
+check "fail" "$( (write_launchdaemon) >/dev/null 2>&1 && echo ok || echo fail)" "a running worker is never killed for reload"
+
 echo "${PASS} passed, ${FAIL} failed"
 [[ ${FAIL} -eq 0 ]]

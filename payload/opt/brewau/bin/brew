@@ -12,6 +12,10 @@ case "${1:-}" in
     shell="${shell#-}"
     /opt/homebrew/bin/brew shellenv "${shell}" 2>/dev/null
     case "${shell}" in
+      zsh)
+        echo 'fpath=(/opt/brewau/share/zsh/site-functions ${fpath:#/opt/homebrew/*});'
+        echo "export PATH=\"${BREWAU_ROOT}/bin:\${PATH}\";"
+        ;;
       fish) echo "fish_add_path --global --move --path ${BREWAU_ROOT}/bin;" ;;
       csh | tcsh) echo "setenv PATH ${BREWAU_ROOT}/bin:\$PATH;" ;;
       *) echo "export PATH=\"${BREWAU_ROOT}/bin:\${PATH}\";" ;;

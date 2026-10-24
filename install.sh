@@ -8,6 +8,8 @@
 #       installs a staged checkout (make install), for development.
 
 set -euo pipefail
+PATH="/usr/bin:/bin:/usr/sbin:/sbin"
+export PATH
 
 BREWAU_REPO="${BREWAU_REPO:-kastruppro/brewau}"
 # Apple Developer team that signs official releases. Forks set their own.
@@ -20,13 +22,20 @@ die() {
 }
 
 install_from_root() {
-  local root="$1"
+  local root="$1" tmp version source_dir
   [[ "$(id -u)" -eq 0 ]] || die "--from must run as root"
   [[ -x "${root}/opt/brewau/libexec/brewau-setup" ]] || die "${root} is not a staged brewau root (run: make stage)"
-  /bin/bash "$(dirname "$0")/scripts/preinstall"
-  ditto "${root}/opt/brewau" /opt/brewau
-  chown -R root:wheel /opt/brewau/bin /opt/brewau/libexec /opt/brewau/share
-  /opt/brewau/libexec/brewau-setup install
+  source_dir="$(cd "$(dirname "$0")" && pwd -P)"
+  root="$(cd "${root}" && pwd -P)"
+  version="$(cat "${root}/opt/brewau/share/VERSION")"
+  tmp="$(mktemp -d /private/tmp/brewau-install.XXXXXX)"
+  # Use Installer's bundle replacement, rather than following an app path in /Applications.
+  # shellcheck disable=SC2064
+  trap "rm -rf '${tmp}'" EXIT
+  /usr/bin/pkgbuild --root "${root}" --scripts "${source_dir}/scripts" \
+    --component-plist "${source_dir}/app/components.plist" --identifier "${PKG_ID}" \
+    --version "${version}" --install-location / --ownership recommended "${tmp}/brewau.pkg"
+  /usr/sbin/installer -pkg "${tmp}/brewau.pkg" -target /
 }
 
 install_release() {
