@@ -43,7 +43,8 @@ struct AppIcon: View {
 struct UpdatePopover: View {
     @ObservedObject var model: AppModel
     @Environment(\.openSettings) private var openSettings
-    @State private var restartConfirmation: PendingApp? = nil
+    // Inline, not an .alert: an alert takes focus from the MenuBarExtra panel, which then closes.
+    @State private var restartConfirmation: String? = nil
     @State private var contentHeight: CGFloat = 0
     var body: some View {
         VStack(spacing: 0) {
@@ -60,6 +61,18 @@ struct UpdatePopover: View {
             Divider()
             ScrollView {
                 VStack(alignment: .leading, spacing: 16) {
+                    if let error = model.error {
+                        VStack(alignment: .leading, spacing: 8) {
+                            Label("Handlingen kunne ikke gennemføres", systemImage: "exclamationmark.triangle.fill")
+                                .font(.system(size: 12, weight: .semibold)).foregroundStyle(.orange)
+                            Text(error).font(.system(size: 11)).fixedSize(horizontal: false, vertical: true)
+                            HStack {
+                                Spacer()
+                                Button("Vis log") { model.showLog(); model.error = nil }
+                                Button("OK") { model.error = nil }
+                            }.controlSize(.small)
+                        }.padding(12).background(Color.orange.opacity(0.1), in: RoundedRectangle(cornerRadius: 8))
+                    }
                     VStack(alignment: .leading, spacing: 6) {
                         Text(!model.installed ? "Tjenesten skal opdateres" : model.failed ? "Kørsel mislykkedes" : !model.hasScanned ? "Klar til scanning" : model.updates.isEmpty ? "Alt er opdateret" : "\(model.updates.count) opdateringer klar")
                             .font(.system(size: 20, weight: .semibold))
@@ -109,8 +122,20 @@ struct UpdatePopover: View {
                                     Text("\(item.app.version) klar efter genstart").font(.system(size: 10)).foregroundStyle(.secondary)
                                 }
                                 Spacer()
-                                Button(model.restarting.contains(item.id) ? "Genstarter…" : "Genstart…") { restartConfirmation = item }
-                                    .controlSize(.small).disabled(model.busy || model.restarting.contains(item.id))
+                                if restartConfirmation == item.id {
+                                    Button("Annuller") { restartConfirmation = nil }.controlSize(.small)
+                                    Button("Genstart") {
+                                        restartConfirmation = nil
+                                        Task { await model.restart(item) }
+                                    }.controlSize(.small).buttonStyle(.borderedProminent)
+                                } else {
+                                    Button(model.restarting.contains(item.id) ? "Genstarter…" : "Genstart…") { restartConfirmation = item.id }
+                                        .controlSize(.small).disabled(model.busy || model.restarting.contains(item.id))
+                                }
+                            }
+                            if restartConfirmation == item.id {
+                                Text("Gem dit arbejde først. \(item.app.name) lukkes og åbnes igen. Tvungen genstart bruges kun, hvis du har tilladt den i indstillingerne.")
+                                    .font(.system(size: 10)).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
                             }
                         }
                         Text("Apps lukkes kun automatisk med din tilladelse.").font(.system(size: 10)).foregroundStyle(.secondary)
@@ -134,17 +159,6 @@ struct UpdatePopover: View {
                     .menuStyle(.borderlessButton).fixedSize().accessibilityLabel("Flere muligheder")
             }.font(.system(size: 11)).buttonStyle(.plain).padding(.horizontal, 20).padding(.vertical, 14)
         }.frame(width: 410).background(.background).tint(.blue)
-            .alert("Genstart app?", isPresented: Binding(get: { restartConfirmation != nil }, set: { if !$0 { restartConfirmation = nil } })) {
-                Button("Annuller", role: .cancel) { restartConfirmation = nil }
-                Button("Genstart") {
-                    if let item = restartConfirmation { Task { await model.restart(item) } }
-                    restartConfirmation = nil
-                }
-            } message: { Text("Gem dit arbejde først. Appen lukkes og åbnes igen. Tvungen genstart bruges kun, hvis du har tilladt den i indstillingerne.") }
-            .alert("Handlingen kunne ikke gennemføres", isPresented: Binding(get: { model.error != nil }, set: { if !$0 { model.error = nil } })) {
-                Button("OK", role: .cancel) { model.error = nil }
-                Button("Vis log") { model.showLog(); model.error = nil }
-            } message: { Text(model.error ?? "") }
     }
 }
 

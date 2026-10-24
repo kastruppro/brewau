@@ -4,6 +4,18 @@ All notable changes to brewau. The format follows [Keep a Changelog](https://kee
 and versions follow [Semantic Versioning](https://semver.org/). Details of each finding behind
 0.4.0 are in [FIXES.md](FIXES.md).
 
+## [0.5.1] - 2026-10-24
+
+### Fixed
+
+- Restarting a pending app took two tries: the confirmation alert took focus from the
+  menu bar panel, which closed. Restart confirmation and errors are now shown inline.
+- macOS asked "downloaded from the Internet?" again after every cask upgrade. Users
+  cannot write to `_brewau`-owned apps, so Gatekeeper never stored their approval, and
+  Homebrew only carries an existing approval over. brewau now marks an upgraded app as
+  approved when it is signed by the Team ID recorded for the previous version and
+  `spctl --assess` accepts it. First installs still ask.
+
 ## [0.5.0] - 2026-10-24
 
 ### Added

@@ -510,15 +510,38 @@ brewau_write_state() {
 
 # Remembers who signed app $1 ("-" if nobody did) as brewau put it in place,
 # so a later change can be told apart. Only re-checks an app whose bundle was
-# replaced (another inode) since; never one that is marked untrusted.
+# replaced (another inode) since; never one that is marked untrusted. A
+# replacement signed by the Team ID recorded before is an upgrade, which keeps
+# the user's Gatekeeper approval (see brewau_inherit_approval).
 brewau_record_app() {
-  local app="$1" state inode team
+  local app="$1" state inode team recorded
   state="$(brewau_app_state "${app}")"
   [[ -e "${state}.untrusted" ]] && return 0
   inode="$(stat -f %i "${app}" 2>/dev/null)" || return 1
   [[ "$(cut -f 1 "${state}.team" 2>/dev/null)" == "${inode}" ]] && return 0
+  recorded="$(cut -f 2 "${state}.team" 2>/dev/null)"
   team="$(brewau_app_team "${app}")" || team="-"
+  if [[ "${BREWAU_APPS_BASELINE}" != "1" && "${team}" != "-" && "${team}" == "${recorded}" ]]; then
+    brewau_inherit_approval "${app}" || true
+  fi
   brewau_write_state "${state}.team" "${inode}"$'\t'"${team}"$'\t'"${app}"
+}
+
+# Gatekeeper asks before a quarantined app opens for the first time and keeps
+# the answer in the app's quarantine attribute (flag 0x40). Users cannot write
+# to an app BREWAU_USER owns, so their answer is never kept there, and
+# Homebrew, which carries an approval over to an upgrade only, asks again
+# after every one. Marks app $1, an upgrade by the same developer (checked by
+# the caller), as approved, provided Gatekeeper itself accepts it. Runs as
+# BREWAU_USER, who owns the app.
+brewau_inherit_approval() {
+  local app="$1" attr flags re='^([0-9a-fA-F]{4})(;.*)$'
+  attr="$(xattr -p com.apple.quarantine "${app}" 2>/dev/null)" || return 0
+  [[ "${attr}" =~ ${re} ]] || return 0
+  flags=$((16#${BASH_REMATCH[1]}))
+  ((flags & 0x40)) && return 0
+  spctl --assess --type execute "${app}" >/dev/null 2>&1 || return 1
+  xattr -w com.apple.quarantine "$(printf '%04x' $((flags | 0x40)))${BASH_REMATCH[2]}" "${app}"
 }
 
 # True if app $1, which others could change until it was just locked, still

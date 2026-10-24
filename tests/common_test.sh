@@ -237,7 +237,48 @@ check "" "$(brewau_protect_apps "${WORK}/signed.json" 2>/dev/null)" "on first in
 brewau_record_apps "${WORK}/signed.json"
 check "no -" "$(brewau_app_untrusted "${APP}" && echo yes || echo no) $(cut -f 2 "${STATE}.team")" "and recorded"
 BREWAU_APPS_BASELINE=0
-unset -f brewau_app_team
+
+# Gatekeeper approval carries over to an upgrade by the same developer.
+spctl() { [[ "${MOCK_GATEKEEPER}" == "accept" ]]; }
+quarantine() { xattr -p com.apple.quarantine "${APP}" 2>/dev/null; }
+upgrade_app() {
+  chmod -RN "${APP}" && rm -rf "${APP}"
+  mkdir -p "${APP}/Contents"
+  xattr -w com.apple.quarantine "$1" "${APP}"
+}
+MOCK_TEAM="TEAM1"
+MOCK_GATEKEEPER="accept"
+rm -f "${STATE}.team"
+brewau_record_app "${APP}"
+upgrade_app "0181;6ad6a431;Homebrew Cask;ID"
+brewau_record_app "${APP}"
+check "01c1;6ad6a431;Homebrew Cask;ID" "$(quarantine)" "an upgrade by the recorded Team ID keeps the approval"
+upgrade_app "0181;6ad6a431;Homebrew Cask;ID"
+brewau_record_app "${APP}"
+upgrade_app "01c3;6ad6a431;Homebrew Cask;ID"
+brewau_record_app "${APP}"
+check "01c3;6ad6a431;Homebrew Cask;ID" "$(quarantine)" "an approved app is left alone"
+upgrade_app "0181;6ad6a431;Homebrew Cask;ID"
+MOCK_GATEKEEPER="reject"
+brewau_record_app "${APP}"
+check "0181;6ad6a431;Homebrew Cask;ID" "$(quarantine)" "not if Gatekeeper rejects the new version"
+MOCK_GATEKEEPER="accept"
+MOCK_TEAM="OTHER"
+upgrade_app "0181;6ad6a431;Homebrew Cask;ID"
+brewau_record_app "${APP}"
+check "0181;6ad6a431;Homebrew Cask;ID" "$(quarantine)" "not if another developer signed it"
+rm -f "${STATE}.team"
+upgrade_app "0181;6ad6a431;Homebrew Cask;ID"
+brewau_record_app "${APP}"
+check "0181;6ad6a431;Homebrew Cask;ID" "$(quarantine)" "not on a first install"
+MOCK_TEAM="TEAM1"
+brewau_record_app "${APP}"
+upgrade_app "0181;6ad6a431;Homebrew Cask;ID"
+BREWAU_APPS_BASELINE=1
+brewau_record_app "${APP}"
+check "0181;6ad6a431;Homebrew Cask;ID" "$(quarantine)" "nor when brewau takes over existing apps"
+BREWAU_APPS_BASELINE=0
+unset -f brewau_app_team spctl quarantine upgrade_app
 
 # --- git repositories ---------------------------------------------------------
 REPO="${WORK}/repo"
