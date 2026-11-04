@@ -26,17 +26,26 @@ Usage: brewau <command>
   run                 start the scheduled upgrade now
   scan                refresh the update list without installing anything
   log [-f] [--audit]  show the upgrade log (or the brew audit log)
+  config show         print the configuration
   doctor              check that the installation is healthy
   setup-shell         point your shell profile at the brewau wrapper
   restore-shell       undo setup-shell (uninstall does this for every user)
 
 Administrator commands (run with sudo):
-  config              edit ${BREWAU_CONF} and apply it
-  reload              re-apply brewau.conf (schedule, sudoers, brew.env)
+  config              edit ${BREWAU_CONF} (\$VISUAL, \$EDITOR or nano)
+                      and apply it; only applied if it is valid
+  config add <KEY> <value>...
+                      add entries to a list, e.g. config add ALLOWED_TAPS openai/tools
+  config remove <KEY> <value>...
+                      remove entries from a list
+  config set <KEY> <value>
+                      set a setting, e.g. config set UPGRADE_MODE daily
+  reload              re-apply brewau.conf (schedule, sudoers, brew.env, tap trust)
   repair              re-apply ownership, permissions and system files
   allow-user <user>   allow a user to run brew
   deny-user <user>    revoke a user's access to brew
   trust-app <app>     trust a cask app again after checking it (see brewau doctor)
+  self-update         update brewau now from its own cask (${BREWAU_CASK})
   move-service-data <user> <formula>
                       copy a service's data from before brewau to where it now runs
   uninstall           remove brewau and return Homebrew to its original owner
@@ -75,6 +84,12 @@ cmd_status() {
     echo "Last run:   never"
   fi
   echo "Taps:       homebrew/* ${ALLOWED_TAPS}"
+  if brewau_tap_allowed "${BREWAU_TAP}"; then
+    echo "Self-update: after each scheduled upgrade, from ${BREWAU_CASK}"
+  else
+    echo "Self-update: off (${BREWAU_TAP} is not in ALLOWED_TAPS)"
+  fi
+  brewau_managed PreventUninstall && echo "Managed:    uninstall blocked by the MDM profile"
   echo "Scanning:   every ${SCAN_MINUTES} minutes"
   if in_users_group; then
     echo "Access:     $(id -un) may use brew"
@@ -149,6 +164,10 @@ cmd_doctor() {
 
   [[ -f "${BREWAU_SUDOERS}" ]] && ok "sudoers rule installed" || bad "${BREWAU_SUDOERS} is missing; run: sudo brewau repair"
   brewau_daemon_loaded && ok "upgrade daemon is loaded" || bad "upgrade daemon is not loaded; run: sudo brewau reload"
+  if brewau_tap_allowed "${BREWAU_TAP}"; then
+    launchctl print system/com.kastruppro.brewau.selfupdate >/dev/null 2>&1 &&
+      ok "self-update daemon is loaded" || bad "self-update daemon is not loaded; run: sudo brewau reload"
+  fi
   in_users_group && ok "$(id -un) is in ${BREWAU_USERS_GROUP}" ||
     bad "$(id -un) is not in ${BREWAU_USERS_GROUP}; run: sudo brewau allow-user $(id -un)"
 
@@ -174,6 +193,8 @@ cmd_doctor() {
   forbidden="$(brewau_forbidden_taps)"
   [[ -n "${forbidden}" ]] &&
     echo "  - installed taps outside ALLOWED_TAPS (blocked): ${forbidden}"
+  [[ -n "${forbidden}" ]] &&
+    echo "    to allow one: sudo brewau config add ALLOWED_TAPS <user/repo>"
 
   local last_run="${BREWAU_STATE_DIR}/last-run" finished since age stale_seconds=$((48 * 3600))
   [[ "${UPGRADE_MODE}" == "weekly" ]] && stale_seconds=$((8 * 86400))
@@ -307,31 +328,86 @@ cmd_restore_shell() {
   done
 }
 
-cmd_config() {
-  [[ "$(id -u)" -eq 0 ]] || brewau_die "run with sudo: sudo brewau config"
-  local tmp answer
-  tmp="$(mktemp /tmp/brewau-conf.XXXXXX)"
-  cp "${BREWAU_CONF}" "${tmp}"
-  # Edit a copy and only install it once it parses; a broken live config
-  # makes every brew command fail.
+# Settings that hold space-separated lists (`config add` and `config remove`).
+CONFIG_LIST_KEYS="ALLOWED_TAPS FORBIDDEN_FORMULAE FORBIDDEN_CASKS EXTRA_ALLOWED_OPTIONS ALLOWED_SERVICES UPGRADE_EXCLUDE UPGRADE_TIMES"
+
+# Opens copy $1 in the administrator's editor until it parses.
+config_edit() {
+  local tmp="$1" answer
   while true; do
     # The editor may carry arguments (e.g. "code --wait"), and lives in the
     # administrator's own PATH. macOS sudo keeps VISUAL and EDITOR.
     # shellcheck disable=SC2086
-    PATH="${USER_PATH}" ${VISUAL:-${EDITOR:-vi}} "${tmp}"
+    PATH="${USER_PATH}" ${VISUAL:-${EDITOR:-nano}} "${tmp}"
     # Strict: unknown keys and invalid values are refused here rather than
     # ignored later.
-    if (BREWAU_CONFIG_STRICT=1 brewau_load_config "${tmp}"); then
-      break
-    fi
+    (BREWAU_CONFIG_STRICT=1 brewau_load_config "${tmp}") && return 0
     read -r -p "brewau: the configuration is invalid. Edit again? [Y/n] " answer
-    if [[ "${answer}" == [nN]* ]]; then
-      rm -f "${tmp}"
-      brewau_die "no changes applied"
-    fi
+    [[ "${answer}" == [nN]* ]] && return 1
   done
-  install -o root -g wheel -m 0644 "${tmp}" "${BREWAU_CONF}"
+}
+
+# Writes KEY="value" into copy $1 and shows the new line.
+config_write() {
+  brewau_config_write "$@"
+  echo "$2=\"$3\""
+}
+
+# config add|remove <KEY> <entries...> or config set <KEY> <value...>, on copy $2.
+config_change() {
+  local action="$1" tmp="$2" key words current word kept=""
+  [[ $# -ge 3 ]] || brewau_die "usage: sudo brewau config ${action} <KEY> <value>..."
+  key="$(echo "$3" | tr '[:lower:]' '[:upper:]')"
+  shift 3
+  [[ "${key}" =~ ^[A-Z_]+$ ]] || brewau_die "'${key}' is not a setting name"
+  if [[ "${action}" == "set" ]]; then
+    config_write "${tmp}" "${key}" "$*"
+    return
+  fi
+  brewau_in_words "${key}" "${CONFIG_LIST_KEYS}" || brewau_die "${key} is not a list; lists are: ${CONFIG_LIST_KEYS}"
+  # Entries may be given separately, or in one argument with spaces or commas.
+  words="${*//,/ }"
+  [[ "${key}" == "ALLOWED_TAPS" ]] && words="$(brewau_lower "${words}")"
+  [[ -n "${words// /}" ]] || brewau_die "usage: sudo brewau config ${action} ${key} <value>..."
+  # The current value as brewau reads it (taps in lower case).
+  current="$(brewau_load_config "${tmp}" && printf '%s' "${!key}")" || exit 1
+  if [[ "${action}" == "add" ]]; then
+    for word in ${words}; do
+      brewau_in_words "${word}" "${current}" || current="${current:+${current} }${word}"
+    done
+  else
+    for word in ${current}; do
+      brewau_in_words "${word}" "${words}" || kept="${kept:+${kept} }${word}"
+    done
+    current="${kept}"
+  fi
+  config_write "${tmp}" "${key}" "${current}"
+}
+
+cmd_config() {
+  local action="${1:-edit}" tmp
+  case "${action}" in
+    show) cat "${BREWAU_CONF}"; return ;;
+    edit | add | remove | set) ;;
+    *) brewau_die "usage: brewau config [show | add|remove <KEY> <value>... | set <KEY> <value>]" ;;
+  esac
+  [[ "$(id -u)" -eq 0 ]] || brewau_die "run with sudo: sudo brewau config $*"
+  # Change a copy and only install it once it parses; a broken live config
+  # makes every brew command fail.
+  tmp="$(mktemp /tmp/brewau-conf.XXXXXX)"
+  # shellcheck disable=SC2064
+  trap "rm -f '${tmp}'" EXIT
+  cp "${BREWAU_CONF}" "${tmp}"
+  if [[ "${action}" == "edit" ]]; then
+    config_edit "${tmp}" || brewau_die "no changes applied"
+  else
+    config_change "${action}" "${tmp}" "${@:2}"
+    (BREWAU_CONFIG_STRICT=1 brewau_load_config "${tmp}") || brewau_die "no changes applied"
+  fi
+  # Re-apply even when nothing changed, e.g. to trust a tap already listed.
+  cmp -s "${tmp}" "${BREWAU_CONF}" || install -o root -g wheel -m 0644 "${tmp}" "${BREWAU_CONF}"
   rm -f "${tmp}"
+  trap - EXIT
   exec "${BREWAU_LIBEXEC}/brewau-setup" reload
 }
 
@@ -348,12 +424,17 @@ case "${1:-}" in
   doctor) cmd_doctor ;;
   setup-shell) cmd_setup_shell ;;
   restore-shell) cmd_restore_shell ;;
-  config) cmd_config ;;
+  config) shift; cmd_config "$@" ;;
   repair)
     [[ "$(id -u)" -eq 0 ]] || brewau_die "run with sudo: sudo brewau repair"
     root_command install
     ;;
   reload | allow-user | deny-user | uninstall | trust-app | move-service-data) root_command "$@" ;;
+  self-update)
+    [[ "$(id -u)" -eq 0 ]] || brewau_die "run with sudo: sudo brewau self-update"
+    # The agent holds the operation lock while the package installs.
+    exec "${BREWAU_LIBEXEC}/brewau-agent" self-update-now
+    ;;
   version | --version | -v) echo "${VERSION}" ;;
   "" | help | -h | --help) usage ;;
   *) usage >&2; exit 1 ;;

@@ -370,5 +370,45 @@ FORBIDDEN_CASKS="firefox"
 check "no" "$([[ "$(brewau_brew_env_current)" == "$(brewau_brew_env_block)" ]] && echo yes || echo no)" \
   "a block from an older config is not"
 
+# --- brewau_managed (MDM profile) ---------------------------------------------
+BREWAU_MANAGED_PREFS="${WORK}/managed/com.kastruppro.brewau.plist"
+BREWAU_MANAGED_OWNER="$(id -u)"
+mkdir -p "${WORK}/managed"
+managed() { brewau_managed "$1" && echo yes || echo no; }
+check "no" "$(managed PreventUninstall)" "no profile, nothing is managed"
+plutil -create xml1 "${BREWAU_MANAGED_PREFS}"
+plutil -insert PreventUninstall -bool YES "${BREWAU_MANAGED_PREFS}"
+chmod 644 "${BREWAU_MANAGED_PREFS}"
+check "yes" "$(managed PreventUninstall)" "a true boolean counts"
+check "no" "$(managed SomethingElse)" "a missing key does not"
+plutil -replace PreventUninstall -integer 1 "${BREWAU_MANAGED_PREFS}"
+check "yes" "$(managed PreventUninstall)" "an integer 1 counts"
+plutil -replace PreventUninstall -bool NO "${BREWAU_MANAGED_PREFS}"
+check "no" "$(managed PreventUninstall)" "false does not"
+plutil -replace PreventUninstall -bool YES "${BREWAU_MANAGED_PREFS}"
+chmod 666 "${BREWAU_MANAGED_PREFS}"
+check "no" "$(managed PreventUninstall)" "a file others can write does not count"
+chmod 644 "${BREWAU_MANAGED_PREFS}"
+BREWAU_MANAGED_OWNER=0
+check "no" "$(managed PreventUninstall)" "nor one root does not own"
+
+# --- brewau_version_newer -----------------------------------------------------
+newer() { brewau_version_newer "$1" "$2" && echo yes || echo no; }
+check "yes" "$(newer 0.6.10 0.6.9)" "versions compare as numbers"
+check "yes" "$(newer 0.7.0 0.6.1)" "a minor bump is newer"
+check "yes" "$(newer 1.0 0.9.9)" "missing parts count as 0"
+check "no" "$(newer 0.6.1 0.6.1)" "the same version is not newer"
+check "no" "$(newer 0.6.0 0.6.1)" "an older one is not"
+check "no" "$(newer 0.7.0-beta 0.6.1)" "anything but numbers is never newer"
+
+# --- brewau_self_update_running -------------------------------------------------
+BREWAU_SELF_UPDATE_MARKER="${WORK}/self-update.pid"
+running() { brewau_self_update_running && echo yes || echo no; }
+check "no" "$(running)" "no marker, no self-update"
+echo "$$" >"${BREWAU_SELF_UPDATE_MARKER}"
+check "no" "$(running)" "a marker naming another program does not count"
+echo "garbage" >"${BREWAU_SELF_UPDATE_MARKER}"
+check "no" "$(running)" "nor one that is not a PID"
+
 echo "${PASS} passed, ${FAIL} failed"
 [[ ${FAIL} -eq 0 ]]

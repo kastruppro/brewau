@@ -4,6 +4,67 @@ All notable changes to brewau. The format follows [Keep a Changelog](https://kee
 and versions follow [Semantic Versioning](https://semver.org/). Details of each finding behind
 0.4.0 are in [FIXES.md](FIXES.md).
 
+## [0.7.0] - 2026-11-03
+
+### Added
+
+- Self-update through Homebrew: brewau's own tap `kastruppro/tap` carries a `brewau` cask
+  (`brew install --cask kastruppro/tap/brewau`). After each scheduled upgrade, a root
+  LaunchDaemon (`com.kastruppro.brewau.selfupdate`) installs a newer cask while it holds the
+  scan/upgrade lock; `sudo brewau self-update` does so at once. The upgrade job leaves the
+  brewau cask to it. Off when `kastruppro/tap` is not in `ALLOWED_TAPS` or `brewau` is in
+  `UPGRADE_EXCLUDE`.
+- `kastruppro/tap` is added to `ALLOWED_TAPS` once on install (new and existing
+  configurations); removing it afterwards sticks.
+- `PreventUninstall` in an MDM custom settings payload for `com.kastruppro.brewau` (computer
+  scope) makes `sudo brewau uninstall` refuse. Example in `mdm/`; `brewau status` shows it.
+- `make tap` points the tap's cask at a release (`scripts/update-tap`).
+
+### Changed
+
+- `brew uninstall brewau` is denied: it would only drop the cask record. Use
+  `sudo brewau uninstall`, which now also removes that record.
+- A first install started by `brew install --cask` finishes after `brew` has exited, instead
+  of taking `/opt/homebrew` over under it.
+- The package's preinstall no longer waits for brewau's jobs while a self-update (which holds
+  their lock) installs it.
+
+## [0.6.1] - 2026-11-03
+
+### Fixed
+
+- The 0.6.0 installer failed ("The installation failed") on a Mac whose `_brewau` had no
+  trusted taps yet: Homebrew lists an empty trust store as `[]`, and the empty search result
+  stopped `brewau-setup` under `pipefail`, after brew.env but before the LaunchDaemons. The same
+  stopped `sudo brewau reload` and `config`. Tap trust now only warns when it cannot be read.
+
+### Changed
+
+- A denial that the configuration can lift now ends with the exact command to run, e.g.
+  `sudo brewau config add ALLOWED_SERVICES tailscale` (also for taps and options), instead
+  of `sudo brewau config (ALLOWED_SERVICES="tailscale")`, which was not a command.
+  Values that are not plain names, and `--adopt`, get no such hint.
+- When `brewau-setup` (the installer's postinstall, `reload`, ...) stops on a failing command,
+  it now names the line and command, so `/var/log/install.log` shows why an install failed
+  instead of only the Installer's generic error.
+
+## [0.6.0] - 2026-11-03
+
+### Added
+
+- `sudo brewau config add|remove <KEY> <value>...` and `config set <KEY> <value>` change one
+  setting without an editor, validate the result and apply it; `brewau config show` prints the
+  configuration.
+- Homebrew 7 tap trust: `brewau reload` (and install) runs `brew trust --tap` as `_brewau`
+  for every tap in `ALLOWED_TAPS` and untrusts taps removed from it. `brew trust`/`brew untrust`
+  with arguments are denied with a hint; without arguments they only list.
+
+### Changed
+
+- `sudo brewau config` opens `nano` instead of `vi` when neither `$VISUAL` nor `$EDITOR` is set.
+- A comma in a list setting is refused with "separate the entries with spaces, not commas"
+  instead of a generic invalid-value error.
+
 ## [0.5.1] - 2026-10-24
 
 ### Fixed

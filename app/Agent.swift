@@ -25,6 +25,18 @@ private let config = root.appendingPathComponent("etc/brewau.conf")
             case "completions":
                 try requireRoot()
                 try withFileLock(root.appendingPathComponent("etc/completions.lock").path) { try refreshCompletions() }
+            case "self-update", "self-update-now":
+                // Root: installs brewau's package. Holding the operation lock keeps scans and
+                // upgrades out; the marker tells the package scripts that this job is the installer.
+                try requireRoot()
+                let now = CommandLine.arguments[1] == "self-update-now"
+                if !now, !FileManager.default.fileExists(atPath: state.appendingPathComponent("self-update-due").path) { return }
+                guard let account = getpwnam("_brewau") else { throw BrewauError.message("_brewau is missing.") }
+                let ran: Void? = try withFileLock(state.appendingPathComponent("operation.lock").path, nonblocking: true,
+                                           owner: (account.pointee.pw_uid, account.pointee.pw_gid)) {
+                    try selfUpdate(now: now)
+                }
+                if ran == nil, now { throw BrewauError.message("brewau scanner eller opdaterer; prøv igen, når det er færdigt.") }
             case "scan", "upgrade", "scheduled":
                 guard let user = getpwuid(getuid()), String(cString: user.pointee.pw_name) == "_brewau" else {
                     throw BrewauError.message("This command must run as _brewau.")
@@ -83,6 +95,20 @@ private let config = root.appendingPathComponent("etc/brewau.conf")
         try writeJSON(operation, to: state.appendingPathComponent("operation.json"))
         try writeJSON(operation, to: state.appendingPathComponent("last-\(kind).json"))
         if let failure { throw failure }
+    }
+    static func selfUpdate(now: Bool) throws {
+        let marker = root.appendingPathComponent("etc/self-update.pid")
+        try Data("\(getpid())\n".utf8).write(to: marker, options: .atomic)
+        defer { try? FileManager.default.removeItem(at: marker) }
+        let child = Process()
+        child.executableURL = root.appendingPathComponent("libexec/brewau-setup")
+        child.arguments = now ? ["self-update", "--now"] : ["self-update"]
+        child.environment = ["PATH": "/usr/bin:/bin:/usr/sbin:/sbin"]
+        child.currentDirectoryURL = URL(fileURLWithPath: "/")
+        child.standardInput = FileHandle.nullDevice
+        try child.run()
+        child.waitUntilExit()
+        if child.terminationStatus != 0 { throw BrewauError.message("Selvopdatering mislykkedes. Se loggen for detaljer.") }
     }
     static func timestamp(_ name: String) -> Date? {
         guard let text = try? String(contentsOf: state.appendingPathComponent(name), encoding: .utf8), let value = Double(text) else { return nil }

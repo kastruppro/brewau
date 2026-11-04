@@ -16,6 +16,9 @@ source "${BREWAU_LIBEXEC}/common.sh"
 BREWAU_PASSTHROUGH_ENV="HOMEBREW_NO_AUTO_UPDATE=1"
 
 LAST_RUN="${BREWAU_STATE_DIR}/last-run"
+# Asks the root self-update job (brewau-agent self-update) to update brewau
+# itself once this run is over: its package cannot install while this job runs.
+SELF_UPDATE_DUE="${BREWAU_STATE_DIR}/self-update-due"
 # Formulae this job pinned because of UPGRADE_EXCLUDE, so it only ever unpins
 # its own pins and leaves pins made by users alone.
 EXCLUDE_PINS="${BREWAU_STATE_DIR}/exclude-pins"
@@ -176,6 +179,8 @@ run_upgrade() {
     if output="$(outdated_names casks "${json}")"; then
       # shellcheck disable=SC2086
       for name in $(not_excluded ${output}); do
+        # brewau updates itself after this run (SELF_UPDATE_DUE).
+        [[ "${name##*/}" == "brewau" ]] && continue
         [[ ${protect_rc} -ne 2 ]] && ! brewau_in_words "${name##*/}" "${unprotected}" && casks="${casks} ${name}"
       done
     else
@@ -213,6 +218,7 @@ run_upgrade() {
   fi
 
   write_state "${status}" "$(echo ${formulae} ${casks})"
+  touch "${SELF_UPDATE_DUE}" || log "could not ask for a brewau self-update"
   log "done (${status})"
   [[ "${status}" == "ok" ]]
 }

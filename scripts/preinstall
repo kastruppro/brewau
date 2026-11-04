@@ -20,12 +20,23 @@ if [[ ! -x /opt/homebrew/bin/brew ]]; then
   exit 1
 fi
 
+# brewau-agent self-update installs this package while it holds the operation
+# lock, so no scan or upgrade can be busy; it writes its PID here (root-only).
+self_update_running() {
+  local pid
+  pid="$(/bin/cat /opt/brewau/etc/self-update.pid 2>/dev/null)" || return 1
+  [[ "${pid}" =~ ^[0-9]+$ ]] || return 1
+  [[ "$(/bin/ps -o comm= -p "${pid}" 2>/dev/null)" == *brewau-agent ]]
+}
+
 # Do not replace executables while a worker is using them.
-for label in upgrade scan scheduler; do
-  if /bin/launchctl print "system/com.kastruppro.brewau.${label}" 2>/dev/null | /usr/bin/grep -q 'state = running'; then
-    echo "brewau is working. Wait for the scan or upgrade to finish, then install again." >&2
-    exit 1
-  fi
-done
+if ! self_update_running; then
+  for label in upgrade scan scheduler; do
+    if /bin/launchctl print "system/com.kastruppro.brewau.${label}" 2>/dev/null | /usr/bin/grep -q 'state = running'; then
+      echo "brewau is working. Wait for the scan or upgrade to finish, then install again." >&2
+      exit 1
+    fi
+  done
+fi
 
 exit 0

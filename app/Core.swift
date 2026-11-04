@@ -235,10 +235,14 @@ func runCommand(_ executable: String, _ arguments: [String], input: Data? = nil)
 }
 
 /// Locks survive crashes as unlocked files; never unlink a file another worker may be waiting on.
-func withFileLock<T>(_ path: String, nonblocking: Bool = false, _ action: () throws -> T) throws -> T? {
+/// `owner` hands a lock file that root opens to the account that shares it, so root
+/// creating it never locks that account out.
+func withFileLock<T>(_ path: String, nonblocking: Bool = false, owner: (uid_t, gid_t)? = nil,
+                     _ action: () throws -> T) throws -> T? {
     let descriptor = open(path, O_CREAT | O_RDWR | O_NOFOLLOW | O_CLOEXEC, mode_t(0o600))
     guard descriptor >= 0 else { throw BrewauError.message("Kunne ikke åbne lås: \(path)") }
     defer { close(descriptor) }
+    if let owner, fchown(descriptor, owner.0, owner.1) != 0 { throw BrewauError.message("Kunne ikke give låsen videre: \(path)") }
     guard flock(descriptor, LOCK_EX | (nonblocking ? LOCK_NB : 0)) == 0 else {
         if nonblocking, errno == EWOULDBLOCK { return nil }
         throw BrewauError.message("Kunne ikke låse: \(path)")

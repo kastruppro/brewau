@@ -37,6 +37,19 @@ HOMEBREW_BIN="${HOMEBREW_PREFIX_PATH}/bin/brew"
 # ALLOWED_TAPS in brewau.conf.
 BREWAU_OFFICIAL_TAP_RE='^homebrew/[a-z0-9][a-z0-9._-]*$'
 
+# brewau's own tap, whose cask brewau updates itself from. It is trusted like
+# any tap: only while it is in ALLOWED_TAPS.
+BREWAU_TAP="kastruppro/tap"
+BREWAU_CASK="${BREWAU_TAP}/brewau"
+# Written (root-only) while `brewau-agent self-update` holds the operation
+# lock, so the package scripts know no scan or upgrade can be running.
+BREWAU_SELF_UPDATE_MARKER="${BREWAU_ROOT}/etc/self-update.pid"
+
+# Settings the organisation's MDM pushes for this computer: a custom settings
+# payload for com.kastruppro.brewau. Only root (the MDM client) can write it.
+BREWAU_MANAGED_PREFS="/Library/Managed Preferences/com.kastruppro.brewau.plist"
+BREWAU_MANAGED_OWNER=0
+
 # Config defaults; overridden by brewau_load_config.
 ALLOWED_TAPS=""
 FORBIDDEN_FORMULAE=""
@@ -92,6 +105,56 @@ brewau_in_words() {
   return 1
 }
 
+# True if the computer's MDM profile sets boolean $1 (true, 1 or yes). A file
+# that is not root-owned, or that others can write, does not count.
+brewau_managed() {
+  local file="${BREWAU_MANAGED_PREFS}" value
+  [[ -f "${file}" && ! -L "${file}" ]] || return 1
+  [[ "$(stat -f '%u' "${file}")" == "${BREWAU_MANAGED_OWNER}" ]] || return 1
+  (((8#$(stat -f '%Lp' "${file}") & 8#022) == 0)) || return 1
+  value="$(plutil -extract "$1" raw -o - "${file}" 2>/dev/null)" || return 1
+  case "$(brewau_lower "${value}")" in true | 1 | yes) return 0 ;; esac
+  return 1
+}
+
+# True if dotted version $1 is newer than $2 (numbers only, e.g. 0.6.10 > 0.6.9).
+brewau_version_newer() {
+  local IFS=. i x y a=() b=()
+  read -ra a <<<"$1"
+  read -ra b <<<"$2"
+  [[ "$1" =~ ^[0-9]+(\.[0-9]+)*$ && "$2" =~ ^[0-9]+(\.[0-9]+)*$ ]] || return 1
+  for ((i = 0; i < ${#a[@]} || i < ${#b[@]}; i++)); do
+    x="${a[i]:-0}"
+    y="${b[i]:-0}"
+    ((10#${x} > 10#${y})) && return 0
+    ((10#${x} < 10#${y})) && return 1
+  done
+  return 1
+}
+
+# True while `brewau-agent self-update` runs: it holds the operation lock, so
+# no scan or upgrade can be busy, and it must not be stopped itself.
+brewau_self_update_running() {
+  local pid
+  pid="$(cat "${BREWAU_SELF_UPDATE_MARKER}" 2>/dev/null)" || return 1
+  [[ "${pid}" =~ ^[0-9]+$ ]] || return 1
+  [[ "$(ps -o comm= -p "${pid}" 2>/dev/null)" == *brewau-agent ]]
+}
+
+# Writes KEY="value" into config file $1, replacing the key's lines or
+# appending one. The value must be one line the parser accepts.
+brewau_config_write() {
+  local file="$1" key="$2" value="$3"
+  [[ "${key}" =~ ^[A-Z_]+$ ]] || brewau_die "'${key}' is not a setting name"
+  [[ "${value}" == *,* ]] && brewau_die "separate the entries of ${key} with spaces, not commas"
+  # No quotes or newlines: nothing that could start another line.
+  [[ "${value}" =~ ^[A-Za-z0-9@/._+=\ -]*$ ]] || brewau_die "invalid value for ${key}: ${value}"
+  brewau_rewrite_file "${file}" awk -v key="${key}" -v line="${key}=\"${value}\"" '
+    $0 ~ "^[[:space:]]*" key "=" { if (!done) print line; done = 1; next }
+    { print }
+    END { if (!done) print line }' || brewau_die "could not write ${key}"
+}
+
 brewau_daemon_loaded() {
   launchctl print "system/${BREWAU_LABEL}" >/dev/null 2>&1
 }
@@ -119,6 +182,8 @@ brewau_load_config() {
     value="${BASH_REMATCH[2]}"
     value="${value%\"}"
     value="${value#\"}"
+    [[ "${value}" == *,* ]] &&
+      brewau_die "${file} line ${n}: separate the entries of ${key} with spaces, not commas"
     [[ "${value}" =~ ^[A-Za-z0-9@/._+=[:space:]-]*$ ]] || brewau_die "${file} line ${n}: invalid value for ${key}"
     case "${key}" in
       ALLOWED_TAPS | FORBIDDEN_FORMULAE | FORBIDDEN_CASKS | EXTRA_ALLOWED_OPTIONS | \

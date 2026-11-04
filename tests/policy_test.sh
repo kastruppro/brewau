@@ -111,6 +111,47 @@ expect deny -v x wget
 
 # brew services runs as root, so only ALLOWED_SERVICES and safe actions pass.
 ALLOWED_SERVICES="tailscale"
+# A denial that brewau.conf can lift names the exact command, if it is safe.
+fix() {
+  local want="$1"
+  shift
+  DENY_FIX=""
+  check_command "$@" >/dev/null 2>&1
+  if [[ "${DENY_FIX}" == "${want}" ]]; then
+    PASS=$((PASS + 1))
+  else
+    FAIL=$((FAIL + 1))
+    printf 'FAIL: brew %s: expected fix "%s", got "%s"\n' "$*" "${want}" "${DENY_FIX}"
+  fi
+}
+fix "sudo brewau config add ALLOWED_TAPS evil/tap" install evil/tap/thing
+fix "sudo brewau config add ALLOWED_TAPS evil/tap" tap evil/tap
+fix "sudo brewau config add ALLOWED_SERVICES postgresql" services start postgresql
+fix "sudo brewau config add EXTRA_ALLOWED_OPTIONS --no-binaries" install --no-binaries wget
+fix "" install --adopt --cask firefox
+fix "" install '--x;id' wget
+fix "" install ./local.rb
+fix "" install wget
+
+# brewau itself is removed with `sudo brewau uninstall`, never through brew.
+expect deny uninstall --cask brewau
+expect deny uninstall kastruppro/tap/brewau
+expect deny rm --zap --cask BrewAU
+expect deny remove wget brewau
+expect deny upgrade --cask kastruppro/tap/brewau
+ALLOWED_TAPS="acme/tools kastruppro/tap"
+expect allow upgrade --cask kastruppro/tap/brewau
+ALLOWED_TAPS="acme/tools"
+expect allow reinstall --cask brewau
+expect allow uninstall --cask brewau-other
+
+# brewau trusts ALLOWED_TAPS itself; users may only list what is trusted.
+expect allow trust
+expect allow untrust
+expect deny trust openai/tools
+expect deny trust --tap acme/tools
+expect deny untrust --tap acme/tools
+
 expect allow services
 expect allow services list
 expect allow services list --json

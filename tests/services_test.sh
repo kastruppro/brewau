@@ -111,8 +111,9 @@ check 'called "user services start redis"' "start runs as the user"
 
 scenario "root-only service that is not allowed" ""
 RC=0
-main services start dnsmasq >/dev/null 2>&1 || RC=$?
+OUT="$(main services start dnsmasq 2>&1 >/dev/null)" || RC=$?
 check '[[ ${RC} -ne 0 ]]' "is refused"
+check '[[ "${OUT}" == *"allow it with: sudo brewau config add ALLOWED_SERVICES dnsmasq" ]]' "with a command that allows it"
 check '! grep -q "services start" "${CALLS}"' "and never started"
 
 scenario "run is refused" "tailscale"

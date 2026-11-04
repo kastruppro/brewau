@@ -18,6 +18,7 @@ source "${WORK}/brewau-upgrade"
 BREWAU_STATE_DIR="${WORK}/state"
 LAST_RUN="${BREWAU_STATE_DIR}/last-run"
 EXCLUDE_PINS="${BREWAU_STATE_DIR}/exclude-pins"
+SELF_UPDATE_DUE="${BREWAU_STATE_DIR}/self-update-due"
 CALLS="${WORK}/calls"
 
 # Prints `brew outdated --json=v2` entries for names $2...; names in
@@ -230,6 +231,13 @@ scenario "scan without Homebrew refresh"
 UPDATE_HOMEBREW=0
 run_scan >/dev/null 2>&1
 check '! called "update"' "optional Homebrew refresh is respected"
+
+scenario "brewau itself is left to the self-update job"
+MOCK_OUTDATED_CASKS="firefox kastruppro/tap/brewau"
+run
+check 'called "upgrade --cask firefox"' "other casks are upgraded"
+check '! grep -q "brewau" "${CALLS}"' "brewau is not upgraded by this job"
+check '[[ -e "${BREWAU_STATE_DIR}/self-update-due" ]]' "and asks for a self-update after the run"
 
 echo "${PASS} passed, ${FAIL} failed"
 [[ ${FAIL} -eq 0 ]]

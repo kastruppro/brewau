@@ -1,15 +1,19 @@
-# brewau configuration. Owned by root; edit with `sudo brewau config`.
-# Values are space-separated lists. This file is parsed, never executed.
+# brewau configuration. Owned by root; edit with `sudo brewau config`, or change
+# one setting with e.g. `sudo brewau config add ALLOWED_TAPS openai/tools`.
+# Lists are separated by spaces, not commas: "one/tap other/tap".
+# This file is parsed, never executed.
 
 # Third-party taps users may install from, as user/repo. Official homebrew/*
-# taps are always allowed. Anything you list here is trusted with root.
+# taps are always allowed. Anything you list here is trusted with root, and
+# brewau runs `brew trust` for it (Homebrew 7 and later).
 ALLOWED_TAPS=""
 
 # Packages nobody may install (passed to HOMEBREW_FORBIDDEN_*).
 FORBIDDEN_FORMULAE=""
 FORBIDDEN_CASKS=""
 
-# Additional brew options to allow beyond the built-in allowlist, e.g. "--no-binaries".
+# Additional brew options (flags starting with -) to allow beyond the built-in
+# allowlist, e.g. "--no-binaries --foo". Not subcommands.
 EXTRA_ALLOWED_OPTIONS=""
 
 # Formulae whose `brew services` run as root system daemons (LaunchDaemons),

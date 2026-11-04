@@ -7,6 +7,8 @@ ROOT := $(BUILD)/root
 #   make release INSTALLER_IDENTITY="Developer ID Installer: Jane Doe (TEAMID)"
 INSTALLER_IDENTITY ?= Developer ID Installer: Tobias Jul Kastrup (5W98EXLE44)
 NOTARY_PROFILE ?= kastruppro-notary
+# Checkout of github.com/kastruppro/homebrew-tap, updated by `make tap`.
+TAP_DIR ?= ../homebrew-tap
 APPLICATION_IDENTITY ?= Developer ID Application: Tobias Jul Kastrup (5W98EXLE44)
 CODESIGN_IDENTITY ?= -
 CODESIGN_TIMESTAMP ?= --timestamp=none
@@ -14,7 +16,7 @@ CODESIGN_TIMESTAMP ?= --timestamp=none
 UNSIGNED_PKG := $(BUILD)/brewau-$(VERSION)-unsigned.pkg
 SIGNED_PKG := $(BUILD)/brewau-$(VERSION).pkg
 
-.PHONY: all stage pkg sign notarize release test lint install uninstall clean mockup mockup-check mockup-previews app agent app-check
+.PHONY: all stage pkg sign notarize release tap test lint install uninstall clean mockup mockup-check mockup-previews app agent app-check
 
 all: pkg
 
@@ -92,7 +94,11 @@ notarize: sign
 # install.sh downloads releases/latest/download/brewau.pkg, so upload that name.
 release: notarize
 	cp $(SIGNED_PKG) $(BUILD)/brewau.pkg
-	@echo "Release ready: $(BUILD)/brewau.pkg (upload as a GitHub release asset)"
+	@echo "Release ready: upload $(SIGNED_PKG) and $(BUILD)/brewau.pkg to GitHub release v$(VERSION)"
+
+# Points the tap's brewau cask at this release; push the tap after the upload.
+tap: release
+	scripts/update-tap $(SIGNED_PKG) $(VERSION) $(TAP_DIR)
 
 test:
 	@set -e; for t in tests/*_test.sh; do echo "$$t"; /bin/bash "$$t"; done

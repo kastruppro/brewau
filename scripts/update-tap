@@ -1,0 +1,19 @@
+#!/bin/bash
+# Points the brewau cask in a tap checkout at a release package:
+#   scripts/update-tap <pkg> <version> <tap dir>
+# Commit and push the tap only after the package is uploaded as release asset
+# brewau-<version>.pkg under tag v<version>.
+
+set -euo pipefail
+
+pkg="${1:?package required}"
+version="${2:?version required}"
+cask="${3:?tap directory required}/Casks/brewau.rb"
+
+[[ "${version}" =~ ^[0-9]+(\.[0-9]+)*$ ]] || { echo "update-tap: bad version ${version}" >&2; exit 1; }
+[[ -f "${pkg}" && -f "${cask}" ]] || { echo "update-tap: need ${pkg} and ${cask}" >&2; exit 1; }
+sha="$(shasum -a 256 "${pkg}" | cut -d ' ' -f 1)"
+sed -i '' -e "s/^  version \".*\"$/  version \"${version}\"/" -e "s/^  sha256 \".*\"$/  sha256 \"${sha}\"/" "${cask}"
+grep -q "^  version \"${version}\"$" "${cask}" && grep -q "^  sha256 \"${sha}\"$" "${cask}" ||
+  { echo "update-tap: could not update ${cask}" >&2; exit 1; }
+echo "update-tap: ${cask} -> ${version} (${sha})"

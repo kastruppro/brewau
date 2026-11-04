@@ -1,5 +1,7 @@
 # brewau
 
+![macOS](https://img.shields.io/badge/macOS-14%2B-blue)
+
 Unattended, isolated Homebrew for macOS, modelled on [Workbrew](https://workbrew.com)'s agent
 but local and self-hosted. Apps and formulae stay up to date on your schedule, including casks that
 need `sudo`, without anyone typing a password.
@@ -113,11 +115,50 @@ brewau doctor
 `install.sh` only installs a package that is notarized and signed by the brewau release team
 (override with `BREWAU_TEAM_ID` for forks).
 
+Or with Homebrew itself:
+
+```sh
+brew install --cask kastruppro/tap/brewau
+```
+
+When Homebrew installs it, the package finishes setting up only after `brew` has exited (a
+one-shot `com.kastruppro.brewau.finish-install` job, log in `/var/log/brewau-install.log`), since
+taking `/opt/homebrew` over under the running `brew` would break its last steps.
+
 Alternatively download `brewau.pkg` from Releases, or deploy it with MDM. The installer:
 creates `_brewau` and `brewau_users`, transfers `/opt/homebrew` and the apps of installed casks
 to `_brewau`, allowlists any taps you already have, and loads the daily job. On the first install
 only, it also adds the console user and the previous prefix owner to `brewau_users`; upgrades
 leave group membership alone, so `deny-user` sticks.
+
+## Updating brewau
+
+brewau updates itself from its own tap, `kastruppro/tap`, which it adds to `ALLOWED_TAPS` (once,
+on install; remove it to turn self-update off, or put `brewau` in `UPGRADE_EXCLUDE`). After each
+scheduled upgrade, the root job `com.kastruppro.brewau.selfupdate` installs a newer
+`kastruppro/tap/brewau` cask, holding the same lock as scans and upgrades: the upgrade job itself
+cannot, because the package refuses to install while a brewau job runs. `sudo brewau self-update`
+updates at once; `brew upgrade` updates it as well, when no job is running.
+
+The cask deliberately has no `uninstall` stanza: Homebrew runs a cask's uninstall directives,
+`pkgutil` and `script` included, on every upgrade, which would remove brewau. brewau is removed
+with `sudo brewau uninstall`; `brew uninstall brewau` is denied.
+
+The tap is trusted like any tap in `ALLOWED_TAPS`: whoever can push to it can run code as root on
+every Mac that uses brewau. Keep it to maintainers with 2FA and branch protection.
+
+## Managed Macs (MDM)
+
+A custom settings payload for preference domain `com.kastruppro.brewau`, scoped to the computer,
+can stop `sudo brewau uninstall`: see [`mdm/com.kastruppro.brewau.plist`](mdm/com.kastruppro.brewau.plist).
+
+| Key | Meaning |
+|---|---|
+| `PreventUninstall` | `true`: `sudo brewau uninstall` refuses until the MDM removes the setting |
+
+brewau only reads `/Library/Managed Preferences/com.kastruppro.brewau.plist`, and only if root owns
+it and nobody else can write it. This stops the uninstall command, not a root user deleting files;
+`brewau status` shows when it is in force.
 
 ## Usage
 
@@ -132,10 +173,16 @@ brewau log --audit     # who ran which brew command
 brewau doctor          # health check
 brewau restore-shell   # undo setup-shell
 
-sudo brewau config     # edit policy/schedule ($VISUAL/$EDITOR); only applied if it validates
+brewau config show     # print the configuration
+
+sudo brewau config     # edit policy/schedule ($VISUAL, $EDITOR or nano); only applied if it validates
+sudo brewau config add ALLOWED_TAPS openai/tools     # add to a list (and trust the tap)
+sudo brewau config remove ALLOWED_TAPS openai/tools
+sudo brewau config set UPGRADE_MODE daily
 sudo brewau allow-user alice
 sudo brewau repair     # re-apply ownership, permissions and system files
 sudo brewau trust-app /Applications/Foo.app   # after checking an app brewau marked untrusted
+sudo brewau self-update                       # update brewau now from kastruppro/tap
 sudo brewau move-service-data alice postgresql@17   # data from before brewau, see Services
 sudo brewau uninstall  # closes access to _brewau first, then returns /opt/homebrew, apps,
                        # permissions and shell profiles
@@ -154,14 +201,20 @@ users' and running services are named: move their data before the next `brew ser
 
 | Key | Default | Meaning |
 |---|---|---|
-| `ALLOWED_TAPS` | existing taps | extra taps users may install from |
+| `ALLOWED_TAPS` | existing taps | extra taps users may install from; brewau also `brew trust`s them (Homebrew 7+) |
 | `FORBIDDEN_FORMULAE`, `FORBIDDEN_CASKS` | empty | never installable |
-| `EXTRA_ALLOWED_OPTIONS` | empty | brew options to allow beyond the built-in list |
+| `EXTRA_ALLOWED_OPTIONS` | empty | brew options (`--flag`, not subcommands) to allow beyond the built-in list |
 | `AUTO_UPGRADE` | `1` | enable the nightly job; with `0`, `brewau run` still starts one by hand |
 | `UPGRADE_GREEDY` | `1` | include self-updating casks |
 | `ALLOWED_SERVICES` | empty | formulae whose `brew services` run as root system daemons (e.g. `tailscale`) |
 | `UPGRADE_EXCLUDE` | empty | never auto-upgrade these, with or without their tap (formulae are pinned, so they are not upgraded as dependencies either) |
 | `UPGRADE_HOUR`, `UPGRADE_MINUTE` | `4`, `0` | when to run; a run missed while asleep happens on wake, a run missed while powered off is skipped (`brewau doctor` warns after 48 hours) |
+
+Lists are separated by spaces, not commas (`ALLOWED_TAPS="acme/tools openai/tools"`); a comma
+is refused with a hint. `config add` and `config remove` take entries as separate arguments or
+comma-separated. Homebrew 7 loads a third-party tap only once it is trusted; `brewau reload`
+trusts every tap in `ALLOWED_TAPS` for `_brewau` and stops trusting taps removed from it, so
+users never run `brew trust` themselves (only listing with a bare `brew trust` is allowed).
 
 `AUTO_UPGRADE` and `UPGRADE_GREEDY` also accept `yes`/`no`, `true`/`false` and `on`/`off`.
 `sudo brewau config` refuses anything it does not understand. A file edited by hand is checked
@@ -207,7 +260,7 @@ stale one).
   `brew services list --json` returns one array, with allowed services as the system sees them.
 
 ```sh
-sudo brewau config            # ALLOWED_SERVICES="tailscale"
+sudo brewau config add ALLOWED_SERVICES tailscale
 brew install tailscale
 brew services start tailscale # root daemon
 sudo tailscale up             # first login; add --operator=$USER to use tailscale without sudo
@@ -251,11 +304,12 @@ make install               # install this checkout locally (sudo)
 xcrun notarytool store-credentials <profile> --apple-id <id> --team-id <TEAMID>
 
 make release INSTALLER_IDENTITY="Developer ID Installer: Your Name (TEAMID)" NOTARY_PROFILE=<profile>
-# upload build/brewau.pkg to a GitHub release
+# upload build/brewau-<version>.pkg and build/brewau.pkg to GitHub release v<version>
+make tap TAP_DIR=../homebrew-tap   # point the cask at the release; then push the tap
 ```
 
-The package installs `/Applications/brewau.app`, the native helper and three
-LaunchDaemons (scheduler, manual scan, manual upgrade). Existing configuration
+The package installs `/Applications/brewau.app`, the native helper and four
+LaunchDaemons (scheduler, manual scan, manual upgrade, self-update). Existing configuration
 and access rules are preserved. The installer prepares shell profiles, with
 backups, for existing local members of `brewau_users`. Open the app and enable
 notifications and launch at login in its settings. No GUI is needed for scans

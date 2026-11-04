@@ -305,7 +305,12 @@ main() {
       fi
       if [[ -n "${name}" && "${action}" =~ ^(start|restart)$ ]] && requires_root "${name}"; then
         echo "brewau: ${name} needs to run as root, and is not in ALLOWED_SERVICES." >&2
-        echo "brewau: an administrator can allow it: sudo brewau config (ALLOWED_SERVICES=\"${formula}\")" >&2
+        # Only a plain name goes into a command meant for a root shell.
+        if [[ "${formula}" =~ ^[A-Za-z0-9][A-Za-z0-9@._+-]*$ ]]; then
+          echo "brewau: an administrator can allow it with: sudo brewau config add ALLOWED_SERVICES ${formula}" >&2
+        else
+          echo "brewau: an administrator can allow it in ALLOWED_SERVICES: sudo brewau config" >&2
+        fi
         return 1
       fi
       ;;

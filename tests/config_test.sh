@@ -55,6 +55,10 @@ expect valid valid 'UPGRADE_EXCLUDE="node@22 libxml++3 acme/tools/thing"'
 
 # Anything that could hide or change a restriction is always fatal.
 expect invalid invalid 'ALLOWED_TAPS="acme/tools" # trailing comment'
+expect invalid invalid 'ALLOWED_TAPS="acme/tools,other/tap"'
+printf '%s\n' 'EXTRA_ALLOWED_OPTIONS="--a,--b"' >"${WORK}/brewau.conf"
+check "separate the entries of EXTRA_ALLOWED_OPTIONS with spaces, not commas" \
+  "$( (brewau_load_config "${WORK}/brewau.conf") 2>&1 | sed 's/.*line 1: //')" "a comma gets a hint"
 expect invalid invalid 'ALLOWED_TAPS="$(id)"'
 expect invalid invalid 'ALLOWED_TAPS="https://example.com/tap.git"'
 expect invalid invalid 'FORBIDDEN_CASKS = "firefox"'

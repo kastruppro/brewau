@@ -7,6 +7,7 @@
 #   brewau-setup allow-user <user>   grant a user access to brew
 #   brewau-setup deny-user <user>    revoke a user's access to brew
 #   brewau-setup uninstall           restore vanilla Homebrew owned by the original user
+#   brewau-setup self-update [--now] update brewau from its own cask (run by brewau-agent)
 
 set -euo pipefail
 
@@ -28,6 +29,13 @@ ORIGINAL_MODES_FILE="${BREWAU_ROOT}/etc/original-modes"
 # automatically before it exists, so `deny-user` survives upgrades.
 INSTALLED_MARKER="${BREWAU_ROOT}/etc/installed"
 PKG_ID="com.kastruppro.brewau"
+# Written once brewau has added its own tap to an existing configuration, so
+# an administrator who removes it again keeps it removed.
+OWN_TAP_MARKER="${BREWAU_ROOT}/etc/own-tap-added"
+# Finishes a first install that Homebrew started (see defer_first_install).
+FINISH_LABEL="com.kastruppro.brewau.finish-install"
+FINISH_PLIST="/Library/LaunchDaemons/${FINISH_LABEL}.plist"
+SELF_UPDATE_LABEL="com.kastruppro.brewau.selfupdate"
 
 log() { echo "brewau-setup: $*"; }
 
@@ -158,13 +166,26 @@ existing_third_party_taps() {
 ensure_config() {
   [[ -f "${BREWAU_CONF}" ]] && return 0
   local taps
-  taps="$(existing_third_party_taps | tr '\n' ' ' | sed 's/ *$//')"
+  taps="$( (existing_third_party_taps; echo "${BREWAU_TAP}") | tr '[:upper:]' '[:lower:]' | sort -u | tr '\n' ' ' | sed 's/ *$//')"
   sed "s|^ALLOWED_TAPS=\"\"|ALLOWED_TAPS=\"${taps}\"|" \
     "${BREWAU_ROOT}/share/brewau.conf.default" >"${BREWAU_CONF}"
   chown root:wheel "${BREWAU_CONF}"
   chmod 0644 "${BREWAU_CONF}"
-  [[ -n "${taps}" ]] && log "allowed existing taps: ${taps}"
+  log "allowed taps: ${taps}"
+  touch "${OWN_TAP_MARKER}"
   return 0
+}
+
+# Configurations from before self-update get brewau's own tap once. Removing it
+# from ALLOWED_TAPS afterwards turns self-update off for good.
+add_own_tap_once() {
+  [[ -e "${OWN_TAP_MARKER}" ]] && return 0
+  if ! brewau_tap_allowed "${BREWAU_TAP}"; then
+    brewau_config_write "${BREWAU_CONF}" ALLOWED_TAPS "${ALLOWED_TAPS:+${ALLOWED_TAPS} }${BREWAU_TAP}"
+    ALLOWED_TAPS="${ALLOWED_TAPS:+${ALLOWED_TAPS} }${BREWAU_TAP}"
+    log "added ${BREWAU_TAP} to ALLOWED_TAPS so brewau can update itself; remove it to turn that off"
+  fi
+  touch "${OWN_TAP_MARKER}"
 }
 
 take_over_prefix() {
@@ -295,14 +316,26 @@ remove_brew_env() {
 # AssociatedBundleIdentifiers makes Login Items show brewau.app's name and icon
 # instead of the signing certificate's developer name.
 write_launchdaemon() {
-  local suffix command label plist tmp i schedule
-  for suffix in upgrade scan scheduler; do
+  local suffix command label plist tmp i schedule user in_self_update=0
+  brewau_self_update_running && in_self_update=1
+  for suffix in upgrade scan scheduler selfupdate; do
     command="${suffix}"
     schedule=""
-    if [[ "${suffix}" == "scheduler" ]]; then
-      command="scheduled"
-      schedule='<key>StartInterval</key><integer>60</integer><key>RunAtLoad</key><true/>'
-    fi
+    user="<key>UserName</key><string>${BREWAU_USER}</string>
+  <key>GroupName</key><string>${BREWAU_GROUP}</string>"
+    case "${suffix}" in
+      scheduler)
+        command="scheduled"
+        schedule='<key>StartInterval</key><integer>60</integer><key>RunAtLoad</key><true/>'
+        ;;
+      selfupdate)
+        # Runs as root: it installs brewau's package. It only acts after a
+        # scheduled upgrade asked for it (see brewau-upgrade).
+        command="self-update"
+        schedule='<key>StartInterval</key><integer>300</integer>'
+        user=""
+        ;;
+    esac
     label="com.kastruppro.brewau.${suffix}"
     plist="$(dirname "${BREWAU_PLIST}")/${label}.plist"
     tmp="${plist}.tmp"
@@ -315,8 +348,7 @@ write_launchdaemon() {
   <key>ProgramArguments</key><array>
     <string>${BREWAU_LIBEXEC}/brewau-agent</string><string>${command}</string>
   </array>
-  <key>UserName</key><string>${BREWAU_USER}</string>
-  <key>GroupName</key><string>${BREWAU_GROUP}</string>
+  ${user}
   ${schedule}
   <key>StandardOutPath</key><string>${BREWAU_LOG_DIR}/upgrade.log</string>
   <key>StandardErrorPath</key><string>${BREWAU_LOG_DIR}/upgrade.log</string>
@@ -331,10 +363,20 @@ EOF
       rm -f "${tmp}"
       continue
     fi
-    # Never terminate an upgrade to apply settings or install a new scheduler.
     if launchctl print "system/${label}" 2>/dev/null | grep -q 'state = running'; then
-      rm -f "${tmp}"
-      brewau_die "${label} is running; wait for it to finish and run sudo brewau reload"
+      # A self-update is installing this package: stopping its own job would
+      # stop the installer. The next install or reload applies the change.
+      if [[ "${suffix}" == "selfupdate" ]]; then
+        rm -f "${tmp}"
+        log "${label} is running; its new settings apply at the next sudo brewau reload"
+        continue
+      fi
+      # Never terminate an upgrade to apply settings or install a new scheduler.
+      # A self-update holds the operation lock, so then nothing is upgrading.
+      if [[ ${in_self_update} -eq 0 ]]; then
+        rm -f "${tmp}"
+        brewau_die "${label} is running; wait for it to finish and run sudo brewau reload"
+      fi
     fi
     launchctl bootout "system/${label}" 2>/dev/null || true
     for ((i = 0; i < 50; i++)); do
@@ -357,11 +399,135 @@ EOF
   chmod 0644 "${NEWSYSLOG_CONF}"
 }
 
+# Homebrew 7 only loads formulae, casks and commands from a non-official tap
+# that is trusted, in _brewau's own trust store. ALLOWED_TAPS already means
+# "trusted with root", so it is the trust list: trust every tap it names and
+# stop trusting taps that are no longer in it. Failures only warn; the policy
+# blocks taps outside ALLOWED_TAPS either way.
+sync_tap_trust() {
+  [[ -f "${HOMEBREW_PREFIX_PATH}/Library/Homebrew/cmd/trust.rb" ]] || return 0
+  local tap trusted
+  # An empty store prints [], so grep finds nothing; under pipefail that (or a
+  # failing brew) must not abort install or reload.
+  trusted="$(brew_as_service trust --tap --json=v1 2>/dev/null | grep -o '"[^"]*"' | tr -d '"')" || trusted=""
+  for tap in ${ALLOWED_TAPS}; do
+    brewau_in_words "${tap}" "${trusted}" && continue
+    if brew_as_service trust --tap "${tap}" >/dev/null; then
+      log "trusted tap ${tap}"
+    else
+      log "warning: could not trust tap ${tap}"
+    fi
+  done
+  while IFS= read -r tap; do
+    # Taps with a custom remote are recorded by URL; brewau never adds those.
+    [[ "${tap}" =~ ^[a-z0-9][a-z0-9._-]*/[a-z0-9][a-z0-9._-]*$ ]] || continue
+    brewau_in_words "${tap}" "${ALLOWED_TAPS}" && continue
+    if brew_as_service untrust --tap "${tap}" >/dev/null; then
+      log "stopped trusting tap ${tap}, which is no longer in ALLOWED_TAPS"
+    else
+      log "warning: could not stop trusting tap ${tap}"
+    fi
+  done <<<"${trusted}"
+}
+
+# Updates brewau from its own cask when a scheduled upgrade asked for it (the
+# due marker), or at once with --now. brewau-agent runs this as root while it
+# holds the operation lock, so the package scripts neither wait for nor stop
+# the job that is installing them (see brewau_self_update_running).
+cmd_self_update() {
+  require_root
+  local now="${1:-}" due="${BREWAU_STATE_DIR}/self-update-due" word installed available json action=install
+  brewau_load_config
+  if [[ "${now}" != "--now" ]]; then
+    [[ -e "${due}" ]] || return 0
+    rm -f "${due}"
+  fi
+  for word in ${UPGRADE_EXCLUDE}; do
+    if [[ "$(brewau_lower "${word##*/}")" == "brewau" ]]; then
+      log "brewau is in UPGRADE_EXCLUDE; not updating it"
+      return 0
+    fi
+  done
+  if ! brewau_tap_allowed "${BREWAU_TAP}"; then
+    log "${BREWAU_TAP} is not in ALLOWED_TAPS, so brewau does not update itself"
+    return 0
+  fi
+  if [[ ! -d "${HOMEBREW_PREFIX_PATH}/Library/Taps/${BREWAU_TAP%/*}/homebrew-${BREWAU_TAP#*/}" ]]; then
+    log "tapping ${BREWAU_TAP}"
+    sync_tap_trust
+    brew_as_service tap "${BREWAU_TAP}" || brewau_die "could not tap ${BREWAU_TAP}"
+  elif [[ "${now}" == "--now" ]]; then
+    brew_as_service update >/dev/null || log "warning: brew update failed; using ${BREWAU_TAP} as it is"
+  fi
+  installed="$(cat "${BREWAU_ROOT}/share/VERSION" 2>/dev/null || echo 0)"
+  json="$(brew_as_service info --json=v2 --cask "${BREWAU_CASK}")" || brewau_die "could not read ${BREWAU_CASK}"
+  available="$(plutil -extract casks.0.version raw -o - - <<<"${json}" 2>/dev/null)" ||
+    brewau_die "${BREWAU_CASK} has no version"
+  if ! brewau_version_newer "${available}" "${installed}"; then
+    log "brewau ${installed} is up to date"
+    return 0
+  fi
+  # A package installed without Homebrew is not registered as the cask yet.
+  plutil -extract casks.0.installed raw -o - - <<<"${json}" >/dev/null 2>&1 && action=upgrade
+  log "updating brewau ${installed} to ${available}"
+  brew_as_service "${action}" --cask "${BREWAU_CASK}" || brewau_die "could not update brewau to ${available}"
+  log "brewau is now $(cat "${BREWAU_ROOT}/share/VERSION" 2>/dev/null)"
+}
+
+# True while Homebrew, run by the prefix owner, is installing brewau itself
+# (`brew install --cask kastruppro/tap/brewau`): it still has steps to finish
+# in the prefix after the package's postinstall.
+homebrew_installing_brewau() {
+  local owner
+  owner="$(stat -f%Su "${HOMEBREW_PREFIX_PATH}" 2>/dev/null)" || return 1
+  [[ "${owner}" != "${BREWAU_USER}" && "${owner}" != "root" ]] || return 1
+  pgrep -u "${owner}" -f "Library/Homebrew/brew.rb" >/dev/null 2>&1
+}
+
+# Taking the prefix over under that Homebrew would break its last steps, so a
+# one-shot LaunchDaemon finishes the install once Homebrew has exited.
+defer_first_install() {
+  cat >"${FINISH_PLIST}" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>${FINISH_LABEL}</string>
+  <key>ProgramArguments</key><array>
+    <string>${BREWAU_LIBEXEC}/brewau-setup</string><string>finish-install</string>
+  </array>
+  <key>RunAtLoad</key><true/>
+  <key>StandardOutPath</key><string>/var/log/brewau-install.log</string>
+  <key>StandardErrorPath</key><string>/var/log/brewau-install.log</string>
+</dict></plist>
+EOF
+  plutil -lint -s "${FINISH_PLIST}" || brewau_die "generated ${FINISH_PLIST} is invalid"
+  chown root:wheel "${FINISH_PLIST}"
+  chmod 0644 "${FINISH_PLIST}"
+  launchctl bootout "system/${FINISH_LABEL}" 2>/dev/null || true
+  launchctl bootstrap system "${FINISH_PLIST}" || brewau_die "could not schedule the rest of the install"
+  log "Homebrew is still installing brewau; brewau finishes setting up as soon as it is done"
+  log "(see /var/log/brewau-install.log)"
+}
+
+cmd_finish_install() {
+  require_root
+  local i
+  # Homebrew needs seconds after the package; give up waiting after 30 minutes.
+  for ((i = 0; i < 1800; i++)); do
+    homebrew_installing_brewau || break
+    sleep 1
+  done
+  # Runs once: launchd forgets the job at the next restart.
+  rm -f "${FINISH_PLIST}"
+  BREWAU_NO_DEFER=1 cmd_install
+}
+
 cmd_reload() {
   require_root
   brewau_load_config
   write_sudoers
   write_brew_env
+  sync_tap_trust
   write_launchdaemon
 }
 
@@ -376,11 +542,17 @@ cmd_install() {
   local first_install=1
   [[ -f "${INSTALLED_MARKER}" || (-f "${ORIGINAL_OWNER_FILE}" && -f "${BREWAU_SUDOERS}") ]] && first_install=0
 
+  if [[ ${first_install} -eq 1 && -z "${BREWAU_NO_DEFER:-}" ]] && homebrew_installing_brewau; then
+    defer_first_install
+    return 0
+  fi
+
   ensure_service_account
   ensure_users_group
   ensure_dirs
   ensure_config
   brewau_load_config
+  add_own_tap_once
 
   local user users=("$@")
   if [[ ${#users[@]} -eq 0 && ${first_install} -eq 1 ]]; then
@@ -403,6 +575,7 @@ cmd_install() {
   write_system_files
   write_sudoers
   write_brew_env
+  sync_tap_trust
   # Only the first install takes apps as they are; `repair` must not quietly
   # accept one that was swapped since.
   BREWAU_APPS_BASELINE="${first_install}"
@@ -670,6 +843,11 @@ return_prefix() {
 
 cmd_uninstall() {
   require_root
+  # Root can always delete files by hand; this stops `sudo brewau uninstall`
+  # (and the app's or a script's use of it) on a computer the MDM manages.
+  if brewau_managed PreventUninstall; then
+    brewau_die "uninstall is blocked by your organisation's MDM profile (com.kastruppro.brewau, PreventUninstall); remove that setting in the MDM first"
+  fi
   local owner=""
   [[ -f "${ORIGINAL_OWNER_FILE}" ]] && owner="$(cat "${ORIGINAL_OWNER_FILE}")"
   [[ -z "${owner}" ]] && owner="$(console_user)"
@@ -680,6 +858,8 @@ cmd_uninstall() {
   launchctl bootout "system/${BREWAU_LABEL}" 2>/dev/null || true
   launchctl bootout system/com.kastruppro.brewau.scan 2>/dev/null || true
   launchctl bootout system/com.kastruppro.brewau.scheduler 2>/dev/null || true
+  launchctl bootout "system/${SELF_UPDATE_LABEL}" 2>/dev/null || true
+  launchctl bootout "system/${FINISH_LABEL}" 2>/dev/null || true
   rm -f "${BREWAU_SUDOERS}"
   stop_service_processes
   # While the prefix still belongs to _brewau, so copies into it are safe.
@@ -688,6 +868,8 @@ cmd_uninstall() {
   if [[ -n "${owner}" ]] && id "${owner}" >/dev/null 2>&1 && [[ -d "${HOMEBREW_PREFIX_PATH}" ]]; then
     return_cask_apps "${owner}"
     restore_prefix_modes
+    # brewau's own cask record; the cask has no uninstall steps of its own.
+    rm -rf "${HOMEBREW_PREFIX_PATH}/Caskroom/brewau"
     log "returning ${HOMEBREW_PREFIX_PATH} to ${owner}"
     return_prefix "${owner}"
   else
@@ -696,7 +878,8 @@ cmd_uninstall() {
   fi
 
   rm -f "${BREWAU_PLIST}" /Library/LaunchDaemons/com.kastruppro.brewau.scan.plist \
-    /Library/LaunchDaemons/com.kastruppro.brewau.scheduler.plist "${BREWAU_PATHS_D}" "${NEWSYSLOG_CONF}"
+    /Library/LaunchDaemons/com.kastruppro.brewau.scheduler.plist \
+    "/Library/LaunchDaemons/${SELF_UPDATE_LABEL}.plist" "${FINISH_PLIST}" "${BREWAU_PATHS_D}" "${NEWSYSLOG_CONF}"
   rm -rf /Applications/brewau.app
   remove_brew_env
   dscl . -delete "/Users/${BREWAU_USER}" 2>/dev/null || true
@@ -708,7 +891,22 @@ cmd_uninstall() {
   log "uninstalled. Homebrew at ${HOMEBREW_PREFIX_PATH} is vanilla again."
 }
 
+# Under errexit a failing command ends this script without a word, and the
+# Installer then only says that an error occurred. Name the command instead;
+# postinstall output lands in /var/log/install.log. brewau_die explains itself.
+FAILED_COMMAND=""
+report_failure() {
+  local rc=$?
+  [[ ${rc} -ne 0 && -n "${FAILED_COMMAND}" ]] || return 0
+  echo "brewau-setup: ${1:-command} failed (exit ${rc}) at ${FAILED_COMMAND}" >&2
+}
+
 main() {
+  # -E: also catch failures inside functions.
+  set -E
+  trap 'FAILED_COMMAND="line ${LINENO}: ${BASH_COMMAND}"' ERR
+  # shellcheck disable=SC2064
+  trap "report_failure '${1:-}'" EXIT
   case "${1:-}" in
     install) shift; cmd_install "$@" ;;
     reload) cmd_reload ;;
@@ -716,8 +914,10 @@ main() {
     deny-user) require_root; deny_user "${2:?user required}" ;;
     uninstall) cmd_uninstall ;;
     trust-app) cmd_trust_app "${2:?app required}" ;;
+    self-update) cmd_self_update "${2:-}" ;;
+    finish-install) cmd_finish_install ;;
     move-service-data) cmd_move_service_data "${2:?user required}" "${3:?formula required}" ;;
-    *) brewau_die "usage: brewau-setup install|reload|allow-user|deny-user|uninstall|trust-app|move-service-data" ;;
+    *) brewau_die "usage: brewau-setup install|reload|allow-user|deny-user|uninstall|trust-app|move-service-data|self-update|finish-install" ;;
   esac
 }
 
