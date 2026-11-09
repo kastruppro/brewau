@@ -321,6 +321,14 @@ struct RunResult: Equatable, Sendable {
         // discovered a block.
         return hasErrorList || status == "blocked" || status == "upgrade-failed"
     }
+    /// A brewau before this contract reported the run that discovered a block as a failed
+    /// run, which the block's own banner already covers.
+    var isLegacyBlockOnly: Bool { !hasErrorList && isBlockOnly }
+    /// True when the result accounts for a non-zero exit by itself. The job records every
+    /// failure of its own, so with a step list present a non-zero exit that no step explains
+    /// came from the scheduler around the script — its privileged completions refresh, say —
+    /// and is news the result cannot describe.
+    var explainsFailure: Bool { isFailure || isLegacyBlockOnly }
 
     /// Danish explanation for the menu, or nil when the run needs no comment.
     /// `displayName` turns a package into the app name the user recognises.
@@ -479,17 +487,28 @@ enum RunNotice: Equatable, Sendable {
 func runNotice(job: String, succeeded: Bool, result: RunResult?) -> RunNotice {
     // No network: nothing was changed and nothing is worth a banner.
     if result?.isOffline == true { return .silent }
-    // A run with nothing but blocks to show is covered by the block's own once-per-version
-    // banner. The job exits 0 for that now, including for the run that discovers a block; a
-    // result file from an older brewau reported that run as a failure. Any other failure is
-    // reported, also next to a standing block.
-    if !succeeded { return result?.isBlockOnly == true ? .silent : .failure }
+    // The job exits 0 for a run with nothing but blocks, including the run that discovers
+    // one, so a non-zero exit beside a block-only result is a failure of the scheduler around
+    // the script and is reported with its own message. Only a result file from before that
+    // contract reported the discovering run as a failure, and the block's own
+    // once-per-version banner covers that.
+    if !succeeded { return result?.isLegacyBlockOnly == true ? .silent : .failure }
     guard job == "upgrade" else { return .updatesAvailable }
     // A run that installed nothing is not news, so a standing block cannot announce a
     // finished upgrade every two hours. Without a result file (an older brewau) the run is
     // announced as before.
     guard let result else { return .upgradeFinished }
     return result.upgraded.isEmpty ? .silent : .upgradeFinished
+}
+
+/// The headline for a finished run. A failure the run itself does not account for outranks
+/// what the run recorded, so a block does not stand in for the scheduler's own failure. An
+/// offline run is reported as skipped either way: it changed nothing.
+func runHeadline(job: String, succeeded: Bool, result: RunResult?) -> String? {
+    if !succeeded, result?.isOffline != true, result?.explainsFailure != true {
+        return job == "scan" ? "Scanningen mislykkedes" : "Opdateringen mislykkedes"
+    }
+    return result?.danishHeadline
 }
 
 /// A result belongs to a run only if it was published for that job, no earlier than the run

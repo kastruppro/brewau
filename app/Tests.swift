@@ -292,6 +292,29 @@ import Darwin
         check(brewauLogLine("upgrade", forgedStage.logSummary, at: morning).components(separatedBy: "\n").count == 1, "so a step cannot forge a log line")
         check(try RunResult.decode(Data(#"{"job":"upgrade","status":"ok","reason":"ok","errors":"none"}"#.utf8)).hasErrorList == false, "A step list of the wrong type is treated as absent")
 
+        // --- a scheduler failure after a clean script is still reported ---------------
+        // The script exits 0 for a block-only run; the privileged completions refresh that
+        // follows it can still fail, and that is news the result cannot describe.
+        check(standingBlock.hasErrorList && !standingBlock.explainsFailure, "A block-only result does not account for a failed run")
+        check(runNotice(job: "upgrade", succeeded: false, result: standingBlock) == .failure,
+              "so a scheduler failure after it is notified")
+        check(standingBlock.danishSummary(includingBlocks: false) == nil,
+              "with the scheduler's own message, not the block text")
+        check(runHeadline(job: "upgrade", succeeded: false, result: standingBlock) == "Opdateringen mislykkedes",
+              "and the menu says the run failed")
+        check(runNotice(job: "upgrade", succeeded: false, result: blocked) == .failure, "The same holds for the run that discovered the block")
+        // A result file from before the step list reported the discovering run as a failure.
+        check(legacyBlock.isLegacyBlockOnly && legacyBlock.explainsFailure, "An old block-only result accounts for its failed run")
+        check(runNotice(job: "upgrade", succeeded: false, result: legacyBlock) == .silent, "so it still raises no second banner")
+        check(runHeadline(job: "upgrade", succeeded: false, result: legacyBlock) == "1 app er blokeret af macOS", "and still reads as blocked")
+        check(runHeadline(job: "upgrade", succeeded: true, result: standingBlock) == "1 app er blokeret af macOS", "A successful block-only run reads as blocked")
+        check(runHeadline(job: "upgrade", succeeded: false, result: restartBeside) == "Opdateringen mislykkedes", "A recorded failure keeps its headline")
+        check(restartBeside.explainsFailure, "because the result accounts for it")
+        check(runHeadline(job: "scan", succeeded: false, result: nil) == "Scanningen mislykkedes", "A failure without a result names the job")
+        check(runHeadline(job: "upgrade", succeeded: true, result: didUpgrade) == nil, "A clean run needs no headline of its own")
+        check(runHeadline(job: "scan", succeeded: false, result: offline) == "Sprunget over – ingen forbindelse", "An offline run stays a skip")
+        check(runNotice(job: "scan", succeeded: false, result: offline) == .silent, "and is not notified")
+
         // --- a one-shot notification survives a permission granted later -------------
         var ledger = OneShotNotice()
         let blockKey = "blocked-parallels-26.2.1"

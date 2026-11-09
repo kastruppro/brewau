@@ -33,8 +33,11 @@ struct PendingApp: Identifiable {
     @Published var upgradeResult: RunResult?
     @Published var scanResult: RunResult?
     @Published var clearingBlocked = false
-    /// What the newest finished run published, if the file really belongs to that run.
+    /// What the newest finished run published, if the file really belongs to that run,
+    /// together with the job it belonged to and the scheduler's verdict for it.
     @Published var runResult: RunResult?
+    @Published var runJob: String?
+    @Published var runSucceeded = true
     @Published var notificationPreferences = NotificationPreferences() { didSet { savePreferences() } }
     @Published var forceAllowed: Set<String> = [] { didSet { savePreferences() } }
     private let defaults = UserDefaults.standard
@@ -83,7 +86,7 @@ struct PendingApp: Identifiable {
     var blockedMessage: String? { RunResult.danishBlocks(blockedByAppManagement.map { displayName(for: $0) }) }
     var headline: String {
         if !installed { return "Tjenesten skal opdateres" }
-        if let line = runResult?.danishHeadline { return line }
+        if let job = runJob, let line = runHeadline(job: job, succeeded: runSucceeded, result: runResult) { return line }
         if failed { return "Kørsel mislykkedes" }
         if !hasScanned { return "Klar til scanning" }
         return updates.isEmpty ? "Alt er opdateret" : "\(updates.count) opdateringer klar"
@@ -185,6 +188,8 @@ struct PendingApp: Identifiable {
         let result = operation?.finished == nil ? nil
             : operation.flatMap { correlatedResult(self.result(for: $0.kind), job: $0.kind, startedAt: $0.started) }
         runResult = result
+        runJob = operation?.finished == nil ? nil : operation?.kind
+        runSucceeded = operation?.succeeded != false
         // A run that found no network changed nothing and is not a failure.
         failed = snapshot.error != nil || (operation?.succeeded == false && result?.isOffline != true)
         let running = operation?.finished == nil && operation?.processID.map { kill($0, 0) == 0 || errno == EPERM } == true
@@ -201,8 +206,12 @@ struct PendingApp: Identifiable {
             let detail = result?.danishSummary { self.displayName(for: $0) }
             if operation.succeeded == true {
                 status = detail ?? "Sidst tjekket \(finished.formatted(.relative(presentation: .named)))"
-            } else {
+            } else if result?.explainsFailure == true {
                 status = detail ?? operation.message ?? "Handlingen mislykkedes. Se loggen."
+            } else {
+                // The run itself did not fail, so the scheduler's own message is the news
+                // here; the block, if any, keeps its own notice below.
+                status = operation.message ?? detail ?? "Handlingen mislykkedes. Se loggen."
             }
         } else if operation?.finished == nil && operation != nil && !running {
             status = "Sidste kørsel blev afbrudt. Du kan prøve igen."
