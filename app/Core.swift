@@ -242,22 +242,33 @@ struct RunResult: Equatable, Sendable {
     var failed: [RunResultItem] = []
     var blocked: [RunResultItem] = []
 
+    /// A result file is written by the local upgrade job, but its package strings come from
+    /// Homebrew, so they are treated as untrusted text: bounded in size and count, and
+    /// flattened to one line each before anything logs or displays them.
+    static let sizeLimit = 1_048_576
+    static let itemLimit = 500
+
     static func decode(_ data: Data) throws -> RunResult {
+        guard data.count <= RunResult.sizeLimit else { throw BrewauError.message("Resultatfilen er for stor.") }
         guard let object = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
             throw BrewauError.message("Resultatfilen kunne ikke læses.")
         }
+        func field(_ value: Any?, _ limit: Int) -> String {
+            brewauSingleLine(value as? String ?? "", limit: limit)
+        }
         var result = RunResult()
         result.finished = (object["finished"] as? String).flatMap { ISO8601DateFormatter().date(from: $0) }
-        result.job = object["job"] as? String ?? ""
-        result.status = object["status"] as? String ?? ""
-        result.reason = object["reason"] as? String ?? ""
+        result.job = field(object["job"], 32)
+        result.status = field(object["status"], 32)
+        result.reason = field(object["reason"], 32)
         func items(_ key: String) -> [RunResultItem] {
-            (object[key] as? [[String: Any]] ?? []).compactMap { row in
-                guard let name = row["name"] as? String, !name.isEmpty else { return nil }
-                return RunResultItem(name: name, kind: row["kind"] as? String ?? "",
-                                     version: row["version"] as? String ?? "",
-                                     reason: row["reason"] as? String ?? "",
-                                     installed: row["installed"] as? String ?? "")
+            (object[key] as? [[String: Any]] ?? []).prefix(RunResult.itemLimit).compactMap { row in
+                let name = field(row["name"], 200)
+                guard !name.isEmpty else { return nil }
+                return RunResultItem(name: name, kind: field(row["kind"], 32),
+                                     version: field(row["version"], 64),
+                                     reason: field(row["reason"], 32),
+                                     installed: field(row["installed"], 200))
             }
         }
         result.upgraded = items("upgraded")
@@ -278,10 +289,17 @@ struct RunResult: Equatable, Sendable {
         return failed.filter { !names.contains($0.name) }
     }
     var hasSomethingToReport: Bool { isOffline || isFailure || !appManagementBlocks.isEmpty }
+    /// Everything this run has to say is that App Management blocks a cask. The block is
+    /// announced once per package and version by its own channel, so the per-run channel
+    /// stays quiet: otherwise the first block raises two banners, every standing-block run
+    /// afterwards claims an upgrade finished, and every failing retry explains it again.
+    var isBlockOnly: Bool { !isOffline && otherFailures.isEmpty && !appManagementBlocks.isEmpty }
 
     /// Danish explanation for the menu, or nil when the run needs no comment.
     /// `displayName` turns a package into the app name the user recognises.
-    func danishSummary(displayName: (RunResultItem) -> String = { $0.name }) -> String? {
+    /// `includingBlocks` is false for the per-run notification, which leaves blocks to the
+    /// per-package channel.
+    func danishSummary(includingBlocks: Bool = true, displayName: (RunResultItem) -> String = { $0.name }) -> String? {
         var parts: [String] = []
         if isOffline {
             parts.append("Ingen forbindelse til Homebrew. brewau prøver igen ved næste kørsel.")
@@ -295,7 +313,7 @@ struct RunResult: Equatable, Sendable {
                 parts.append("\(name) kunne ikke opdateres, fordi Homebrew meldte en fejl. Se loggen for detaljer.")
             }
         }
-        if let blocks = RunResult.danishBlocks(appManagementBlocks.map(displayName)) { parts.append(blocks) }
+        if includingBlocks, let blocks = RunResult.danishBlocks(appManagementBlocks.map(displayName)) { parts.append(blocks) }
         if parts.isEmpty, isFailure { parts.append(RunResult.danishStatus(status, job: job)) }
         return parts.isEmpty ? nil : parts.joined(separator: " ")
     }
@@ -353,19 +371,90 @@ struct RunResult: Equatable, Sendable {
     }
 }
 
+/// Flattens text to a single bounded line. Package names, versions and child output all end
+/// up on one line of upgrade.log, where a newline followed by an apparent
+/// `<timestamp> [job]` prefix would forge a log entry. Control and format characters (Cc, Cf)
+/// are replaced by a space, and so are the line and paragraph separators that break a line
+/// in a view without being control characters.
+let brewauLineBreakers = CharacterSet.controlCharacters.union(.newlines)
+
+func brewauSingleLine(_ text: String, limit: Int = 200) -> String {
+    let flattened = String(String.UnicodeScalarView(text.unicodeScalars.map {
+        brewauLineBreakers.contains($0) ? " " : $0
+    }))
+    return flattened.count <= limit ? flattened : String(flattened.prefix(limit)) + "…"
+}
+
 /// Same shape as the shell layer's `log()` (`date +%Y-%m-%dT%H:%M:%S%z` and a job tag),
-/// so upgrade.log reads as one stream whoever wrote the line.
+/// so upgrade.log reads as one stream whoever wrote the line. Every caller's text passes
+/// through `brewauSingleLine`, so one call can never produce two lines.
 func brewauLogLine(_ job: String, _ message: String, at date: Date = Date()) -> String {
     let formatter = DateFormatter()
     formatter.locale = Locale(identifier: "en_US_POSIX")
     formatter.dateFormat = "yyyy-MM-dd'T'HH:mm:ssZ"
-    return "\(formatter.string(from: date)) [\(job)] \(message)"
+    return "\(formatter.string(from: date)) [\(brewauSingleLine(job, limit: 32))] \(brewauSingleLine(message, limit: 1000))"
 }
 
-/// Missing or unreadable result files leave the GUI on its previous information.
+/// Missing or unreadable result files leave the GUI on its previous information. The read is
+/// bounded: an oversized file is truncated here and then fails to parse, rather than being
+/// loaded into memory whole.
 func readRunResult(_ url: URL) -> RunResult? {
-    guard let data = try? Data(contentsOf: url) else { return nil }
+    guard let handle = try? FileHandle(forReadingFrom: url) else { return nil }
+    defer { try? handle.close() }
+    guard let data = try? handle.read(upToCount: RunResult.sizeLimit) else { return nil }
     return try? RunResult.decode(data)
+}
+
+/// Which banner the ordinary per-run notification channel should raise.
+enum RunNotice: Equatable, Sendable {
+    case silent
+    case failure
+    case upgradeFinished
+    case updatesAvailable
+}
+
+/// The per-run notification decision. `succeeded` is the scheduler's verdict for the run,
+/// `result` what the job published for it (already correlated with the run).
+func runNotice(job: String, succeeded: Bool, result: RunResult?) -> RunNotice {
+    // No network: nothing was changed and nothing is worth a banner.
+    if result?.isOffline == true { return .silent }
+    // A standing App Management block has its own once-per-version banner.
+    if result?.isBlockOnly == true { return .silent }
+    if !succeeded { return .failure }
+    guard job == "upgrade" else { return .updatesAvailable }
+    // A run that installed nothing is not news. Without a result file (an older brewau)
+    // the run is announced as before.
+    guard let result else { return .upgradeFinished }
+    return result.upgraded.isEmpty ? .silent : .upgradeFinished
+}
+
+/// A result belongs to a run only if it was published for that job, no earlier than the run
+/// started. A worker that died before publishing would otherwise let the previous run's
+/// explanation — "offline", say — stand in for a new failure.
+/// The shell layer truncates `finished` to whole seconds, so a run shorter than a second
+/// needs that much tolerance.
+func correlatedResult(_ result: RunResult?, job: String, startedAt: Date) -> RunResult? {
+    guard let result, result.job == job, let finished = result.finished,
+          finished >= startedAt.addingTimeInterval(-1) else { return nil }
+    return result
+}
+
+/// One-shot notifications, kept out of the delivery path on purpose: nothing is remembered
+/// until a banner was really delivered, so a notification the user had not permitted yet is
+/// still delivered once permission is granted. `inFlight` keeps a repeated refresh from
+/// submitting the same key twice while the first submission is still running.
+struct OneShotNotice {
+    private(set) var inFlight: Set<String> = []
+    /// True when `key` should be submitted now. `delivered` is what was persisted earlier.
+    mutating func shouldSubmit(_ key: String, delivered: Bool) -> Bool {
+        guard !delivered else { return false }
+        return inFlight.insert(key).inserted
+    }
+    /// Records the outcome of a submission. True when the key may be persisted as delivered.
+    mutating func finish(_ key: String, delivered: Bool) -> Bool {
+        inFlight.remove(key)
+        return delivered
+    }
 }
 
 func writeJSON<T: Encodable>(_ value: T, to url: URL) throws {

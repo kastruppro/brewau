@@ -121,9 +121,9 @@ import Darwin
         check(blocked.logSummary == "kastruppro/tap/parallels 26.2.1: blocked by macOS App Management, skipped until a newer version or a manual upgrade", "Log line names package and version in English")
         check(blocked.hasSomethingToReport, "A blocked run is reported")
 
-        let standingBlock = Data(#"{"upgraded":[],"failed":[],"blocked":[{"name":"parallels","kind":"cask","version":"26.2.1","reason":"app-management","installed":"x"}],"finished":"2026-11-09T04:00:00Z","job":"upgrade","status":"blocked","reason":"app-management"}"#.utf8)
-        check(!(try RunResult.decode(standingBlock).isFailure), "A standing block is not a failure")
-        check(try RunResult.decode(standingBlock).danishHeadline == "1 app er blokeret af macOS", "A standing block keeps its headline")
+        let standingBlock = try RunResult.decode(Data(#"{"upgraded":[],"failed":[],"blocked":[{"name":"parallels","kind":"cask","version":"26.2.1","reason":"app-management","installed":"x"}],"finished":"2026-11-09T04:00:00Z","job":"upgrade","status":"blocked","reason":"app-management"}"#.utf8))
+        check(!standingBlock.isFailure, "A standing block is not a failure")
+        check(standingBlock.danishHeadline == "1 app er blokeret af macOS", "A standing block keeps its headline")
 
         let offline = try RunResult.decode(Data(#"{"upgraded":[],"failed":[],"blocked":[],"finished":"2026-11-09T06:00:00Z","job":"scan","status":"skipped","reason":"offline"}"#.utf8))
         check(offline.isOffline && !offline.isFailure, "An offline run is not a failure")
@@ -156,6 +156,75 @@ import Darwin
         check(readRunResult(resultFile)?.appManagementBlocks.count == 1, "Result files are read from disk")
         check(brewauLogLine("upgrade", "done", at: morning).hasSuffix(" [upgrade] done"), "Log lines carry the shell layer's job tag")
         check(brewauLogLine("scan", "x", at: morning).range(of: "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}[+-][0-9]{4} ", options: .regularExpression) != nil, "Log stamp matches date +%Y-%m-%dT%H:%M:%S%z")
+
+        // --- a result file cannot forge a log line or exhaust memory ------------------
+        let forged = try RunResult.decode(Data(#"""
+        {"failed":[{"name":"evil\n2026-11-09T03:00:00+0100 [upgrade] everything is up to date","kind":"cask","version":"1\u00072","reason":"brew-error","installed":""}],
+         "blocked":[],"job":"upgrade","status":"upgrade\u2028-failed","reason":"brew-error"}
+        """#.utf8))
+        check(!forged.failed[0].name.contains("\n") && !forged.failed[0].version.contains("\u{07}"),
+              "Control characters in a result are flattened at ingest")
+        check(!forged.status.contains("\u{2028}"), "Line separators cannot split a status")
+        check(brewauLogLine("upgrade", forged.logSummary, at: morning).components(separatedBy: "\n").count == 1,
+              "A forged name cannot produce a second log line")
+        check(brewauLogLine("up\ngrade", "x", at: morning).components(separatedBy: "\n").count == 1,
+              "Nor can a forged job tag")
+        check(brewauSingleLine(String(repeating: "a", count: 500), limit: 64).count == 65, "Long strings are capped")
+        check(try RunResult.decode(Data(#"{"job":"upgrade","status":"ok","reason":"ok","upgraded":[]}"#.utf8)).upgraded.isEmpty, "Normal results still decode")
+        let manyItems = "{\"job\":\"upgrade\",\"status\":\"ok\",\"reason\":\"ok\",\"upgraded\":["
+            + (0..<600).map { "{\"name\":\"p\($0)\",\"kind\":\"cask\",\"version\":\"1\",\"reason\":\"ok\",\"installed\":\"\"}" }.joined(separator: ",") + "]}"
+        check(try RunResult.decode(Data(manyItems.utf8)).upgraded.count == RunResult.itemLimit, "Item count is bounded")
+        check(rejects { _ = try RunResult.decode(Data(repeating: 32, count: RunResult.sizeLimit + 1)) }, "Oversized results are refused")
+        let oversized = work.appendingPathComponent("oversized.json")
+        try Data(repeating: 0x20, count: RunResult.sizeLimit + 64).write(to: oversized)
+        check(readRunResult(oversized) == nil, "An oversized result file is not loaded whole")
+
+        // --- a result only explains the run that published it -------------------------
+        let runStart = date("2026-11-09T05:00:00Z")
+        let staleOffline = try RunResult.decode(Data(#"{"job":"scan","status":"skipped","reason":"offline","finished":"2026-11-09T04:00:00Z"}"#.utf8))
+        check(correlatedResult(staleOffline, job: "scan", startedAt: runStart) == nil, "A result from an earlier run is not reused")
+        check(correlatedResult(staleOffline, job: "scan", startedAt: date("2026-11-09T04:00:00Z")) != nil, "Its own run still matches it")
+        // The shell layer truncates finished to whole seconds, so a sub-second run must match.
+        check(correlatedResult(staleOffline, job: "scan", startedAt: date("2026-11-09T04:00:00Z").addingTimeInterval(0.8)) != nil,
+              "A run shorter than a second still matches its result")
+        check(correlatedResult(staleOffline, job: "upgrade", startedAt: date("2026-11-09T04:00:00Z")) == nil, "The other job's result does not match")
+        check(correlatedResult(try RunResult.decode(Data(#"{"job":"scan","status":"skipped","reason":"offline"}"#.utf8)), job: "scan", startedAt: runStart) == nil,
+              "A result without a timestamp cannot be correlated")
+        // A crashed worker leaves no new result: the failure must be reported as a failure.
+        check(runNotice(job: "scan", succeeded: false, result: correlatedResult(staleOffline, job: "scan", startedAt: runStart)) == .failure,
+              "A stale offline result does not excuse a new failure")
+        check(runNotice(job: "scan", succeeded: false, result: staleOffline) == .silent, "while its own offline run stays quiet")
+
+        // --- the per-run channel leaves standing blocks to the per-package channel ----
+        check(blocked.isBlockOnly && runNotice(job: "upgrade", succeeded: false, result: blocked) == .silent,
+              "The first block does not also raise the ordinary failure banner")
+        check(runNotice(job: "upgrade", succeeded: true, result: standingBlock) == .silent,
+              "A standing block does not announce a finished upgrade")
+        check(runNotice(job: "upgrade", succeeded: false, result: blocked) == .silent,
+              "A failing retry does not explain the block again")
+        check(runNotice(job: "upgrade", succeeded: false, result: brewError) == .failure, "An unrelated failure is still notified")
+        let mixed = try RunResult.decode(Data(#"{"upgraded":[],"failed":[{"name":"parallels","kind":"cask","version":"1","reason":"app-management","installed":""},{"name":"ffmpeg","kind":"formula","version":"8.0","reason":"brew-error","installed":""}],"blocked":[{"name":"parallels","kind":"cask","version":"1","reason":"app-management","installed":""}],"job":"upgrade","status":"upgrade-failed","reason":"brew-error"}"#.utf8))
+        check(!mixed.isBlockOnly && runNotice(job: "upgrade", succeeded: false, result: mixed) == .failure, "A failure next to a block is notified")
+        check(mixed.danishSummary(includingBlocks: false) == "ffmpeg kunne ikke opdateres, fordi Homebrew meldte en fejl. Se loggen for detaljer.",
+              "and its banner leaves the block to the block banner")
+        check(mixed.danishSummary()?.contains("App Management") == true, "while the menu still explains both")
+        let didUpgrade = try RunResult.decode(Data(#"{"upgraded":[{"name":"firefox","kind":"cask","version":"145.0","reason":"ok","installed":""}],"job":"upgrade","status":"ok","reason":"ok"}"#.utf8))
+        check(runNotice(job: "upgrade", succeeded: true, result: didUpgrade) == .upgradeFinished, "A real upgrade is announced")
+        check(runNotice(job: "upgrade", succeeded: true, result: sparse) == .silent, "An upgrade that installed nothing is not news")
+        check(runNotice(job: "upgrade", succeeded: true, result: nil) == .upgradeFinished, "Without a result file the old behaviour stands")
+        check(runNotice(job: "scan", succeeded: true, result: didUpgrade) == .updatesAvailable, "A finished scan reports what it found")
+        check(runNotice(job: "scan", succeeded: true, result: offline) == .silent, "An offline scan reports nothing")
+
+        // --- a one-shot notification survives a permission granted later -------------
+        var ledger = OneShotNotice()
+        let blockKey = "blocked-parallels-26.2.1"
+        check(ledger.shouldSubmit(blockKey, delivered: false), "A new block is submitted")
+        check(!ledger.shouldSubmit(blockKey, delivered: false), "but not twice while the first submission runs")
+        check(!ledger.finish(blockKey, delivered: false), "A refused delivery is not remembered")
+        check(ledger.shouldSubmit(blockKey, delivered: false), "so it is tried again once permission is granted")
+        check(ledger.finish(blockKey, delivered: true), "A delivered banner is remembered")
+        check(!ledger.shouldSubmit(blockKey, delivered: true), "and never repeats")
+        check(ledger.inFlight.isEmpty, "No key is left in flight")
         print("\(checks) native checks passed")
     }
 }

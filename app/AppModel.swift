@@ -33,8 +33,8 @@ struct PendingApp: Identifiable {
     @Published var upgradeResult: RunResult?
     @Published var scanResult: RunResult?
     @Published var clearingBlocked = false
-    /// Which job the newest finished run belonged to, so the headline describes that run.
-    @Published var lastRunJob: String?
+    /// What the newest finished run published, if the file really belongs to that run.
+    @Published var runResult: RunResult?
     @Published var notificationPreferences = NotificationPreferences() { didSet { savePreferences() } }
     @Published var forceAllowed: Set<String> = [] { didSet { savePreferences() } }
     private let defaults = UserDefaults.standard
@@ -43,6 +43,7 @@ struct PendingApp: Identifiable {
     private var requestPendingUntil: Date?
     private var automaticRestartAttempts: Set<String> = []
     private var loadingPreferences = true
+    private var oneShot = OneShotNotice()
 
     override init() {
         super.init()
@@ -73,14 +74,16 @@ struct PendingApp: Identifiable {
     func result(for job: String) -> RunResult? { job == "scan" ? scanResult : upgradeResult }
     /// Casks the last upgrade could not touch because macOS App Management stops the daemon.
     var blockedByAppManagement: [RunResultItem] { upgradeResult?.appManagementBlocks ?? [] }
-    func displayName(for item: RunResultItem) -> String { apps.first(where: { $0.token == item.token })?.name ?? item.token }
+    func displayName(for item: RunResultItem) -> String {
+        brewauSingleLine(apps.first(where: { $0.token == item.token })?.name ?? item.token, limit: 80)
+    }
     func appManagementBlock(for update: PackageUpdate) -> RunResultItem? {
         blockedByAppManagement.first { $0.token == update.token }
     }
     var blockedMessage: String? { RunResult.danishBlocks(blockedByAppManagement.map { displayName(for: $0) }) }
     var headline: String {
         if !installed { return "Tjenesten skal opdateres" }
-        if let line = (lastRunJob.flatMap { result(for: $0) })?.danishHeadline { return line }
+        if let line = runResult?.danishHeadline { return line }
         if failed { return "Kørsel mislykkedes" }
         if !hasScanned { return "Klar til scanning" }
         return updates.isEmpty ? "Alt er opdateret" : "\(updates.count) opdateringer klar"
@@ -98,7 +101,7 @@ struct PendingApp: Identifiable {
             await request("upgrade")
         } catch {
             clearingBlocked = false
-            BrewauLog.app.error("clear-blocked failed: \(error.localizedDescription, privacy: .public)")
+            BrewauLog.app.error("clear-blocked was refused")
             self.error = error.localizedDescription
         }
     }
@@ -152,7 +155,8 @@ struct PendingApp: Identifiable {
                     snapshot.homebrew = version.trimmingCharacters(in: .whitespacesAndNewlines)
                 }
             } catch {
-                BrewauLog.app.error("reading brewau state failed: \(error.localizedDescription, privacy: .public)")
+                // The description can carry child or file content; the GUI shows it, the log does not.
+                BrewauLog.app.error("reading brewau state failed")
                 snapshot.error = error.localizedDescription
             }
             return snapshot
@@ -176,8 +180,11 @@ struct PendingApp: Identifiable {
         upgradeResult = snapshot.upgradeResult
         scanResult = snapshot.scanResult
         let operation = snapshot.operation
-        lastRunJob = operation?.finished == nil ? nil : operation?.kind
-        let result = operation.flatMap { self.result(for: $0.kind) }
+        // Only a result published for this run may explain it; a stale file (an earlier
+        // offline scan, say) must not excuse a worker that died before publishing its own.
+        let result = operation?.finished == nil ? nil
+            : operation.flatMap { correlatedResult(self.result(for: $0.kind), job: $0.kind, startedAt: $0.started) }
+        runResult = result
         // A run that found no network changed nothing and is not a failure.
         failed = snapshot.error != nil || (operation?.succeeded == false && result?.isOffline != true)
         let running = operation?.finished == nil && operation?.processID.map { kill($0, 0) == 0 || errno == EPERM } == true
@@ -205,7 +212,7 @@ struct PendingApp: Identifiable {
         await refreshNotificationStatus()
         detectPending()
         for event in [snapshot.lastScan, snapshot.lastUpgrade].compactMap({ $0 }) {
-            await notify(event, result: self.result(for: event.kind))
+            await notify(event, result: correlatedResult(self.result(for: event.kind), job: event.kind, startedAt: event.started))
         }
         await notifyBlocked()
         if !busy { await automaticallyRestartAllowed() }
@@ -221,7 +228,7 @@ struct PendingApp: Identifiable {
             _ = try await Task.detached { try runCommand("/opt/brewau/bin/brewau", [kind == "upgrade" ? "run" : "scan"]) }.value
             await refresh()
         } catch {
-            BrewauLog.app.error("\(kind, privacy: .public) could not be started: \(error.localizedDescription, privacy: .public)")
+            BrewauLog.app.error("\(kind, privacy: .public) could not be started")
             self.error = error.localizedDescription
             requestPendingUntil = nil
             busy = false
@@ -241,7 +248,7 @@ struct PendingApp: Identifiable {
             BrewauLog.app.notice("schedule saved")
             await refresh()
         } catch {
-            BrewauLog.app.error("saving the schedule failed: \(error.localizedDescription, privacy: .public)")
+            BrewauLog.app.error("saving the schedule failed")
             self.error = error.localizedDescription
         }
     }
@@ -272,15 +279,22 @@ struct PendingApp: Identifiable {
         guard finished.timeIntervalSince1970 > defaults.double(forKey: key) else { return }
         defaults.set(finished.timeIntervalSince1970, forKey: key)
         guard notificationPreferences.enabled else { return }
-        // A run without network did nothing; it is neither a failure nor news worth a banner.
-        guard result?.isOffline != true else { return }
         var body: String?
-        if event.succeeded == false, notificationPreferences.failure {
-            body = result?.danishSummary { self.displayName(for: $0) } ?? event.message ?? "En opdatering mislykkedes. Åbn brewau for detaljer."
+        switch runNotice(job: event.kind, succeeded: event.succeeded == true, result: result) {
+        case .silent: return
+        case .failure:
+            guard notificationPreferences.failure else { return }
+            // Blocks are left out: their own banner reports them once per version.
+            body = result?.danishSummary(includingBlocks: false) { self.displayName(for: $0) }
+                ?? event.message ?? "En opdatering mislykkedes. Åbn brewau for detaljer."
+        case .upgradeFinished:
+            guard notificationPreferences.complete else { return }
+            body = "Opdateringen er færdig.\(pending.isEmpty ? "" : " \(pending.count) apps afventer genstart.")"
+        case .updatesAvailable:
+            guard notificationPreferences.available, !availableUpdates.isEmpty else { return }
+            body = "\(availableUpdates.count) opdateringer er klar til installation."
         }
-        else if event.kind == "upgrade", notificationPreferences.complete { body = "Opdateringen er færdig.\(pending.isEmpty ? "" : " \(pending.count) apps afventer genstart.")" }
-        else if event.kind == "scan", notificationPreferences.available, !availableUpdates.isEmpty { body = "\(availableUpdates.count) opdateringer er klar til installation." }
-        if let body { await sendNotification(id: key, title: "brewau", body: body) }
+        if let body { _ = await sendNotification(id: key, title: "brewau", body: body) }
     }
     /// A block repeats on every scheduled run, so the banner is tied to the package and the
     /// version it got stuck on instead of to the run.
@@ -288,21 +302,29 @@ struct PendingApp: Identifiable {
         guard notificationPreferences.enabled, notificationPreferences.failure else { return }
         for item in blockedByAppManagement {
             let key = "blocked-\(item.name)-\(item.version)"
-            guard !defaults.bool(forKey: key) else { continue }
-            defaults.set(true, forKey: key)
+            guard oneShot.shouldSubmit(key, delivered: defaults.bool(forKey: key)) else { continue }
             BrewauLog.app.notice("reporting blocked package \(item.name, privacy: .public) \(item.version, privacy: .public)")
-            await sendNotification(id: key, title: "\(displayName(for: item)) kunne ikke opdateres",
-                                   body: "macOS App Management blokerer baggrundsjobbet. Åbn brewau for at se, hvad du kan gøre.")
+            let delivered = await sendNotification(id: key, title: "\(displayName(for: item)) kunne ikke opdateres",
+                                                   body: "macOS App Management blokerer baggrundsjobbet. Åbn brewau for at se, hvad du kan gøre.")
+            // Remembered only once it was really delivered, so a permission the user grants
+            // later still gets the banner.
+            if oneShot.finish(key, delivered: delivered) { defaults.set(true, forKey: key) }
         }
     }
-    func sendNotification(id: String, title: String, body: String) async {
-        guard notificationAllowed else { return }
+    @discardableResult func sendNotification(id: String, title: String, body: String) async -> Bool {
+        guard notificationAllowed else { return false }
         let content = UNMutableNotificationContent()
         content.title = title
         content.body = body
         content.sound = .default
-        do { try await UNUserNotificationCenter.current().add(UNNotificationRequest(identifier: id, content: content, trigger: nil)) }
-        catch { status = "Notifikation kunne ikke sendes: \(error.localizedDescription)" }
+        do {
+            try await UNUserNotificationCenter.current().add(UNNotificationRequest(identifier: id, content: content, trigger: nil))
+            return true
+        } catch {
+            BrewauLog.app.error("a notification could not be submitted")
+            status = "Notifikation kunne ikke sendes: \(error.localizedDescription)"
+            return false
+        }
     }
     nonisolated func userNotificationCenter(_ center: UNUserNotificationCenter, willPresent notification: UNNotification) async -> UNNotificationPresentationOptions {
         [.banner, .sound]
