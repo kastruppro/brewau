@@ -1,9 +1,28 @@
 import Foundation
 import Darwin
+import os
+
+/// One subsystem for the GUI, the scheduler and the privileged helper, so a single
+/// `log show --predicate 'subsystem == "com.kastruppro.brewau"'` covers all three.
+/// Nothing here may carry secrets, file contents or a full environment.
+enum BrewauLog {
+    static let app = Logger(subsystem: "com.kastruppro.brewau", category: "app")
+    static let agent = Logger(subsystem: "com.kastruppro.brewau", category: "agent")
+    static let helper = Logger(subsystem: "com.kastruppro.brewau", category: "helper")
+}
 
 enum BrewauError: LocalizedError {
     case message(String)
-    var errorDescription: String? { if case .message(let text) = self { return text }; return nil }
+    /// Danish text for the GUI plus a separate English line for upgrade.log and the unified log.
+    case reported(ui: String, log: String)
+    var errorDescription: String? {
+        switch self {
+        case .message(let text): return text
+        case .reported(let ui, _): return ui
+        }
+    }
+    /// The English wording to print where the log is read, not the user interface.
+    var logDescription: String? { if case .reported(_, let text) = self { return text }; return nil }
 }
 
 struct ScheduleSettings: Codable, Equatable, Sendable {
@@ -198,6 +217,157 @@ struct OperationState: Codable, Sendable {
     var processID: Int32? = nil
 }
 
+/// One package in a run result, as `brewau-upgrade` records it.
+struct RunResultItem: Equatable, Sendable {
+    let name: String
+    let kind: String
+    let version: String
+    let reason: String
+    /// Opaque installed-version signature the shell layer matches a retry against.
+    let installed: String
+    var isCask: Bool { kind == "cask" }
+    /// Casks may be named `tap/user/token`; the catalog knows them by the last component.
+    var token: String { String(name.split(separator: "/").last ?? "") }
+}
+
+/// `state/last-result.json` (upgrades) and `state/last-scan-result.json` (scans), written by
+/// `brewau-upgrade`. Fields are read defensively: a file from an older brewau, a partly
+/// written file or an unexpected type must never keep the GUI from starting.
+struct RunResult: Equatable, Sendable {
+    var finished: Date?
+    var job = ""
+    var status = ""
+    var reason = ""
+    var upgraded: [RunResultItem] = []
+    var failed: [RunResultItem] = []
+    var blocked: [RunResultItem] = []
+
+    static func decode(_ data: Data) throws -> RunResult {
+        guard let object = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            throw BrewauError.message("Resultatfilen kunne ikke læses.")
+        }
+        var result = RunResult()
+        result.finished = (object["finished"] as? String).flatMap { ISO8601DateFormatter().date(from: $0) }
+        result.job = object["job"] as? String ?? ""
+        result.status = object["status"] as? String ?? ""
+        result.reason = object["reason"] as? String ?? ""
+        func items(_ key: String) -> [RunResultItem] {
+            (object[key] as? [[String: Any]] ?? []).compactMap { row in
+                guard let name = row["name"] as? String, !name.isEmpty else { return nil }
+                return RunResultItem(name: name, kind: row["kind"] as? String ?? "",
+                                     version: row["version"] as? String ?? "",
+                                     reason: row["reason"] as? String ?? "",
+                                     installed: row["installed"] as? String ?? "")
+            }
+        }
+        result.upgraded = items("upgraded")
+        result.failed = items("failed")
+        result.blocked = items("blocked")
+        return result
+    }
+
+    /// No network: the run did nothing and will try again, so it is not a failure.
+    var isOffline: Bool { reason == "offline" }
+    /// Statuses the shell layer exits 0 with; everything else left work undone.
+    var isFailure: Bool { !["ok", "blocked", "skipped", ""].contains(status) }
+    /// Casks macOS App Management keeps the background job from upgrading.
+    var appManagementBlocks: [RunResultItem] { blocked.filter { $0.reason == "app-management" } }
+    /// Failures that are not already explained by a block.
+    var otherFailures: [RunResultItem] {
+        let names = Set(appManagementBlocks.map(\.name))
+        return failed.filter { !names.contains($0.name) }
+    }
+    var hasSomethingToReport: Bool { isOffline || isFailure || !appManagementBlocks.isEmpty }
+
+    /// Danish explanation for the menu, or nil when the run needs no comment.
+    /// `displayName` turns a package into the app name the user recognises.
+    func danishSummary(displayName: (RunResultItem) -> String = { $0.name }) -> String? {
+        var parts: [String] = []
+        if isOffline {
+            parts.append("Ingen forbindelse til Homebrew. brewau prøver igen ved næste kørsel.")
+        }
+        for item in otherFailures {
+            let name = displayName(item)
+            switch item.reason {
+            case "protect-failed":
+                parts.append("\(name) blev ikke opdateret, fordi appens filer i /Applications ikke kunne sikres. Se loggen for detaljer.")
+            default:
+                parts.append("\(name) kunne ikke opdateres, fordi Homebrew meldte en fejl. Se loggen for detaljer.")
+            }
+        }
+        if let blocks = RunResult.danishBlocks(appManagementBlocks.map(displayName)) { parts.append(blocks) }
+        if parts.isEmpty, isFailure { parts.append(RunResult.danishStatus(status, job: job)) }
+        return parts.isEmpty ? nil : parts.joined(separator: " ")
+    }
+
+    /// Short Danish headline for the menu, or nil when the run needs no headline of its own.
+    var danishHeadline: String? {
+        // A run whose only problem is App Management is reported as blocked, not as a failure,
+        // also on the first run: there is nothing for the user to retry blindly.
+        if isFailure, !otherFailures.isEmpty || appManagementBlocks.isEmpty {
+            return job == "scan" ? "Scanningen mislykkedes" : "Opdateringen mislykkedes"
+        }
+        if !appManagementBlocks.isEmpty {
+            return appManagementBlocks.count == 1 ? "1 app er blokeret af macOS" : "\(appManagementBlocks.count) apps er blokeret af macOS"
+        }
+        if isOffline { return "Sprunget over – ingen forbindelse" }
+        return nil
+    }
+
+    /// One English line for upgrade.log and the unified log.
+    var logSummary: String {
+        var parts: [String] = []
+        if isOffline { parts.append("offline, nothing was changed") }
+        for item in otherFailures { parts.append("\(item.name): \(item.reason.isEmpty ? "failed" : item.reason)") }
+        for item in appManagementBlocks {
+            parts.append("\(item.name) \(item.version): blocked by macOS App Management, skipped until a newer version or a manual upgrade")
+        }
+        if parts.isEmpty { parts.append("status \(status.isEmpty ? "unknown" : status) (reason \(reason.isEmpty ? "unknown" : reason))") }
+        return parts.joined(separator: "; ")
+    }
+
+    /// The App Management explanation, also shown on its own next to the retry buttons.
+    static func danishBlocks(_ names: [String]) -> String? {
+        if names.count == 1 {
+            return "\(names[0]) kunne ikke opdateres, fordi macOS App Management blokerer baggrundsjobbet. Den springes over, indtil der kommer en nyere version eller du opdaterer den manuelt."
+        }
+        if names.count > 1 {
+            return "\(list(names)) kunne ikke opdateres, fordi macOS App Management blokerer baggrundsjobbet. De springes over, indtil der kommer nyere versioner, eller du opdaterer dem manuelt."
+        }
+        return nil
+    }
+    static func danishStatus(_ status: String, job: String) -> String {
+        switch status {
+        case "update-failed": return "Homebrew kunne ikke opdatere sig selv. Se loggen for detaljer."
+        case "outdated-failed": return "Listen over opdateringer kunne ikke hentes fra Homebrew. Se loggen for detaljer."
+        case "snapshot-failed": return "Opdateringslisten kunne ikke gemmes. Se loggen for detaljer."
+        case "restart-failed": return "En systemtjeneste kunne ikke genstartes efter opdateringen. Se loggen for detaljer."
+        case "protect-failed": return "Apps i /Applications kunne ikke sikres efter opdateringen. Se loggen for detaljer."
+        case "tap-check-failed": return "brewau kunne ikke afgøre, hvilke taps der er tilladt, og kørte ikke Homebrew."
+        default: return job == "scan" ? "Scanningen mislykkedes. Se loggen for detaljer." : "Opdateringen mislykkedes. Se loggen for detaljer."
+        }
+    }
+    private static func list(_ names: [String]) -> String {
+        guard names.count > 1 else { return names.joined() }
+        return names.dropLast().joined(separator: ", ") + " og " + names[names.count - 1]
+    }
+}
+
+/// Same shape as the shell layer's `log()` (`date +%Y-%m-%dT%H:%M:%S%z` and a job tag),
+/// so upgrade.log reads as one stream whoever wrote the line.
+func brewauLogLine(_ job: String, _ message: String, at date: Date = Date()) -> String {
+    let formatter = DateFormatter()
+    formatter.locale = Locale(identifier: "en_US_POSIX")
+    formatter.dateFormat = "yyyy-MM-dd'T'HH:mm:ssZ"
+    return "\(formatter.string(from: date)) [\(job)] \(message)"
+}
+
+/// Missing or unreadable result files leave the GUI on its previous information.
+func readRunResult(_ url: URL) -> RunResult? {
+    guard let data = try? Data(contentsOf: url) else { return nil }
+    return try? RunResult.decode(data)
+}
+
 func writeJSON<T: Encodable>(_ value: T, to url: URL) throws {
     let encoder = JSONEncoder()
     encoder.dateEncodingStrategy = .iso8601
@@ -230,7 +400,14 @@ func runCommand(_ executable: String, _ arguments: [String], input: Data? = nil)
     let data = output.fileHandleForReading.readDataToEndOfFile()
     process.waitUntilExit()
     let text = String(decoding: data.suffix(16000), as: UTF8.self)
-    guard process.terminationStatus == 0 else { throw BrewauError.message(text.isEmpty ? "Handlingen mislykkedes (\(process.terminationStatus))." : text) }
+    // Call sites pass fixed executables and validated subcommands; payloads travel on stdin,
+    // so the command line is safe to log while the child's output is not.
+    let command = ([executable] + arguments).joined(separator: " ")
+    guard process.terminationStatus == 0 else {
+        BrewauLog.helper.error("\(command, privacy: .public) exited \(process.terminationStatus)")
+        throw BrewauError.message(text.isEmpty ? "Handlingen mislykkedes (\(process.terminationStatus))." : text)
+    }
+    BrewauLog.helper.notice("\(command, privacy: .public) succeeded")
     return text
 }
 

@@ -102,6 +102,60 @@ import Darwin
         check(try FileManager.default.attributesOfItem(atPath: destination.appendingPathComponent("_demo").path)[.posixPermissions] as? Int == 0o644, "Copied completions are not writable by other users")
         let audit = try runCommand("/bin/zsh", ["-dfc", "fpath=(\"$1\" ${fpath:#/opt/homebrew/*}); autoload -Uz compaudit; _compdir='' compaudit", "brewau-test", destination.path])
         check(audit.isEmpty, "zsh compaudit accepts the completion snapshot")
+
+        // --- run results from brewau-upgrade ------------------------------------------
+        let blockedRun = Data(#"""
+        {"upgraded":[{"name":"firefox","kind":"cask","version":"145.0","reason":"ok","installed":"[\"144.0\"]"}],
+         "failed":[{"name":"kastruppro/tap/parallels","kind":"cask","version":"26.2.1","reason":"app-management","installed":"[\"26.1.0\"]"}],
+         "blocked":[{"name":"kastruppro/tap/parallels","kind":"cask","version":"26.2.1","reason":"app-management","installed":"[\"26.1.0\"]"}],
+         "finished":"2026-11-09T02:00:11Z","job":"upgrade","status":"upgrade-failed","reason":"app-management"}
+        """#.utf8)
+        let blocked = try RunResult.decode(blockedRun)
+        check(blocked.job == "upgrade" && blocked.status == "upgrade-failed" && blocked.reason == "app-management", "Run result header read")
+        check(blocked.finished == date("2026-11-09T02:00:11Z"), "Run result timestamp read")
+        check(blocked.upgraded.map(\.name) == ["firefox"] && blocked.upgraded.first?.isCask == true, "Successful package kept next to the failure")
+        check(blocked.appManagementBlocks.count == 1 && blocked.appManagementBlocks.first?.token == "parallels", "Block is attributed to the cask")
+        check(blocked.otherFailures.isEmpty, "A newly blocked cask is not reported twice")
+        check(blocked.danishHeadline == "1 app er blokeret af macOS", "A block is not presented as a plain failure")
+        check(blocked.danishSummary { $0.token.capitalized } == "Parallels kunne ikke opdateres, fordi macOS App Management blokerer baggrundsjobbet. Den springes over, indtil der kommer en nyere version eller du opdaterer den manuelt.", "Block explains itself with the app's name")
+        check(blocked.logSummary == "kastruppro/tap/parallels 26.2.1: blocked by macOS App Management, skipped until a newer version or a manual upgrade", "Log line names package and version in English")
+        check(blocked.hasSomethingToReport, "A blocked run is reported")
+
+        let standingBlock = Data(#"{"upgraded":[],"failed":[],"blocked":[{"name":"parallels","kind":"cask","version":"26.2.1","reason":"app-management","installed":"x"}],"finished":"2026-11-09T04:00:00Z","job":"upgrade","status":"blocked","reason":"app-management"}"#.utf8)
+        check(!(try RunResult.decode(standingBlock).isFailure), "A standing block is not a failure")
+        check(try RunResult.decode(standingBlock).danishHeadline == "1 app er blokeret af macOS", "A standing block keeps its headline")
+
+        let offline = try RunResult.decode(Data(#"{"upgraded":[],"failed":[],"blocked":[],"finished":"2026-11-09T06:00:00Z","job":"scan","status":"skipped","reason":"offline"}"#.utf8))
+        check(offline.isOffline && !offline.isFailure, "An offline run is not a failure")
+        check(offline.danishHeadline == "Sprunget over – ingen forbindelse", "Offline headline")
+        check(offline.danishSummary() == "Ingen forbindelse til Homebrew. brewau prøver igen ved næste kørsel.", "Offline explains itself")
+        check(offline.logSummary == "offline, nothing was changed", "Offline log line")
+
+        let brewError = try RunResult.decode(Data(#"{"upgraded":[],"failed":[{"name":"ffmpeg","kind":"formula","version":"8.0","reason":"brew-error","installed":""}],"blocked":[],"finished":"2026-11-09T07:00:00Z","job":"upgrade","status":"upgrade-failed","reason":"brew-error"}"#.utf8))
+        check(brewError.isFailure && brewError.danishHeadline == "Opdateringen mislykkedes", "An ordinary failure is still a failure")
+        check(brewError.danishSummary() == "ffmpeg kunne ikke opdateres, fordi Homebrew meldte en fejl. Se loggen for detaljer.", "Ordinary failure names the package")
+        check(brewError.logSummary == "ffmpeg: brew-error", "Ordinary failure log line")
+
+        let protectFailed = try RunResult.decode(Data(#"{"failed":[{"name":"vlc","kind":"cask","version":"4.0","reason":"protect-failed","installed":""}],"job":"upgrade","status":"upgrade-failed","reason":"protect-failed"}"#.utf8))
+        check(protectFailed.danishSummary() == "vlc blev ikke opdateret, fordi appens filer i /Applications ikke kunne sikres. Se loggen for detaljer.", "Protection failure has its own wording")
+        check(try RunResult.decode(Data(#"{"job":"scan","status":"update-failed","reason":"brew-error"}"#.utf8)).danishSummary() == "Homebrew kunne ikke opdatere sig selv. Se loggen for detaljer.", "A failure without packages falls back to its status")
+
+        let twoBlocks = try RunResult.decode(Data(#"{"blocked":[{"name":"parallels","kind":"cask","version":"1","reason":"app-management","installed":""},{"name":"docker","kind":"cask","version":"2","reason":"app-management","installed":""}],"job":"upgrade","status":"blocked","reason":"app-management"}"#.utf8))
+        check(twoBlocks.danishSummary()?.hasPrefix("parallels og docker kunne ikke opdateres") == true, "Several blocks are listed in one sentence")
+        check(twoBlocks.danishHeadline == "2 apps er blokeret af macOS", "Several blocks are counted")
+
+        // Files from an older brewau, or a half-written one, must not keep the GUI from starting.
+        let sparse = try RunResult.decode(Data("{}".utf8))
+        check(!sparse.isFailure && !sparse.hasSomethingToReport && sparse.danishSummary() == nil, "An empty result reports nothing")
+        let wrongTypes = try RunResult.decode(Data(#"{"status":7,"blocked":"none","failed":[{"kind":"cask"},{"name":"ok","kind":"cask"}]}"#.utf8))
+        check(wrongTypes.status.isEmpty && wrongTypes.blocked.isEmpty && wrongTypes.failed.map(\.name) == ["ok"], "Unexpected types are skipped, not fatal")
+        check(rejects { _ = try RunResult.decode(Data("not json".utf8)) }, "Malformed result rejected")
+        check(readRunResult(work.appendingPathComponent("absent.json")) == nil, "A missing result file is not an error")
+        let resultFile = work.appendingPathComponent("last-result.json")
+        try blockedRun.write(to: resultFile)
+        check(readRunResult(resultFile)?.appManagementBlocks.count == 1, "Result files are read from disk")
+        check(brewauLogLine("upgrade", "done", at: morning).hasSuffix(" [upgrade] done"), "Log lines carry the shell layer's job tag")
+        check(brewauLogLine("scan", "x", at: morning).range(of: "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}[+-][0-9]{4} ", options: .regularExpression) != nil, "Log stamp matches date +%Y-%m-%dT%H:%M:%S%z")
         print("\(checks) native checks passed")
     }
 }
