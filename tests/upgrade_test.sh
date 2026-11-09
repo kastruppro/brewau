@@ -216,8 +216,9 @@ check '[[ "$(sed -n "s/^upgraded=//p" "${LAST_RUN}")" == "" ]]' "records nothing
 scenario "scan does not install"
 MOCK_OUTDATED_CASKS="postman"
 UPDATE_HOMEBREW=1
-run_scan >/dev/null 2>&1
+SCAN_OUTPUT="$(run_scan 2>&1)"
 check '[[ $? -eq 0 ]]' "scan succeeds"
+check '[[ "${SCAN_OUTPUT}" == *"[scan] done (status=0)"* ]]' "scan records its job and result"
 check 'called "update"' "refreshes Homebrew"
 check '! grep -q "^upgrade" "${CALLS}"' "installs nothing"
 check '[[ -s "${BREWAU_STATE_DIR}/updates.json" && -s "${BREWAU_STATE_DIR}/catalog.json" ]]' "publishes both snapshots"

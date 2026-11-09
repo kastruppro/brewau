@@ -24,7 +24,7 @@ SELF_UPDATE_DUE="${BREWAU_STATE_DIR}/self-update-due"
 EXCLUDE_PINS="${BREWAU_STATE_DIR}/exclude-pins"
 
 log() {
-  echo "$(date '+%Y-%m-%d %H:%M:%S') $*"
+  echo "$(date '+%Y-%m-%dT%H:%M:%S%z') [${BREWAU_JOB:-upgrade}] $*"
 }
 
 brew_run() {
@@ -130,7 +130,7 @@ restart_system_services() {
 
 # Homebrew leaves temp files behind when a cask fails; keep the directory small.
 clean_tmp() {
-  find "${BREWAU_TMP}" -mindepth 1 -maxdepth 1 -mtime +7 -exec rm -rf {} + 2>/dev/null
+  find "${BREWAU_TMP}" -mindepth 1 -maxdepth 1 -type d -name 'cask-*' -user "${BREWAU_USER}" -mtime +1 -exec rm -rf {} + 2>/dev/null
   return 0
 }
 
@@ -243,11 +243,17 @@ refresh_snapshot() {
 }
 
 run_scan() {
+  local BREWAU_JOB="scan" status=0
   if [[ "${UPDATE_HOMEBREW}" == "1" ]]; then
     log "brew update (scan)"
-    brew_run update || return 1
+    if ! brew_run update; then
+      log "done (update-failed)"
+      return 1
+    fi
   fi
-  refresh_snapshot
+  refresh_snapshot || status=$?
+  log "done (status=${status})"
+  return "${status}"
 }
 
 # With AUTO_UPGRADE=0 the LaunchDaemon has no schedule, so the job only runs
