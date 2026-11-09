@@ -7,6 +7,9 @@ ROOT := $(BUILD)/root
 #   make release INSTALLER_IDENTITY="Developer ID Installer: Jane Doe (TEAMID)"
 INSTALLER_IDENTITY ?= Developer ID Installer: Tobias Jul Kastrup (5W98EXLE44)
 NOTARY_PROFILE ?= kastruppro-notary
+# How notarytool authenticates; when the keychain profile is not reachable, pass the API key:
+#   make tap NOTARY_AUTH="--key <AuthKey.p8> --key-id <KEY_ID> --issuer <ISSUER_ID>"
+NOTARY_AUTH ?= --keychain-profile "$(NOTARY_PROFILE)"
 # Checkout of github.com/kastruppro/homebrew-tap, updated by `make tap`.
 TAP_DIR ?= ../homebrew-tap
 APPLICATION_IDENTITY ?= Developer ID Application: Tobias Jul Kastrup (5W98EXLE44)
@@ -87,7 +90,7 @@ sign: pkg
 	pkgutil --check-signature $(SIGNED_PKG)
 
 notarize: sign
-	xcrun notarytool submit $(SIGNED_PKG) --keychain-profile "$(NOTARY_PROFILE)" --wait
+	xcrun notarytool submit $(SIGNED_PKG) $(NOTARY_AUTH) --wait
 	xcrun stapler staple $(SIGNED_PKG)
 	spctl --assess --type install --verbose $(SIGNED_PKG)
 
