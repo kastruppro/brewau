@@ -161,16 +161,16 @@ doctor_account() {
     bad "cannot read ${BREWAU_USER}'s account; run: sudo brewau doctor"
     return
   fi
-  shell="$(awk '$1 == "UserShell:" {print $2}' <<<"${record}")"
-  hidden="$(awk '$1 == "IsHidden:" {print $2}' <<<"${record}")"
-  password="$(awk '$1 == "Password:" {print $2}' <<<"${record}")"
+  shell="$(awk '$1 ~ /^(dsAttrTypeNative:)?UserShell:$/ {print $2}' <<<"${record}")"
+  hidden="$(awk '$1 ~ /^(dsAttrTypeNative:)?IsHidden:$/ {print $2}' <<<"${record}")"
+  password="$(awk '$1 ~ /^(dsAttrTypeNative:)?Password:$/ {print $2}' <<<"${record}")"
   case "${shell}" in
     /usr/bin/false | /sbin/nologin) ok "${BREWAU_USER} cannot log in with a shell" ;;
     *) bad "${BREWAU_USER} has login shell ${shell:-unknown}; run: sudo brewau repair" ;;
   esac
   [[ "${hidden}" == 1 ]] && ok "${BREWAU_USER} is hidden" ||
     bad "${BREWAU_USER} is not hidden; run: sudo brewau repair"
-  if [[ "${password}" != '*' ]] || grep -Eq '^[[:space:]]*(AuthenticationAuthority|ShadowHashData):' <<<"${record}"; then
+  if [[ "${password}" != '*' ]] || grep -Eq '^[[:space:]]*(dsAttrTypeNative:)?(AuthenticationAuthority|ShadowHashData):' <<<"${record}"; then
     bad "${BREWAU_USER} has password/authentication attributes or an unknown password state; review the account"
   else
     ok "${BREWAU_USER} has a disabled password and no authentication authority"

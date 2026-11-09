@@ -18,11 +18,26 @@ dscl() {
   printf '%s\n' "${RECORD}"
   return "${DSCL_RC:-0}"
 }
-record() { printf 'UserShell: %s\nIsHidden: %s\nPassword: %s\n' "$1" "$2" "$3"; }
+record() { printf 'UserShell: %s\ndsAttrTypeNative:IsHidden: %s\nPassword: %s\n' "$1" "$2" "$3"; }
 account() { FAILED=0; OUTPUT="$(doctor_account; echo "FAILED=${FAILED}")"; }
 RECORD="$(record /usr/bin/false 1 '*')"
 account
 check '[[ "${OUTPUT}" == *FAILED=0 ]]' "disabled hidden account is healthy"
+RECORD="$(record /usr/bin/false 1 '*')"
+RECORD="${RECORD/dsAttrTypeNative:IsHidden:/IsHidden:}"
+account
+check '[[ "${OUTPUT}" == *FAILED=0 ]]' "plain hidden attribute is accepted"
+RECORD="$(record /usr/bin/false 1 '*')"
+RECORD="${RECORD/Password:/dsAttrTypeNative:Password:}"
+account
+check '[[ "${OUTPUT}" == *FAILED=0 ]]' "native password attribute is accepted"
+for attribute in AuthenticationAuthority ShadowHashData; do
+  for prefix in '' dsAttrTypeNative:; do
+    RECORD="$(record /usr/bin/false 1 '*')"$'\n'"${prefix}${attribute}: ;ShadowHash;"
+    account
+    check '[[ "${OUTPUT}" == *FAILED=1 ]]' "${prefix}${attribute} warns"
+  done
+done
 RECORD="$(record /sbin/nologin 1 '*')"
 account
 check '[[ "${OUTPUT}" == *FAILED=0 ]]' "nologin is accepted"
