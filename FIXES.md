@@ -7,14 +7,32 @@ All fixed items have tests (`make test`) except where root is needed (noted).
 
 ## 2026-11-09: logs and review findings
 
-- Fixed repeated retries of App Management-blocked casks, isolated per-package failures, and recorded concrete errors and outcomes.
-- Fixed stale cask temporary directories, excessive download cache retention and duplicate shellenv paths.
-- Fixed incomplete job failure reporting and unsafe retry marker handling; notifications are deduplicated per blocked name and version.
-- Added account drift checks and auditing of root sudo commands.
+| Finding | Source | Fix |
+|---|---|---|
+| Parallels hit the same App Management failure 59 times. | Logs | Persist a per-version block and skip it until a new version, manual upgrade or explicit retry. |
+| One failing cask failed the whole run. | Logs | Record outcomes per package and continue other upgrades. |
+| Offline runs reported failures. | Logs | Probe connectivity and report a quiet offline skip. |
+| Stale `cask-*` temporary directories accumulated. | Logs | Clean stale temporary directories. |
+| Download cache grew to 3.1 GB. | Logs | Prune with configurable `CLEANUP_PRUNE_DAYS`, default 1. |
+| `brew shellenv` duplicated `/opt/brewau/bin` on PATH. | Logs | Add it only when absent. |
+| Logs lacked job tags, timezone and scan completion; brew output was untagged. | Logs, review | Tag and prefix output, include timezone and record scan completion. |
+| Failure messages did not identify the cause. | Logs | Report the failed package or step and reason. |
+| Protection failure could discard existing blocks. | Review | Preserve blocks while recording protection failures. |
+| A malformed block file interfered with `clear-blocked`. | Review | Clear first and recover malformed block state. |
+| Block notifications duplicated or were deduplicated before delivery. | Review | Use one block channel, deduplicate after successful delivery and guard pending notices. |
+| A stale result could explain a later failed run. | Review | Correlate the result with its run. |
+| Untrusted JSON strings could inject log lines. | Review | Bound and flatten result strings and log lines. |
+| A FIFO retry marker could hang the root agent. | Review | Open nonblocking without following symlinks and require a regular file. |
+| A standing block hid other job failures; a single status lost independent failures. | Review | Record all failed steps in `errors`, and report them alongside blocks. |
+| A scheduler failure after a block-only run was hidden. | Review | Report the scheduler failure separately when the result does not explain it. |
 
 ### Open follow-ups
 
-- Redesign App Management around a signed `brewau-agent` with fixed identifier `com.kastruppro.brewau.agent` as the launchd program and responsible process. Ship a PPPC profile for `SystemPolicyAppBundles` with path identifier and a DDM `com.apple.configuration.legacy` wrapper in `mdm/`. Responsible-process behaviour and DDM delivery remain untested.
+- Redesign App Management around a signed `brewau-agent` with fixed identifier
+  `com.kastruppro.brewau.agent` as the launchd program and responsible process. Ship a PPPC
+  profile for `SystemPolicyAppBundles` with path identifier and a DDM
+  `com.apple.configuration.legacy` wrapper in `mdm/`. Responsible-process behaviour and DDM
+  delivery remain untested.
 - Live test blocking, offline behaviour and notifications on an installed build.
 - Doctor's sudoers scan is lexical: aliases can cause false positives and UID or netgroup grants can escape it.
 - The worktree post-start hook copies `build/` (444 MB) into every worktree.

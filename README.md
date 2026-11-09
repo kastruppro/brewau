@@ -39,11 +39,12 @@ GUI ── validated schedule settings / scan / upgrade requests ──▶ exist
 
 ## Security model
 
-`_brewau` is root-equivalent: cask steps and package scripts require unrestricted root sudo. `ALLOWED_TAPS` is a root-trust list: adding a tap permits its code to run as root. The account is hidden and has a disabled login shell; `brewau doctor` checks account and sudoers drift. Allowed sudo invocations are recorded in `/var/log/system.log`.
-
-`_brewau` can become root without a password; that is what makes unattended cask upgrades
-possible. Whatever can make `_brewau` run code therefore gets root, so the isolation only
-holds if nothing but the policy can steer `_brewau`:
+`_brewau` is root-equivalent: Homebrew cask steps and package scripts need unrestricted
+root sudo. Whatever can make `_brewau` run code therefore gets root, so the isolation only
+holds if nothing but the policy can steer it. `ALLOWED_TAPS` is a root-trust list: adding a
+tap permits its code to run as root. The account is hidden and has a disabled login shell;
+`brewau doctor` checks account and sudoers drift. Allowed sudo invocations are recorded in
+`/var/log/system.log`.
 
 - `/opt/homebrew` is owned by `_brewau` with group/world write and ACLs removed, so neither
   you nor other admins' processes can plant code that Homebrew will run.
@@ -273,8 +274,8 @@ sudo tailscale up             # first login; add --operator=$USER to use tailsca
 Anything in `ALLOWED_SERVICES` runs as root, so a vulnerability in it is a root compromise.
 
 Upgrade and scan results are stored in `/opt/brewau/var/state/last-result.json` and
-`/opt/brewau/var/state/last-scan-result.json`, including upgraded, failed and blocked
-packages and an `errors` array of stage and reason. `brewau status` lists errors and blocked casks.
+`/opt/brewau/var/state/last-scan-result.json`, including upgraded, failed and blocked packages
+and an `errors` array of stage and reason. `brewau status` lists errors and blocked casks.
 
 ## Troubleshooting
 
@@ -282,7 +283,10 @@ packages and an `errors` array of stage and reason. `brewau status` lists errors
 `chown: /Applications/Parallels Desktop.app/...: Operation not permitted`). macOS App Management
 blocks changes to app bundles, even by root, unless the app that started the command is allowed.
 Enable your terminal (Terminal, iTerm, Ghostty, ...) in System Settings → Privacy & Security →
-App Management and run the command again. The scheduled job cannot obtain App Management without an MDM-delivered PPPC grant. Update blocked apps manually from an allowed terminal; brewau skips that version until a newer version, a manual upgrade, or `sudo brewau clear-blocked`. The menu also offers retry and a link to App Management settings.
+App Management and run the command again. The scheduled job cannot obtain App Management
+without an MDM-delivered PPPC grant. Update blocked apps manually from an allowed terminal;
+brewau skips that version until a newer version, a manual upgrade, or `sudo brewau clear-blocked`.
+The menu also offers retry and a link to App Management settings.
 
 ## Limitations
 

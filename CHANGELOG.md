@@ -8,22 +8,40 @@ and versions follow [Semantic Versioning](https://semver.org/). Details of each 
 
 ### Added
 
-- Per-package upgrade outcomes, blocked cask retry controls and notifications, and structured scan and upgrade results with errors.
-- `CLEANUP_PRUNE_DAYS`, account and sudoers drift checks, sudo audit logging and unified app logging.
+- Upgrade results track each package upgraded, failed or blocked. `state/last-result.json` and
+  `state/last-scan-result.json` contain those lists and an `errors` array of `{stage, reason}`;
+  `brewau status` lists blocked casks and all errors.
+- Casks blocked by macOS App Management are skipped for that version until a newer version,
+  a manual upgrade or `sudo brewau clear-blocked`. The menu shows a blocked-app card with
+  “Prøv igen” and a link to System Settings → Privacy & Security → App Management. The retry
+  button uses the `brewau-agent clear-blocked` sudoers entry written on install of 0.8.0.
+  A notification is delivered once per blocked name and version.
+- `CLEANUP_PRUNE_DAYS` controls download cache cleanup, defaults to `1` and accepts `all`.
+- `brewau doctor` checks the `_brewau` account's shell, password and hidden status, and other
+  sudoers files for grants. App, agent and helper use `os.Logger` under subsystem
+  `com.kastruppro.brewau`.
 
 ### Changed
 
-- Offline scans and upgrades skip quietly; logs identify jobs, time zones and concrete failures.
-- Setup enforces a hidden service account with a disabled login shell.
+- A curl probe to `formulae.brew.sh` detects offline runs, which skip quietly instead of failing.
+- Upgrade logs include timezone and job tags, prefix Homebrew output and record scan completion;
+  failure messages name the concrete cause.
+- Setup enforces a hidden `_brewau` account with a disabled login shell.
+- A run whose only issue is a newly blocked cask exits 0 with status `blocked`.
 
 ### Fixed
 
-- Failed casks no longer fail the entire upgrade; App Management blocks no longer cause repeated retries.
-- Stale cask temporary directories and old download cache entries are cleaned; shellenv avoids duplicate wrapper paths.
+- One failing cask no longer fails every package in a run, and an App Management block no longer
+  causes repeated retries of the same version.
+- Stale `cask-*` temporary directories are removed, and cleanup no longer retains download cache
+  entries for 30 days. `brew shellenv` no longer repeats `/opt/brewau/bin` when already on PATH.
+- Blocks, independent failures and notifications survive retry, protection and scheduler errors;
+  malformed state and untrusted result strings are handled safely.
 
 ### Security
 
-- Allowed root commands run by `_brewau` are recorded in the system log.
+- `Defaults:_brewau log_allowed` records allowed sudo invocations in system logging, including
+  `/var/log/system.log`.
 
 ## [0.7.1] - 2026-11-09
 
