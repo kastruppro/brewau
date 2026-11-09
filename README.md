@@ -44,7 +44,11 @@ root sudo. Whatever can make `_brewau` run code therefore gets root, so the isol
 holds if nothing but the policy can steer it. `ALLOWED_TAPS` is a root-trust list: adding a
 tap permits its code to run as root. The account is hidden and has a disabled login shell;
 `brewau doctor` checks account and sudoers drift. Allowed sudo invocations are recorded in
-`/var/log/system.log`.
+the unified log. To find them, run:
+
+```sh
+/usr/bin/log show --predicate 'process == "sudo" AND eventMessage CONTAINS "_brewau"'
+```
 
 - `/opt/homebrew` is owned by `_brewau` with group/world write and ACLs removed, so neither
   you nor other admins' processes can plant code that Homebrew will run.

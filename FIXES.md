@@ -26,6 +26,13 @@ All fixed items have tests (`make test`) except where root is needed (noted).
 | A standing block hid other job failures; a single status lost independent failures. | Review | Record all failed steps in `errors`, and report them alongside blocks. |
 | A scheduler failure after a block-only run was hidden. | Review | Report the scheduler failure separately when the result does not explain it. |
 
+### 0.8.1 fixes
+
+- [x] `brewau doctor` falsely reported a visible account when `dscl` printed the native
+  `dsAttrTypeNative:IsHidden` attribute; parse the attribute value correctly.
+- [x] The sudo audit location in the 0.8.0 notes pointed to `/var/log/system.log`; the README
+  now points to the unified log observed on this Mac.
+
 ### Open follow-ups
 
 - Redesign App Management around a signed `brewau-agent` with fixed identifier
@@ -33,7 +40,8 @@ All fixed items have tests (`make test`) except where root is needed (noted).
   profile for `SystemPolicyAppBundles` with path identifier and a DDM
   `com.apple.configuration.legacy` wrapper in `mdm/`. Responsible-process behaviour and DDM
   delivery remain untested.
-- Live test blocking, offline behaviour and notifications on an installed build.
+- Live test blocking, offline behaviour and notifications on an installed build. The App
+  Management block test is still pending: Docker updated itself before it could be reproduced.
 - Doctor's sudoers scan is lexical: aliases can cause false positives and UID or netgroup grants can escape it.
 - The worktree post-start hook copies `build/` (444 MB) into every worktree.
 

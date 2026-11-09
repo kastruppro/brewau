@@ -4,6 +4,15 @@ All notable changes to brewau. The format follows [Keep a Changelog](https://kee
 and versions follow [Semantic Versioning](https://semver.org/). Details of each finding behind
 0.4.0 are in [FIXES.md](FIXES.md).
 
+## [0.8.1] - 2026-11-09
+
+### Fixed
+
+- `brewau doctor` no longer reports `_brewau` as visible when `dscl` returns the native
+  attribute name `dsAttrTypeNative:IsHidden`.
+- The 0.8.0 release notes pointed to `/var/log/system.log` for sudo audit entries; on the
+  tested Mac those entries are in the unified log.
+
 ## [0.8.0] - 2026-11-09
 
 ### Added
