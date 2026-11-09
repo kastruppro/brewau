@@ -39,6 +39,8 @@ GUI ── validated schedule settings / scan / upgrade requests ──▶ exist
 
 ## Security model
 
+`_brewau` is root-equivalent: cask steps and package scripts require unrestricted root sudo. `ALLOWED_TAPS` is a root-trust list: adding a tap permits its code to run as root. The account is hidden and has a disabled login shell; `brewau doctor` checks account and sudoers drift. Allowed sudo invocations are recorded in `/var/log/system.log`.
+
 `_brewau` can become root without a password; that is what makes unattended cask upgrades
 possible. Whatever can make `_brewau` run code therefore gets root, so the isolation only
 holds if nothing but the policy can steer `_brewau`:
@@ -180,6 +182,7 @@ sudo brewau config add ALLOWED_TAPS openai/tools     # add to a list (and trust 
 sudo brewau config remove ALLOWED_TAPS openai/tools
 sudo brewau config set UPGRADE_MODE daily
 sudo brewau allow-user alice
+sudo brewau clear-blocked # retry blocked casks on the next run
 sudo brewau repair     # re-apply ownership, permissions and system files
 sudo brewau trust-app /Applications/Foo.app   # after checking an app brewau marked untrusted
 sudo brewau self-update                       # update brewau now from kastruppro/tap
@@ -205,6 +208,7 @@ users' and running services are named: move their data before the next `brew ser
 | `FORBIDDEN_FORMULAE`, `FORBIDDEN_CASKS` | empty | never installable |
 | `EXTRA_ALLOWED_OPTIONS` | empty | brew options (`--flag`, not subcommands) to allow beyond the built-in list |
 | `AUTO_UPGRADE` | `1` | enable the nightly job; with `0`, `brewau run` still starts one by hand |
+| `CLEANUP_PRUNE_DAYS` | `1` | remove cached downloads older than this many days; accepts `all` |
 | `UPGRADE_GREEDY` | `1` | include self-updating casks |
 | `ALLOWED_SERVICES` | empty | formulae whose `brew services` run as root system daemons (e.g. `tailscale`) |
 | `UPGRADE_EXCLUDE` | empty | never auto-upgrade these, with or without their tap (formulae are pinned, so they are not upgraded as dependencies either) |
@@ -268,15 +272,17 @@ sudo tailscale up             # first login; add --operator=$USER to use tailsca
 
 Anything in `ALLOWED_SERVICES` runs as root, so a vulnerability in it is a root compromise.
 
+Upgrade and scan results are stored in `/opt/brewau/var/state/last-result.json` and
+`/opt/brewau/var/state/last-scan-result.json`, including upgraded, failed and blocked
+packages and an `errors` array of stage and reason. `brewau status` lists errors and blocked casks.
+
 ## Troubleshooting
 
 **`Operation not permitted` when a cask changes its app** (e.g. Parallels:
 `chown: /Applications/Parallels Desktop.app/...: Operation not permitted`). macOS App Management
 blocks changes to app bundles, even by root, unless the app that started the command is allowed.
 Enable your terminal (Terminal, iTerm, Ghostty, ...) in System Settings → Privacy & Security →
-App Management and run the command again. The nightly job has no terminal; on managed Macs
-grant App Management with an MDM Privacy Preferences (PPPC) profile, otherwise update such
-apps by hand (`brewau doctor` reports it).
+App Management and run the command again. The scheduled job cannot obtain App Management without an MDM-delivered PPPC grant. Update blocked apps manually from an allowed terminal; brewau skips that version until a newer version, a manual upgrade, or `sudo brewau clear-blocked`. The menu also offers retry and a link to App Management settings.
 
 ## Limitations
 

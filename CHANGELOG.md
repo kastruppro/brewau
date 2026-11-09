@@ -4,6 +4,27 @@ All notable changes to brewau. The format follows [Keep a Changelog](https://kee
 and versions follow [Semantic Versioning](https://semver.org/). Details of each finding behind
 0.4.0 are in [FIXES.md](FIXES.md).
 
+## [0.8.0] - 2026-11-09
+
+### Added
+
+- Per-package upgrade outcomes, blocked cask retry controls and notifications, and structured scan and upgrade results with errors.
+- `CLEANUP_PRUNE_DAYS`, account and sudoers drift checks, sudo audit logging and unified app logging.
+
+### Changed
+
+- Offline scans and upgrades skip quietly; logs identify jobs, time zones and concrete failures.
+- Setup enforces a hidden service account with a disabled login shell.
+
+### Fixed
+
+- Failed casks no longer fail the entire upgrade; App Management blocks no longer cause repeated retries.
+- Stale cask temporary directories and old download cache entries are cleaned; shellenv avoids duplicate wrapper paths.
+
+### Security
+
+- Allowed root commands run by `_brewau` are recorded in the system log.
+
 ## [0.7.1] - 2026-11-09
 
 ### Changed

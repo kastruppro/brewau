@@ -5,6 +5,20 @@ Homebrew 7.0.10's source. Sources: **R0** own review, **R1**/**R2**/**R3** the t
 reviews, **V** found while verifying or fixing, **F** found by a review of the fixes themselves.
 All fixed items have tests (`make test`) except where root is needed (noted).
 
+## 2026-11-09: logs and review findings
+
+- Fixed repeated retries of App Management-blocked casks, isolated per-package failures, and recorded concrete errors and outcomes.
+- Fixed stale cask temporary directories, excessive download cache retention and duplicate shellenv paths.
+- Fixed incomplete job failure reporting and unsafe retry marker handling; notifications are deduplicated per blocked name and version.
+- Added account drift checks and auditing of root sudo commands.
+
+### Open follow-ups
+
+- Redesign App Management around a signed `brewau-agent` with fixed identifier `com.kastruppro.brewau.agent` as the launchd program and responsible process. Ship a PPPC profile for `SystemPolicyAppBundles` with path identifier and a DDM `com.apple.configuration.legacy` wrapper in `mdm/`. Responsible-process behaviour and DDM delivery remain untested.
+- Live test blocking, offline behaviour and notifications on an installed build.
+- Doctor's sudoers scan is lexical: aliases can cause false positives and UID or netgroup grants can escape it.
+- The worktree post-start hook copies `build/` (444 MB) into every worktree.
+
 ## Fixed
 
 ### Security
