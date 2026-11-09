@@ -138,6 +138,59 @@ cmd_log() {
   exec tail -n 100 "${file}"
 }
 
+doctor_account() {
+  local record shell hidden password
+  if ! record="$(dscl . -read "/Users/${BREWAU_USER}" 2>/dev/null)"; then
+    bad "cannot read ${BREWAU_USER}'s account; run: sudo brewau doctor"
+    return
+  fi
+  shell="$(awk '$1 == "UserShell:" {print $2}' <<<"${record}")"
+  hidden="$(awk '$1 == "IsHidden:" {print $2}' <<<"${record}")"
+  password="$(awk '$1 == "Password:" {print $2}' <<<"${record}")"
+  case "${shell}" in
+    /usr/bin/false | /sbin/nologin) ok "${BREWAU_USER} cannot log in with a shell" ;;
+    *) bad "${BREWAU_USER} has login shell ${shell:-unknown}; run: sudo brewau repair" ;;
+  esac
+  [[ "${hidden}" == 1 ]] && ok "${BREWAU_USER} is hidden" ||
+    bad "${BREWAU_USER} is not hidden; run: sudo brewau repair"
+  if [[ "${password}" != '*' ]] || grep -Eq '^[[:space:]]*(AuthenticationAuthority|ShadowHashData):' <<<"${record}"; then
+    bad "${BREWAU_USER} has password/authentication attributes or an unknown password state; review the account"
+  else
+    ok "${BREWAU_USER} has a disabled password and no authentication authority"
+  fi
+}
+
+doctor_sudoers() {
+  local parsed file refs found=0 inspected=0
+  if ! parsed="$(LC_ALL=C sudo -n /usr/sbin/visudo -c 2>/dev/null)"; then
+    bad "cannot inspect all sudoers files; run: sudo brewau doctor"
+    return
+  fi
+  while IFS= read -r file; do
+    [[ -n "${file}" ]] || continue
+    inspected=1
+    [[ "${file}" == "${BREWAU_SUDOERS}" || "${file}" == "/private${BREWAU_SUDOERS}" ]] && continue
+    # Include alias definitions and continuations: an indirect grant also needs review.
+    if ! refs="$(sudo -n /usr/bin/awk -v user="${BREWAU_USER}" -v group="${BREWAU_USERS_GROUP}" '
+      /^[[:space:]]*#/ || /^[[:space:]]*Defaults/ { next }
+      { sub(/#.*/, ""); gsub(/[^[:alnum:]_]/, " ")
+        if ($1 == "ALL") { print NR; next }
+        for (i=1; i<=NF; i++) if ($i == user || $i == group) { print NR; break }
+      }' "${file}" 2>/dev/null)"; then
+      bad "cannot inspect sudoers file ${file}; run: sudo brewau doctor"
+      found=1
+    elif [[ -n "${refs}" ]]; then
+      bad "additional sudoers references to ${BREWAU_USER}/${BREWAU_USERS_GROUP} in ${file} (lines: ${refs//$'\n'/, }); review grants beyond brew-policy"
+      found=1
+    fi
+  done < <(sed -n 's/: parsed OK$//p' <<<"${parsed}")
+  if [[ ${inspected} == 0 ]]; then
+    bad "could not enumerate sudoers files; run: sudo brewau doctor"
+    return
+  fi
+  [[ ${found} == 1 ]] || ok "no additional sudoers references to the service account or users group"
+}
+
 cmd_doctor() {
   FAILED=0
   local brew_path owner writable
@@ -163,6 +216,9 @@ cmd_doctor() {
   fi
 
   brewau_load_config
+  echo "  - ${BREWAU_USER} is root-equivalent: ALLOWED_TAPS can run code as root; treat adding a tap as granting root."
+  doctor_account
+  doctor_sudoers
 
   local env_file
   for env_file in "${HOMEBREW_PREFIX_PATH}/etc/homebrew/brew.env" "${BREWAU_HOME}/.homebrew/brew.env"; do

@@ -84,6 +84,8 @@ free_id() {
 
 ensure_service_account() {
   if dscl . -read "/Users/${BREWAU_USER}" >/dev/null 2>&1; then
+    dscl . -create "/Users/${BREWAU_USER}" UserShell /usr/bin/false
+    dscl . -create "/Users/${BREWAU_USER}" IsHidden 1
     return 0
   fi
   local id
@@ -262,7 +264,9 @@ write_sudoers() {
 # Managed by brewau. Regenerate with: sudo brewau reload
 # Never hand the caller's PATH to anything running as ${BREWAU_USER}.
 Defaults>${BREWAU_USER} secure_path="/usr/bin:/bin:/usr/sbin:/sbin"
-# _brewau runs Homebrew; Homebrew elevates some cask steps with sudo -E.
+# _brewau is root-equivalent: Homebrew cask steps (sudo -E) and pkg scripts need root sudo.
+# ALLOWED_TAPS can run code as root; adding a tap grants root trust.
+Defaults:${BREWAU_USER} log_allowed
 ${BREWAU_USER} ALL=(root) NOPASSWD: ALL
 # Members of ${BREWAU_USERS_GROUP} may run brew, but only through the policy.
 %${BREWAU_USERS_GROUP} ALL=(${BREWAU_USER}) NOPASSWD: ${BREWAU_LIBEXEC}/brew-policy
