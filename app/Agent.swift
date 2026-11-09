@@ -55,7 +55,7 @@ private let config = root.appendingPathComponent("etc/brewau.conf")
             }
         } catch {
             if let line = (error as? BrewauError)?.logDescription { fputs("\(line)\n", stderr) }
-            else { fputs("brewau: \(error.localizedDescription)\n", stderr) }
+            else { fputs("brewau: \(brewauSingleLine(error.localizedDescription, limit: 1000))\n", stderr) }
             exit(1)
         }
     }
@@ -63,12 +63,18 @@ private let config = root.appendingPathComponent("etc/brewau.conf")
         guard getuid() == 0 else { throw BrewauError.message("This command must run as root.") }
     }
     /// `O_NOFOLLOW` and no `O_TRUNC`: _brewau owns the directory, so a symlink planted there
-    /// must never make root create or shorten a file somewhere else.
+    /// must never make root create or shorten a file somewhere else. `O_NONBLOCK` keeps a
+    /// FIFO planted in its place from making root wait for a reader, and `fstat` then
+    /// refuses anything that is not a regular file.
     static func requestBlockedRetry() throws {
         let path = state.appendingPathComponent("clear-blocked").path
-        let descriptor = open(path, O_CREAT | O_WRONLY | O_NOFOLLOW | O_CLOEXEC, mode_t(0o644))
+        let descriptor = open(path, O_CREAT | O_WRONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC, mode_t(0o644))
         guard descriptor >= 0 else { throw BrewauError.message("Kunne ikke anmode om et nyt forsøg.") }
-        close(descriptor)
+        defer { close(descriptor) }
+        var info = stat()
+        guard fstat(descriptor, &info) == 0, info.st_mode & S_IFMT == S_IFREG else {
+            throw BrewauError.message("Kunne ikke anmode om et nyt forsøg: uventet fil i tilstandsmappen.")
+        }
     }
     static func perform(_ request: String) throws {
         let settings = try ScheduleSettings.readConfig(String(contentsOf: config, encoding: .utf8))
@@ -101,7 +107,7 @@ private let config = root.appendingPathComponent("etc/brewau.conf")
             child.standardInput = FileHandle.nullDevice
             try child.run()
             child.waitUntilExit()
-            if child.terminationStatus != 0 { throw resultFailure(kind, exit: child.terminationStatus) }
+            if child.terminationStatus != 0 { throw resultFailure(kind, exit: child.terminationStatus, startedAt: now) }
         } catch { failure = error }
         // A fixed root-only command refreshes trusted completion copies after any Homebrew run.
         do { _ = try runCommand("/usr/bin/sudo", ["-n", root.appendingPathComponent("libexec/brewau-agent").path, "completions"]) }
@@ -115,7 +121,9 @@ private let config = root.appendingPathComponent("etc/brewau.conf")
             // resultFailure already carries a tagged English line; anything else (a missing
             // helper, a failed completions refresh) gets one here so upgrade.log stays uniform.
             guard (failure as? BrewauError)?.logDescription != nil else {
-                BrewauLog.agent.error("\(kind, privacy: .public) failed: \(failure.localizedDescription, privacy: .public)")
+                // The description can be a child's output: upgrade.log gets it as one
+                // flattened line, the unified log only the fact that the job failed.
+                BrewauLog.agent.error("\(kind, privacy: .public) failed")
                 throw BrewauError.reported(ui: failure.localizedDescription,
                                            log: brewauLogLine(kind, "failed: \(failure.localizedDescription)"))
             }
@@ -123,15 +131,19 @@ private let config = root.appendingPathComponent("etc/brewau.conf")
         }
         // The script already wrote its own lines to upgrade.log; this only mirrors the outcome
         // into the unified log.
-        let result = readRunResult(state.appendingPathComponent(kind == "scan" ? "last-scan-result.json" : "last-result.json"))
-        BrewauLog.agent.notice("\(kind, privacy: .public) finished: \(result?.logSummary ?? "no result file", privacy: .public)")
+        let file = state.appendingPathComponent(kind == "scan" ? "last-scan-result.json" : "last-result.json")
+        let result = correlatedResult(readRunResult(file), job: kind, startedAt: now)
+        BrewauLog.agent.notice("\(kind, privacy: .public) finished: \(result?.logSummary ?? "no result for this run", privacy: .public)")
     }
     /// The script records what actually went wrong, so the run no longer reports a generic
     /// "see the log for details". The GUI gets Danish; upgrade.log and the unified log get
     /// the English line, tagged like the shell layer's own lines.
-    static func resultFailure(_ kind: String, exit code: Int32) -> Error {
+    static func resultFailure(_ kind: String, exit code: Int32, startedAt: Date) -> Error {
         let file = state.appendingPathComponent(kind == "scan" ? "last-scan-result.json" : "last-result.json")
-        let result = readRunResult(file).flatMap { $0.job == kind && $0.hasSomethingToReport ? $0 : nil }
+        // Only a result this run published may explain it. A worker that died before writing
+        // one would otherwise be explained by the previous run's result.
+        let result = correlatedResult(readRunResult(file), job: kind, startedAt: startedAt)
+            .flatMap { $0.hasSomethingToReport ? $0 : nil }
         let english = result?.logSummary ?? "exited with code \(code) and left no usable result"
         let danish = result?.danishSummary() ?? RunResult.danishStatus(result?.status ?? "", job: kind)
         BrewauLog.agent.error("\(kind, privacy: .public) failed: \(english, privacy: .public)")

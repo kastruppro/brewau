@@ -108,9 +108,18 @@ to the unified log under subsystem `com.kastruppro.brewau`, in the categories `a
 log show --last 1h --predicate 'subsystem == "com.kastruppro.brewau"'
 ```
 
-Lines carry package names, job names and exit codes only; no secrets, file contents
-or environments. The scheduler's own lines in `/opt/brewau/var/log/upgrade.log` are
-English and use the same `<timestamp> [<job>] <message>` shape as the shell layer.
+Lines carry package names and versions, job names, the fixed command lines of helper
+calls and their exit codes, marked `.public` so they stay readable. Child output,
+file contents, environments and the localized error descriptions that can contain
+them are deliberately kept out: a failure is logged as the fact that the job failed,
+and the detail stays in `/opt/brewau/var/log/upgrade.log`.
+
+The scheduler's own lines in that log are English and use the same
+`<timestamp> [<job>] <message>` shape as the shell layer. Every line passes through
+one formatter that flattens control characters, line and paragraph separators, so a
+package name or a child's output cannot forge a second, untagged entry. Result files
+are read with a 1 MB limit, at most 500 items per array, and each string bounded and
+flattened as it is parsed.
 
 The original visual prototype remains in `mockup/` for design reference and is
 not included in the installer.
