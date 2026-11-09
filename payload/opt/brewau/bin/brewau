@@ -449,7 +449,7 @@ case "${1:-}" in
   reload | allow-user | deny-user | uninstall | trust-app | move-service-data) root_command "$@" ;;
   clear-blocked)
     [[ "$(id -u)" -eq 0 ]] || brewau_die "run with sudo: sudo brewau clear-blocked"
-    touch "${BREWAU_STATE_DIR}/clear-blocked" || brewau_die "could not request a retry"
+    touch -h "${BREWAU_STATE_DIR}/clear-blocked" || brewau_die "could not request a retry"
     echo "Blocked casks will be retried on the next upgrade."
     ;;
   self-update)
