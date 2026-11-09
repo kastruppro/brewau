@@ -317,6 +317,49 @@ run
 check '[[ "$(plutil -extract failed.0.reason raw -o - "${BREWAU_STATE_DIR}/last-result.json")" == brew-error ]]' "ordinary failure retains brew-error"
 check '[[ "$(plutil -extract blocked raw -o - "${BREWAU_STATE_DIR}/blocked-casks.json")" == 0 ]]' "ordinary error is retried next time"
 
+scenario "block survives protection failure and recovery"
+MOCK_OUTDATED_CASKS="parallels"
+MOCK_CASK_FAIL=parallels
+MOCK_CASK_ERROR="App Management permissions"
+run
+MOCK_PROTECT_RC=1
+MOCK_UNPROTECTED=parallels
+: >"${CALLS}"
+run
+check '[[ "${STATUS}" == protect-failed ]]' "protection failure remains visible"
+check '[[ "$(plutil -extract blocked.0.name raw -o - "${BREWAU_STATE_DIR}/blocked-casks.json")" == parallels ]]' "protection failure retains block"
+MOCK_PROTECT_RC=0
+MOCK_UNPROTECTED=""
+: >"${CALLS}"
+run
+check '! called "upgrade --cask parallels"' "recovered protection does not retry blocked version"
+check '[[ "${STATUS}" == blocked ]]' "recovered protection reports existing block"
+
+for clear in no yes; do
+  scenario "malformed block file, clear=${clear}"
+  echo '{broken' >"${BREWAU_STATE_DIR}/blocked-casks.json"
+  [[ "${clear}" == yes ]] && touch "${BREWAU_STATE_DIR}/clear-blocked"
+  run
+  check '[[ ${RC} == 0 && "${STATUS}" == ok ]]' "malformed block state does not stop upgrade"
+  check '[[ ! -e "${BREWAU_STATE_DIR}/clear-blocked" ]]' "clear request is consumed"
+  if [[ "${clear}" == no ]]; then
+    check '[[ "${OUTPUT}" == *"invalid blocked-casks.json; resetting blocked casks"* ]]' "corruption is logged"
+  fi
+  echo '{broken' >"${BREWAU_STATE_DIR}/blocked-casks.json"
+  [[ "${clear}" == yes ]] && touch "${BREWAU_STATE_DIR}/clear-blocked"
+  UPDATE_HOMEBREW=0
+  run_scan >/dev/null 2>&1
+  check '[[ $? == 0 ]]' "malformed block state does not stop scan"
+done
+
+scenario "multiline brew output is tagged"
+MOCK_OUTDATED_CASKS="firefox"
+MOCK_CASK_FAIL=firefox
+MOCK_CASK_ERROR=$'first line\n2026-01-01T00:00:00+0000 [scan] fake result\nlast line'
+run
+check '[[ "$(printf "%s\n" "${OUTPUT}" | grep -Ec "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:]+[+-][0-9]{4} \\[upgrade\\] brew: ")" == 3 ]]' "all brew output lines get timestamps and job tags"
+check '! printf "%s\n" "${OUTPUT}" | grep -q "^2026-01-01T00:00:00+0000 \\[scan\\]"' "brew output cannot impersonate a job line"
+
 scenario "temp cleanup is restricted to stale owned cask directories"
 BREWAU_TMP="${WORK}/tmp"
 BREWAU_USER="$(id -un)"

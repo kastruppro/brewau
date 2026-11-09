@@ -27,6 +27,13 @@ log() {
   echo "$(date '+%Y-%m-%dT%H:%M:%S%z') [${BREWAU_JOB:-upgrade}] $*"
 }
 
+log_output() {
+  local line
+  while IFS= read -r line || [[ -n "${line}" ]]; do
+    log "brew: ${line}"
+  done
+}
+
 brew_run() {
   (brewau_exec_brew "$@")
 }
@@ -34,12 +41,29 @@ brew_run() {
 # last-result.json: UTC finished, job, status, reason, and upgraded/failed/blocked
 # arrays of {name, kind, version, reason}; blocked adds installed for retry matching.
 result_init() {
+  local file="${BREWAU_STATE_DIR}/blocked-casks.json" blocked count i field valid=1
+  if [[ -e "${BREWAU_STATE_DIR}/clear-blocked" ]]; then
+    rm -f "${file}" "${BREWAU_STATE_DIR}/clear-blocked" || return 1
+  fi
   RESULT="${BREWAU_STATE_DIR}/last-result.json.tmp"
   printf '{"upgraded":[],"failed":[],"blocked":[]}' >"${RESULT}" || return 1
-  if [[ -r "${BREWAU_STATE_DIR}/blocked-casks.json" ]]; then
-    local blocked
-    blocked="$(plutil -extract blocked json -o - "${BREWAU_STATE_DIR}/blocked-casks.json")" || return 1
-    plutil -replace blocked -json "${blocked}" "${RESULT}" || return 1
+  if [[ -r "${file}" ]]; then
+    blocked="$(plutil -extract blocked json -o - "${file}" 2>/dev/null)" || valid=0
+    count="$(plutil -extract blocked raw -o - "${file}" 2>/dev/null)" || valid=0
+    [[ "${blocked}" == \[* && "${count}" =~ ^[0-9]+$ ]] || valid=0
+    if [[ ${valid} == 1 ]]; then
+      for ((i=0; i<count; i++)); do
+        for field in name kind version reason installed; do
+          plutil -extract "blocked.${i}.${field}" raw -o - "${file}" >/dev/null 2>&1 || valid=0
+        done
+      done
+    fi
+    if [[ ${valid} == 1 ]]; then
+      plutil -replace blocked -json "${blocked}" "${RESULT}" || return 1
+    else
+      log "invalid blocked-casks.json; resetting blocked casks"
+      rm -f "${file}" || return 1
+    fi
   fi
 }
 
@@ -208,9 +232,6 @@ run_upgrade() {
   local status="ok" greedy="" formulae="" casks="" output json name
   local upgraded="" reason=ok version installed kind item_reason package_greedy
   result_init || return 1
-  if [[ -f "${BREWAU_STATE_DIR}/clear-blocked" ]]; then
-    rm -f "${BREWAU_STATE_DIR}/blocked-casks.json" "${BREWAU_STATE_DIR}/clear-blocked" || return 1
-  fi
   if ! network_available; then
     log "offline, skipped"
     log "done (offline)"
@@ -268,6 +289,10 @@ run_upgrade() {
         [[ "${name##*/}" == "brewau" ]] && continue
         if [[ ${protect_rc} -eq 2 ]] || brewau_in_words "${name##*/}" "${unprotected}"; then
           version="$(package_field casks "${name}" current_version)" || version="unknown"
+          installed="$(package_field casks "${name}" installed_versions)" || installed='null'
+          if blocked_match "${name}" "${version}" "${installed}"; then
+            result_item blocked "${name}" cask "${version}" app-management "${installed}" || return 1
+          fi
           result_item failed "${name}" cask "${version}" protect-failed || return 1
         else
           casks="${casks} ${name}"
@@ -308,14 +333,14 @@ run_upgrade() {
       log "upgrading ${kind}: ${name}"
       # shellcheck disable=SC2086
       if output="$(brew_run upgrade --${kind} ${package_greedy} "${name}" 2>&1)"; then
-        printf '%s\n' "${output}"
+        log_output <<<"${output}"
         upgraded="${upgraded:+${upgraded} }${name}"
         result_item upgraded "${name}" "${kind}" "${version}" ok || return 1
         if [[ "${kind}" == formula ]]; then
           restart_system_services "${name}" || status=restart-failed
         fi
       else
-        printf '%s\n' "${output}"
+        log_output <<<"${output}"
         item_reason=brew-error
         if [[ "${kind}" == cask ]] && { [[ "${output}" == *"App Management permissions"* ]] ||
           printf '%s\n' "${output}" | /usr/bin/grep -Eq '/Applications/[^[:cntrl:]]+\.app[^[:cntrl:]]*Operation not permitted|Operation not permitted[^[:cntrl:]]*/Applications/[^[:cntrl:]]+\.app'; }; then
