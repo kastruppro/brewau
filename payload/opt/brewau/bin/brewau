@@ -72,6 +72,22 @@ blocked_guidance() {
   echo "Skipped until a newer version or manual upgrade; retry with: sudo brewau clear-blocked"
 }
 
+status_errors() {
+  local file count i stage reason job
+  for job in upgrade scan; do
+    if [[ "${job}" == upgrade ]]; then file="${BREWAU_STATE_DIR}/last-result.json";
+    else file="${BREWAU_STATE_DIR}/last-scan-result.json"; fi
+    [[ -r "${file}" ]] || continue
+    count="$(plutil -extract errors raw -o - "${file}" 2>/dev/null)" || continue
+    [[ "${count}" =~ ^[0-9]+$ ]] || continue
+    for ((i=0; i<count; i++)); do
+      stage="$(plutil -extract "errors.${i}.stage" raw -o - "${file}")" || continue
+      reason="$(plutil -extract "errors.${i}.reason" raw -o - "${file}")" || continue
+      printf 'Error (%s): %s (%s)\n' "${job}" "${stage}" "${reason}"
+    done
+  done
+}
+
 cmd_status() {
   brewau_load_config
   echo "brewau ${VERSION}"
@@ -95,6 +111,7 @@ cmd_status() {
   else
     echo "Last run:   never"
   fi
+  status_errors
   blocked_guidance
   echo "Taps:       homebrew/* ${ALLOWED_TAPS}"
   if brewau_tap_allowed "${BREWAU_TAP}"; then

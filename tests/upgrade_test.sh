@@ -39,6 +39,8 @@ json_entries() {
 brew_run() {
   echo "$*" >>"${CALLS}"
   case "$*" in
+    update) return "${MOCK_UPDATE_RC:-0}" ;;
+    cleanup*) return "${MOCK_CLEANUP_RC:-0}" ;;
     "list --formula -1") printf '%s\n' ${MOCK_INSTALLED:-}; return "${MOCK_LIST_RC:-0}" ;;
     "list --pinned --formula") printf '%s\n' ${MOCK_PINNED:-}; return "${MOCK_PINNED_RC:-0}" ;;
     "outdated --json=v2"*)
@@ -72,12 +74,13 @@ launchctl() { [[ "$*" == "print system/homebrew.mxcl.tailscale" || "$*" == "prin
 # scenario <name>: resets state; set MOCK_* and config before calling run.
 scenario() {
   NAME="$1"
+  [[ "${BREWAU_STATE_DIR}" == "${WORK}/state" ]] || { echo "unsafe fixture state directory" >&2; exit 1; }
   rm -rf "${BREWAU_STATE_DIR}" "${CALLS}"
   mkdir -p "${BREWAU_STATE_DIR}"
   touch "${CALLS}"
   unset MOCK_INSTALLED MOCK_PINNED MOCK_LIST_RC MOCK_PINNED_RC MOCK_OUTDATED_FORMULAE \
     MOCK_OUTDATED_CASKS MOCK_OUTDATED_RC MOCK_OUTDATED_PINNED MOCK_UPGRADE_RC MOCK_RESTART_FAILS \
-    MOCK_UNPROTECTED MOCK_PROTECT_RC MOCK_OFFLINE MOCK_CASK_ERROR MOCK_CASK_FAIL
+    MOCK_UNPROTECTED MOCK_PROTECT_RC MOCK_OFFLINE MOCK_CASK_ERROR MOCK_CASK_FAIL MOCK_UPDATE_RC MOCK_CLEANUP_RC
   UPGRADE_EXCLUDE=""
   UPGRADE_GREEDY="0"
 }
@@ -226,7 +229,7 @@ MOCK_OUTDATED_CASKS="postman"
 UPDATE_HOMEBREW=1
 SCAN_OUTPUT="$(run_scan 2>&1)"
 check '[[ $? -eq 0 ]]' "scan succeeds"
-check '[[ "${SCAN_OUTPUT}" == *"[scan] done (status=0)"* ]]' "scan records its job and result"
+check '[[ "${SCAN_OUTPUT}" == *"[scan] done (ok)"* ]]' "scan records its job and result"
 check 'called "update"' "refreshes Homebrew"
 check '! grep -q "^upgrade" "${CALLS}"' "installs nothing"
 check '[[ -s "${BREWAU_STATE_DIR}/updates.json" && -s "${BREWAU_STATE_DIR}/catalog.json" ]]' "publishes both snapshots"
@@ -253,7 +256,7 @@ MOCK_OUTDATED_CASKS="parallels firefox"
 MOCK_CASK_FAIL=parallels
 MOCK_CASK_ERROR="Cannot change ownership because your terminal does not have App Management permissions."
 run
-check '[[ "${STATUS}" == upgrade-failed ]]' "first block reports the failed attempt"
+check '[[ ${RC} == 0 && "${STATUS}" == blocked ]]' "new block is not a job failure"
 check '[[ "$(sed -n "s/^upgraded=//p" "${LAST_RUN}")" == firefox ]]' "only successful cask is upgraded"
 check '[[ "$(plutil -extract blocked.0.name raw -o - "${BREWAU_STATE_DIR}/last-result.json")" == parallels ]]' "JSON attributes block to cask"
 : >"${CALLS}"
@@ -359,6 +362,87 @@ MOCK_CASK_ERROR=$'first line\n2026-01-01T00:00:00+0000 [scan] fake result\nlast 
 run
 check '[[ "$(printf "%s\n" "${OUTPUT}" | grep -Ec "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:]+[+-][0-9]{4} \\[upgrade\\] brew: ")" == 3 ]]' "all brew output lines get timestamps and job tags"
 check '! printf "%s\n" "${OUTPUT}" | grep -q "^2026-01-01T00:00:00+0000 \\[scan\\]"' "brew output cannot impersonate a job line"
+
+scenario "restart failure and a newly discovered block"
+ALLOWED_SERVICES=tailscale
+MOCK_OUTDATED_FORMULAE=tailscale
+MOCK_RESTART_FAILS=tailscale
+MOCK_OUTDATED_CASKS=parallels
+MOCK_CASK_FAIL=parallels
+MOCK_CASK_ERROR="App Management permissions"
+run
+check '[[ ${RC} != 0 && "${STATUS}" == restart-failed ]]' "restart failure outranks new block"
+check '[[ "$(plutil -extract errors.0.stage raw -o - "${BREWAU_STATE_DIR}/last-result.json")" == restart ]]' "restart error retained"
+check '[[ "$(plutil -extract errors raw -o - "${BREWAU_STATE_DIR}/last-result.json")" == 1 ]]' "block is not a job error"
+check '[[ "$(plutil -extract blocked.0.name raw -o - "${BREWAU_STATE_DIR}/last-result.json")" == parallels ]]' "new block retained alongside restart error"
+ALLOWED_SERVICES=""
+
+scenario "pin failure and upgrade failure"
+MOCK_PINNED_RC=1
+MOCK_OUTDATED_FORMULAE=wget
+MOCK_UPGRADE_RC=1
+run
+check '[[ ${RC} != 0 && "${STATUS}" == pin-failed ]]' "first job error determines summary"
+check '[[ "$(plutil -extract errors.0.stage raw -o - "${BREWAU_STATE_DIR}/last-result.json")" == pin ]]' "pin error retained"
+check '[[ "$(plutil -extract errors.1.stage raw -o - "${BREWAU_STATE_DIR}/last-result.json")" == upgrade ]]' "upgrade error appended"
+check '[[ "$(plutil -extract errors raw -o - "${BREWAU_STATE_DIR}/last-result.json")" == 2 ]]' "both independent errors retained"
+
+scenario "enumeration and snapshot failures"
+MOCK_OUTDATED_RC=1
+run
+check '[[ "${STATUS}" == outdated-failed && ${RC} != 0 ]]' "enumeration failure retains precedence"
+check '[[ "$(plutil -extract errors.1.stage raw -o - "${BREWAU_STATE_DIR}/last-result.json")" == snapshot ]]' "later snapshot failure is retained"
+
+scenario "block-only and offline results have no job errors"
+MOCK_OUTDATED_CASKS=parallels
+MOCK_CASK_FAIL=parallels
+MOCK_CASK_ERROR="App Management permissions"
+run
+check '[[ ${RC} == 0 && "${STATUS}" == blocked ]]' "new block-only result succeeds"
+check '[[ "$(plutil -extract errors raw -o - "${BREWAU_STATE_DIR}/last-result.json")" == 0 ]]' "block-only errors is empty"
+MOCK_OFFLINE=1
+run
+check '[[ ${RC} == 0 && "${STATUS}" == blocked ]]' "standing block outranks offline skip"
+check '[[ "$(plutil -extract errors raw -o - "${BREWAU_STATE_DIR}/last-result.json")" == 0 ]]' "offline does not create errors"
+scenario "offline without standing blocks"
+MOCK_OFFLINE=1
+run
+check '[[ ${RC} == 0 && "${STATUS}" == skipped ]]' "offline alone remains skipped"
+check '[[ "$(plutil -extract errors raw -o - "${BREWAU_STATE_DIR}/last-result.json")" == 0 ]]' "offline errors is empty"
+
+scenario "cleanup failure is visible"
+MOCK_CLEANUP_RC=1
+run
+check '[[ ${RC} != 0 && "${STATUS}" == cleanup-failed ]]' "cleanup error fails the run"
+check '[[ "$(plutil -extract errors.0.stage raw -o - "${BREWAU_STATE_DIR}/last-result.json")" == cleanup ]]' "cleanup error recorded"
+
+scenario "scan failures use the same error schema"
+UPDATE_HOMEBREW=1
+MOCK_UPDATE_RC=1
+run_scan >/dev/null 2>&1
+check '[[ $? != 0 ]]' "failed scan update exits nonzero"
+check '[[ "$(plutil -extract errors.0.stage raw -o - "${BREWAU_STATE_DIR}/last-scan-result.json")" == update ]]' "scan update error recorded"
+MOCK_UPDATE_RC=0
+MOCK_OUTDATED_RC=1
+run_scan >/dev/null 2>&1
+check '[[ $? != 0 ]]' "failed scan snapshot exits nonzero"
+check '[[ "$(plutil -extract errors.0.stage raw -o - "${BREWAU_STATE_DIR}/last-scan-result.json")" == snapshot ]]' "scan snapshot error recorded"
+
+# Read both jobs through the CLI consumer, including an old result without errors.
+sed -e "s#^BREWAU_LIBEXEC=.*#BREWAU_LIBEXEC=\"${PAYLOAD}/libexec\"#" -e '/^case "${1:-}" in/,$d' \
+  "${PAYLOAD}/bin/brewau" >"${WORK}/brewau-cli"
+# shellcheck source=/dev/null
+source "${WORK}/brewau-cli"
+BREWAU_STATE_DIR="${WORK}/state"
+LAST_RUN="${BREWAU_STATE_DIR}/last-run"
+scenario "CLI lists every job error"
+printf '%s' '{"errors":[{"stage":"pin","reason":"brew-error"},{"stage":"upgrade","reason":"brew-error"}]}' >"${BREWAU_STATE_DIR}/last-result.json"
+printf '%s' '{"errors":[{"stage":"snapshot","reason":"brew-error"}]}' >"${BREWAU_STATE_DIR}/last-scan-result.json"
+CLI_ERRORS="$(status_errors)"
+check '[[ "${CLI_ERRORS}" == *"Error (upgrade): pin (brew-error)"* && "${CLI_ERRORS}" == *"Error (upgrade): upgrade (brew-error)"* && "${CLI_ERRORS}" == *"Error (scan): snapshot (brew-error)"* ]]' "CLI displays both jobs and all errors"
+printf '%s' '{"status":"ok"}' >"${BREWAU_STATE_DIR}/last-result.json"
+rm "${BREWAU_STATE_DIR}/last-scan-result.json"
+check '[[ -z "$(status_errors)" ]]' "CLI accepts legacy result without errors"
 
 scenario "temp cleanup is restricted to stale owned cask directories"
 BREWAU_TMP="${WORK}/tmp"
