@@ -45,6 +45,7 @@ Administrator commands (run with sudo):
   allow-user <user>   allow a user to run brew
   deny-user <user>    revoke a user's access to brew
   trust-app <app>     trust a cask app again after checking it (see brewau doctor)
+  clear-blocked       retry casks blocked by macOS App Management on the next run
   self-update         update brewau now from its own cask (${BREWAU_CASK})
   move-service-data <user> <formula>
                       copy a service's data from before brewau to where it now runs
@@ -58,6 +59,17 @@ bad() { printf '  \033[31m✗\033[0m %s\n' "$*"; FAILED=1; }
 in_users_group() {
   case " $(id -Gn "${1:-$(id -un)}" 2>/dev/null) " in *" ${BREWAU_USERS_GROUP} "*) return 0 ;; esac
   return 1
+}
+
+blocked_guidance() {
+  local file="${BREWAU_STATE_DIR}/blocked-casks.json" count i
+  [[ -r "${file}" ]] || return 0
+  count="$(plutil -extract blocked raw -o - "${file}" 2>/dev/null)" || return 0
+  [[ "${count}" =~ ^[0-9]+$ && "${count}" -gt 0 ]] || return 0
+  for ((i=0; i<count; i++)); do
+    printf 'Blocked cask: %s (macOS App Management)\n' "$(plutil -extract "blocked.${i}.name" raw -o - "${file}")"
+  done
+  echo "Skipped until a newer version or manual upgrade; retry with: sudo brewau clear-blocked"
 }
 
 cmd_status() {
@@ -83,6 +95,7 @@ cmd_status() {
   else
     echo "Last run:   never"
   fi
+  blocked_guidance
   echo "Taps:       homebrew/* ${ALLOWED_TAPS}"
   if brewau_tap_allowed "${BREWAU_TAP}"; then
     echo "Self-update: after each scheduled upgrade, from ${BREWAU_CASK}"
@@ -117,6 +130,7 @@ cmd_log() {
       *) brewau_die "unknown option ${arg}" ;;
     esac
   done
+  blocked_guidance
   [[ -r "${file}" ]] || brewau_die "no log yet at ${file}"
   if [[ ${follow} -eq 1 ]]; then
     exec tail -n 50 -f "${file}"
@@ -290,7 +304,10 @@ cmd_setup_shell() {
     if [[ "${shell}" == "fish" ]]; then
       printf '\n%s\nfish_add_path --global --move --path %s\n' "${PATH_MARKER}" "${BREWAU_ROOT}/bin" >>"${rc}"
     else
-      printf '\n%s\nexport PATH="%s:${PATH}"\n' "${PATH_MARKER}" "${BREWAU_ROOT}/bin" >>"${rc}"
+      printf '\n%s\n' "${PATH_MARKER}" >>"${rc}"
+      cat >>"${rc}" <<'PATH_EOF'
+export PATH="$(printf '%s' "$PATH" | /usr/bin/awk -v RS=: 'BEGIN { printf "/opt/brewau/bin" } $0 != "/opt/brewau/bin" { printf ":%s", $0 }')"
+PATH_EOF
     fi
     echo "added the wrapper to the end of ${rc}"
   fi
@@ -430,6 +447,11 @@ case "${1:-}" in
     root_command install
     ;;
   reload | allow-user | deny-user | uninstall | trust-app | move-service-data) root_command "$@" ;;
+  clear-blocked)
+    [[ "$(id -u)" -eq 0 ]] || brewau_die "run with sudo: sudo brewau clear-blocked"
+    touch "${BREWAU_STATE_DIR}/clear-blocked" || brewau_die "could not request a retry"
+    echo "Blocked casks will be retried on the next upgrade."
+    ;;
   self-update)
     [[ "$(id -u)" -eq 0 ]] || brewau_die "run with sudo: sudo brewau self-update"
     # The agent holds the operation lock while the package installs.

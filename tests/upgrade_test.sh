@@ -46,6 +46,9 @@ brew_run() {
       printf '{%s, %s}\n' "$(json_entries formulae ${MOCK_OUTDATED_FORMULAE:-})" "$(json_entries casks ${MOCK_OUTDATED_CASKS:-})"
       ;;
     "info --json=v2 --installed --cask") echo '{"casks": []}' ;;
+    "upgrade --cask"*)
+      if [[ "$*" == *"${MOCK_CASK_FAIL:-never}" ]]; then echo "${MOCK_CASK_ERROR:-failure}"; return 1; fi
+      ;;
     "upgrade --formula"*) return "${MOCK_UPGRADE_RC:-0}" ;;
   esac
   return 0
@@ -55,7 +58,12 @@ brewau_protect_installed_apps() {
   [[ -n "${MOCK_UNPROTECTED:-}" ]] && echo "${MOCK_UNPROTECTED}"
   return "${MOCK_PROTECT_RC:-0}"
 }
+# Exercise the production network classification without network access.
+eval "$(declare -f clean_tmp | sed 's/clean_tmp/real_clean_tmp/')"
+eval "$(declare -f network_available | sed 's/network_available/real_network_available/; s#/usr/bin/curl#mock_curl#')"
+mock_curl() { return "${MOCK_CURL_RC}"; }
 clean_tmp() { :; }
+network_available() { [[ "${MOCK_OFFLINE:-0}" == 0 ]]; }
 # Mocked root brew and launchd: tailscale's and db's system daemons are loaded.
 brewau_exec_brew_as_root() { echo "root $*" >>"${CALLS}"; [[ "$*" != *"${MOCK_RESTART_FAILS:-none}"* ]]; }
 brewau_release_service_keg() { echo "release $1" >>"${CALLS}"; }
@@ -69,7 +77,7 @@ scenario() {
   touch "${CALLS}"
   unset MOCK_INSTALLED MOCK_PINNED MOCK_LIST_RC MOCK_PINNED_RC MOCK_OUTDATED_FORMULAE \
     MOCK_OUTDATED_CASKS MOCK_OUTDATED_RC MOCK_OUTDATED_PINNED MOCK_UPGRADE_RC MOCK_RESTART_FAILS \
-    MOCK_UNPROTECTED MOCK_PROTECT_RC
+    MOCK_UNPROTECTED MOCK_PROTECT_RC MOCK_OFFLINE MOCK_CASK_ERROR MOCK_CASK_FAIL
   UPGRADE_EXCLUDE=""
   UPGRADE_GREEDY="0"
 }
@@ -239,6 +247,86 @@ run
 check 'called "upgrade --cask firefox"' "other casks are upgraded"
 check '! grep -q "brewau" "${CALLS}"' "brewau is not upgraded by this job"
 check '[[ -e "${BREWAU_STATE_DIR}/self-update-due" ]]' "and asks for a self-update after the run"
+
+scenario "one cask fails but the other succeeds"
+MOCK_OUTDATED_CASKS="parallels firefox"
+MOCK_CASK_FAIL=parallels
+MOCK_CASK_ERROR="Cannot change ownership because your terminal does not have App Management permissions."
+run
+check '[[ "${STATUS}" == upgrade-failed ]]' "first block reports the failed attempt"
+check '[[ "$(sed -n "s/^upgraded=//p" "${LAST_RUN}")" == firefox ]]' "only successful cask is upgraded"
+check '[[ "$(plutil -extract blocked.0.name raw -o - "${BREWAU_STATE_DIR}/last-result.json")" == parallels ]]' "JSON attributes block to cask"
+: >"${CALLS}"
+run
+check '! called "upgrade --cask parallels"' "same blocked version is skipped"
+check 'called "upgrade --cask firefox"' "other casks continue"
+check '[[ ${RC} == 0 && "${STATUS}" == blocked ]]' "existing block is not another failure"
+touch "${BREWAU_STATE_DIR}/clear-blocked"
+run
+check 'called "upgrade --cask parallels"' "explicit clear retries the cask"
+
+scenario "offline skips upgrade"
+MOCK_OFFLINE=1
+run
+check '[[ ${RC} == 0 && "${STATUS}" == skipped ]]' "offline is not a failure"
+check '! called update' "does not call brew update offline"
+check '[[ "$(plutil -extract reason raw -o - "${BREWAU_STATE_DIR}/last-result.json")" == offline ]]' "offline reason is machine readable"
+
+scenario "curl network classification"
+for MOCK_CURL_RC in 6 7 28; do
+  check '! real_network_available' "curl ${MOCK_CURL_RC} means offline"
+done
+for MOCK_CURL_RC in 0 22 60; do
+  check 'real_network_available' "curl ${MOCK_CURL_RC} is not offline"
+done
+
+scenario "new cask version clears old block"
+MOCK_OUTDATED_CASKS="parallels"
+MOCK_CASK_FAIL=parallels
+MOCK_CASK_ERROR="App Management permissions"
+run
+plutil -replace blocked.0.version -string old "${BREWAU_STATE_DIR}/blocked-casks.json"
+: >"${CALLS}"
+run
+check 'called "upgrade --cask parallels"' "a newer version is tried"
+
+scenario "manual upgrade clears old block"
+MOCK_OUTDATED_CASKS="parallels"
+MOCK_CASK_FAIL=parallels
+MOCK_CASK_ERROR="App Management permissions"
+run
+MOCK_OUTDATED_CASKS=""
+run
+check '[[ "$(plutil -extract blocked raw -o - "${BREWAU_STATE_DIR}/blocked-casks.json")" == 0 ]]' "no longer outdated drops block"
+
+scenario "offline scan reports a skip without erasing the last upgrade"
+MOCK_OFFLINE=1
+UPDATE_HOMEBREW=1
+echo previous >"${LAST_RUN}"
+run_scan >/dev/null 2>&1
+check '[[ $? == 0 ]]' "offline scan succeeds"
+check '[[ "$(cat "${LAST_RUN}")" == previous ]]' "scan preserves last upgrade state"
+check '[[ "$(plutil -extract reason raw -o - "${BREWAU_STATE_DIR}/last-scan-result.json")" == offline ]]' "scan records offline reason"
+check '! called update' "offline scan does not update"
+
+scenario "ordinary cask failure is not blocked"
+MOCK_OUTDATED_CASKS="firefox"
+MOCK_CASK_FAIL=firefox
+MOCK_CASK_ERROR="download failed"
+run
+check '[[ "$(plutil -extract failed.0.reason raw -o - "${BREWAU_STATE_DIR}/last-result.json")" == brew-error ]]' "ordinary failure retains brew-error"
+check '[[ "$(plutil -extract blocked raw -o - "${BREWAU_STATE_DIR}/blocked-casks.json")" == 0 ]]' "ordinary error is retried next time"
+
+scenario "temp cleanup is restricted to stale owned cask directories"
+BREWAU_TMP="${WORK}/tmp"
+BREWAU_USER="$(id -un)"
+mkdir -p "${BREWAU_TMP}/cask-old" "${BREWAU_TMP}/cask-new" "${BREWAU_TMP}/unrelated" "${WORK}/outside"
+ln -s "${WORK}/outside" "${BREWAU_TMP}/cask-link"
+touch -t 202001010000 "${BREWAU_TMP}/cask-old" "${BREWAU_TMP}/unrelated"
+real_clean_tmp
+check '[[ ! -e "${BREWAU_TMP}/cask-old" ]]' "removes stale cask directory"
+check '[[ -d "${BREWAU_TMP}/cask-new" && -d "${BREWAU_TMP}/unrelated" ]]' "preserves fresh and unrelated directories"
+check '[[ -L "${BREWAU_TMP}/cask-link" && -d "${WORK}/outside" ]]' "does not follow symlinks"
 
 echo "${PASS} passed, ${FAIL} failed"
 [[ ${FAIL} -eq 0 ]]

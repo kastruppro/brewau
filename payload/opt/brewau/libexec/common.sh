@@ -56,6 +56,7 @@ FORBIDDEN_FORMULAE=""
 FORBIDDEN_CASKS=""
 EXTRA_ALLOWED_OPTIONS=""
 AUTO_UPGRADE="1"
+CLEANUP_PRUNE_DAYS="1"
 UPGRADE_GREEDY="1"
 UPGRADE_EXCLUDE=""
 ALLOWED_SERVICES=""
@@ -187,7 +188,7 @@ brewau_load_config() {
     [[ "${value}" =~ ^[A-Za-z0-9@/._+=[:space:]-]*$ ]] || brewau_die "${file} line ${n}: invalid value for ${key}"
     case "${key}" in
       ALLOWED_TAPS | FORBIDDEN_FORMULAE | FORBIDDEN_CASKS | EXTRA_ALLOWED_OPTIONS | \
-        AUTO_UPGRADE | UPGRADE_GREEDY | UPGRADE_EXCLUDE | UPGRADE_HOUR | UPGRADE_MINUTE | ALLOWED_SERVICES | \
+        CLEANUP_PRUNE_DAYS | AUTO_UPGRADE | UPGRADE_GREEDY | UPGRADE_EXCLUDE | UPGRADE_HOUR | UPGRADE_MINUTE | ALLOWED_SERVICES | \
         SCAN_MINUTES | UPGRADE_MODE | UPGRADE_INTERVAL_HOURS | UPGRADE_WEEKDAY | UPGRADE_TIMES | UPDATE_HOMEBREW)
         printf -v "${key}" '%s' "${value}"
         ;;
@@ -229,6 +230,10 @@ brewau_config_list() {
 # (or reset to the default) with a warning rather than blocking brew.
 brewau_check_config() {
   local file="$1"
+  if ! [[ "${CLEANUP_PRUNE_DAYS}" =~ ^([0-9]+|all)$ ]]; then
+    brewau_config_problem "CLEANUP_PRUNE_DAYS must be a number of days or all in ${file}" "using 1"
+    CLEANUP_PRUNE_DAYS=1
+  fi
   brewau_config_bool AUTO_UPGRADE 1 "${file}"
   brewau_config_bool UPGRADE_GREEDY 1 "${file}"
   brewau_config_bool UPDATE_HOMEBREW 1 "${file}"

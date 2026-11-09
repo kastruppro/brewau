@@ -14,11 +14,17 @@ case "${1:-}" in
     case "${shell}" in
       zsh)
         echo 'fpath=(/opt/brewau/share/zsh/site-functions ${fpath:#/opt/homebrew/*});'
-        echo "export PATH=\"${BREWAU_ROOT}/bin:\${PATH}\";"
+        echo 'typeset -U path PATH; path=(/opt/brewau/bin ${path:#/opt/brewau/bin}); export PATH;'
         ;;
       fish) echo "fish_add_path --global --move --path ${BREWAU_ROOT}/bin;" ;;
-      csh | tcsh) echo "setenv PATH ${BREWAU_ROOT}/bin:\$PATH;" ;;
-      *) echo "export PATH=\"${BREWAU_ROOT}/bin:\${PATH}\";" ;;
+      csh | tcsh) cat <<'PATH_EOF'
+setenv PATH "`printf '%s' "$PATH" | /usr/bin/awk -v RS=: 'BEGIN { printf "/opt/brewau/bin" } $0 != "/opt/brewau/bin" { printf ":%s", $0 }'`";
+PATH_EOF
+        ;;
+      *) cat <<'PATH_EOF'
+export PATH="$(printf '%s' "$PATH" | /usr/bin/awk -v RS=: 'BEGIN { printf "/opt/brewau/bin" } $0 != "/opt/brewau/bin" { printf ":%s", $0 }')";
+PATH_EOF
+        ;;
     esac
     exit 0
     ;;

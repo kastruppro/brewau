@@ -31,13 +31,83 @@ brew_run() {
   (brewau_exec_brew "$@")
 }
 
+# last-result.json: UTC finished, job, status, reason, and upgraded/failed/blocked
+# arrays of {name, kind, version, reason}; blocked adds installed for retry matching.
+result_init() {
+  RESULT="${BREWAU_STATE_DIR}/last-result.json.tmp"
+  printf '{"upgraded":[],"failed":[],"blocked":[]}' >"${RESULT}" || return 1
+  if [[ -r "${BREWAU_STATE_DIR}/blocked-casks.json" ]]; then
+    local blocked
+    blocked="$(plutil -extract blocked json -o - "${BREWAU_STATE_DIR}/blocked-casks.json")" || return 1
+    plutil -replace blocked -json "${blocked}" "${RESULT}" || return 1
+  fi
+}
+
+result_item() {
+  local array="$1" name="$2" kind="$3" version="$4" reason="$5" installed="${6:-}" item count
+  item='{"name":""}'
+  item="$(plutil -replace name -string "${name}" -o - - <<<"${item}")" || return 1
+  item="$(plutil -insert kind -string "${kind}" -o - - <<<"${item}")" || return 1
+  item="$(plutil -insert version -string "${version}" -o - - <<<"${item}")" || return 1
+  item="$(plutil -insert reason -string "${reason}" -o - - <<<"${item}")" || return 1
+  item="$(plutil -insert installed -string "${installed}" -o - - <<<"${item}")" || return 1
+  item="$(plutil -convert json -o - - <<<"${item}")" || return 1
+  count="$(plutil -extract "${array}" raw -o - "${RESULT}")" || return 1
+  plutil -insert "${array}.${count}" -json "${item}" "${RESULT}"
+}
+
 write_state() {
-  local status="$1" upgraded="$2"
+  local status="$1" upgraded="$2" reason="${3:-brew-error}" finished
+  finished="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  [[ "${status}" == "ok" && "${reason}" != app-management ]] && reason=ok
   {
-    echo "finished=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    echo "finished=${finished}"
     echo "status=${status}"
     echo "upgraded=${upgraded}"
   } >"${LAST_RUN}.tmp" && mv -f "${LAST_RUN}.tmp" "${LAST_RUN}"
+  plutil -insert finished -string "${finished}" "${RESULT}" &&
+    plutil -insert job -string "${BREWAU_JOB:-upgrade}" "${RESULT}" &&
+    plutil -insert status -string "${status}" "${RESULT}" &&
+    plutil -insert reason -string "${reason}" "${RESULT}" &&
+    plutil -convert json "${RESULT}" &&
+    mv -f "${RESULT}" "${RESULT_DEST:-${BREWAU_STATE_DIR}/last-result.json}"
+}
+
+# Only connection failures mean offline; TLS/HTTP problems remain brew errors.
+network_available() {
+  local rc=0
+  /usr/bin/curl -sS -I --connect-timeout 5 --max-time 10 -o /dev/null \
+    https://formulae.brew.sh/api/formula.json 2>/dev/null || rc=$?
+  case "${rc}" in 6 | 7 | 28) return 1 ;; esac
+  return 0
+}
+
+blocked_match() {
+  local name="$1" version="$2" installed="$3" count i file="${BREWAU_STATE_DIR}/blocked-casks.json"
+  [[ -r "${file}" ]] || return 1
+  count="$(plutil -extract blocked raw -o - "${file}" 2>/dev/null)" || return 1
+  [[ "${count}" =~ ^[0-9]+$ ]] || return 1
+  for ((i=0; i<count; i++)); do
+    [[ "$(plutil -extract "blocked.${i}.name" raw -o - "${file}")" == "${name}" &&
+       "$(plutil -extract "blocked.${i}.version" raw -o - "${file}")" == "${version}" &&
+       "$(plutil -extract "blocked.${i}.installed" raw -o - "${file}")" == "${installed}" ]] && return 0
+  done
+  return 1
+}
+
+package_field() {
+  local kind="$1" name="$2" field="$3" count i
+  count="$(plutil -extract "${kind}" raw -o - - <<<"${json}")" || return 1
+  for ((i=0; i<count; i++)); do
+    [[ "$(plutil -extract "${kind}.${i}.name" raw -o - - <<<"${json}")" == "${name}" ]] || continue
+    if [[ "${field}" == current_version ]]; then
+      plutil -extract "${kind}.${i}.${field}" raw -o - - <<<"${json}"
+    else
+      plutil -extract "${kind}.${i}.${field}" json -o - - <<<"${json}"
+    fi
+    return
+  done
+  return 1
 }
 
 # True if formula or cask $1 is in UPGRADE_EXCLUDE. Either may name it with or
@@ -136,11 +206,25 @@ clean_tmp() {
 
 run_upgrade() {
   local status="ok" greedy="" formulae="" casks="" output json name
+  local upgraded="" reason=ok version installed kind item_reason package_greedy
+  result_init || return 1
+  if [[ -f "${BREWAU_STATE_DIR}/clear-blocked" ]]; then
+    rm -f "${BREWAU_STATE_DIR}/blocked-casks.json" "${BREWAU_STATE_DIR}/clear-blocked" || return 1
+  fi
+  if ! network_available; then
+    log "offline, skipped"
+    log "done (offline)"
+    write_state skipped "" offline
+    clean_tmp
+    return 0
+  fi
   [[ "${UPGRADE_GREEDY}" == "1" ]] && greedy="--greedy"
 
   log "brew update"
   if ! brew_run update; then
     write_state "update-failed" ""
+    clean_tmp
+    log "done (update-failed)"
     return 1
   fi
 
@@ -167,6 +251,7 @@ run_upgrade() {
   # otherwise look like "nothing is outdated".
   # shellcheck disable=SC2086
   if json="$(brew_run outdated --json=v2 ${greedy})"; then
+    plutil -replace blocked -json '[]' "${RESULT}" || return 1
     if [[ ${formulae_ok} -eq 1 ]]; then
       if output="$(outdated_names formulae "${json}")"; then
         # shellcheck disable=SC2086
@@ -181,7 +266,12 @@ run_upgrade() {
       for name in $(not_excluded ${output}); do
         # brewau updates itself after this run (SELF_UPDATE_DUE).
         [[ "${name##*/}" == "brewau" ]] && continue
-        [[ ${protect_rc} -ne 2 ]] && ! brewau_in_words "${name##*/}" "${unprotected}" && casks="${casks} ${name}"
+        if [[ ${protect_rc} -eq 2 ]] || brewau_in_words "${name##*/}" "${unprotected}"; then
+          version="$(package_field casks "${name}" current_version)" || version="unknown"
+          result_item failed "${name}" cask "${version}" protect-failed || return 1
+        else
+          casks="${casks} ${name}"
+        fi
       done
     else
       log "could not list outdated casks"
@@ -192,35 +282,80 @@ run_upgrade() {
     status="outdated-failed"
   fi
 
-  if [[ -n "${formulae}" ]]; then
-    log "upgrading formulae: $(echo ${formulae})"
-    # shellcheck disable=SC2086
-    brew_run upgrade --formula ${formulae} || status="upgrade-failed"
-    # shellcheck disable=SC2086
-    restart_system_services ${formulae} || status="restart-failed"
+  # Keep successful packages when another package fails in the same run.
+  for kind in formula cask; do
+    if [[ "${kind}" == formula ]]; then
+      output="${formulae}"
+      package_greedy=""
+    else
+      output="${casks}"
+      package_greedy="${greedy}"
+    fi
+    for name in ${output}; do
+      if [[ "${kind}" == formula ]]; then
+        version="$(package_field formulae "${name}" current_version)" || version='null'
+        installed=""
+      else
+        version="$(package_field casks "${name}" current_version)" || version='null'
+        installed="$(package_field casks "${name}" installed_versions)" || installed='null'
+        if blocked_match "${name}" "${version}" "${installed}"; then
+          result_item blocked "${name}" cask "${version}" app-management "${installed}" || return 1
+          log "${name}: blocked by macOS App Management; skipped"
+          reason=app-management
+          continue
+        fi
+      fi
+      log "upgrading ${kind}: ${name}"
+      # shellcheck disable=SC2086
+      if output="$(brew_run upgrade --${kind} ${package_greedy} "${name}" 2>&1)"; then
+        printf '%s\n' "${output}"
+        upgraded="${upgraded:+${upgraded} }${name}"
+        result_item upgraded "${name}" "${kind}" "${version}" ok || return 1
+        if [[ "${kind}" == formula ]]; then
+          restart_system_services "${name}" || status=restart-failed
+        fi
+      else
+        printf '%s\n' "${output}"
+        item_reason=brew-error
+        if [[ "${kind}" == cask ]] && { [[ "${output}" == *"App Management permissions"* ]] ||
+          printf '%s\n' "${output}" | /usr/bin/grep -Eq '/Applications/[^[:cntrl:]]+\.app[^[:cntrl:]]*Operation not permitted|Operation not permitted[^[:cntrl:]]*/Applications/[^[:cntrl:]]+\.app'; }; then
+          item_reason=app-management
+          result_item blocked "${name}" cask "${version}" "${item_reason}" "${installed}" || return 1
+        fi
+        result_item failed "${name}" "${kind}" "${version}" "${item_reason}" || return 1
+        status=upgrade-failed
+        reason="${item_reason}"
+      fi
+    done
+  done
+  if [[ -n "${casks}" ]] && ! brewau_protect_installed_apps /usr/bin/sudo -n >/dev/null; then
+    status=protect-failed
+    reason=protect-failed
   fi
-  if [[ -n "${casks}" ]]; then
-    log "upgrading casks: $(echo ${casks})"
-    # shellcheck disable=SC2086
-    brew_run upgrade --cask ${greedy} ${casks} || status="upgrade-failed"
-    # The new versions can ship with group/world-writable files.
-    brewau_protect_installed_apps /usr/bin/sudo -n >/dev/null
+  # Replace the block list only after a successful outdated query, so offline
+  # or failed enumeration cannot accidentally clear a block.
+  if [[ "${status}" != outdated-failed ]]; then
+    cp "${RESULT}" "${BREWAU_STATE_DIR}/blocked-casks.json.tmp" &&
+      mv -f "${BREWAU_STATE_DIR}/blocked-casks.json.tmp" "${BREWAU_STATE_DIR}/blocked-casks.json" || return 1
   fi
   [[ -z "${formulae}${casks}" && "${status}" == "ok" ]] && log "everything is up to date"
 
   log "brew cleanup"
-  brew_run cleanup --prune=30 || true
+  brew_run cleanup "--prune=${CLEANUP_PRUNE_DAYS}" || true
   clean_tmp
 
   if ! refresh_snapshot; then
     log "could not refresh the GUI snapshot"
-    [[ "${status}" == "ok" ]] && status="snapshot-failed"
+    if [[ "${status}" == "ok" ]]; then status="snapshot-failed"; reason=brew-error; fi
   fi
 
-  write_state "${status}" "$(echo ${formulae} ${casks})"
+  [[ "${status}" == ok && "${reason}" == app-management ]] && status=blocked
+  [[ "${status}" == protect-failed ]] && reason=protect-failed
+  [[ "${status}" != ok && "${reason}" == ok ]] && reason=brew-error
+  write_state "${status}" "${upgraded}" "${reason}" || return 1
   touch "${SELF_UPDATE_DUE}" || log "could not ask for a brewau self-update"
   log "done (${status})"
-  [[ "${status}" == "ok" ]]
+  [[ "${status}" == "ok" || "${status}" == blocked ]]
 }
 
 # Publish complete JSON files atomically; a failed scan leaves the last good data intact.
@@ -244,14 +379,28 @@ refresh_snapshot() {
 
 run_scan() {
   local BREWAU_JOB="scan" status=0
+  local LAST_RUN="${BREWAU_STATE_DIR}/last-scan" RESULT
+  local RESULT_DEST="${BREWAU_STATE_DIR}/last-scan-result.json"
+  result_init || return 1
+  if ! network_available; then
+    log "offline, skipped"
+    log "done (offline)"
+    write_state skipped "" offline
+    clean_tmp
+    return 0
+  fi
   if [[ "${UPDATE_HOMEBREW}" == "1" ]]; then
     log "brew update (scan)"
     if ! brew_run update; then
       log "done (update-failed)"
+      write_state update-failed "" brew-error
+      clean_tmp
       return 1
     fi
   fi
   refresh_snapshot || status=$?
+  if [[ ${status} == 0 ]]; then write_state ok "" ok; else write_state snapshot-failed "" brew-error; fi
+  clean_tmp
   log "done (status=${status})"
   return "${status}"
 }
@@ -260,7 +409,9 @@ run_scan() {
 # when started with `brewau run`.
 main() {
   [[ "$(id -un)" == "${BREWAU_USER}" ]] || brewau_die "brewau-upgrade must run as ${BREWAU_USER}"
+  trap clean_tmp EXIT
   brewau_load_config
+  result_init || exit 1
   if ! brewau_cache_forbidden_taps; then
     log "could not determine which taps to block; not running brew"
     write_state "tap-check-failed" ""

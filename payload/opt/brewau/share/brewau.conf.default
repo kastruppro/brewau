@@ -40,3 +40,6 @@ UPGRADE_INTERVAL_HOURS="1"
 UPGRADE_WEEKDAY="2"
 # For daily at 03:00 and 15:00: "180 900".
 UPGRADE_TIMES=""
+
+# Remove cached downloads older than this many days (or all).
+CLEANUP_PRUNE_DAYS="1"

@@ -51,6 +51,10 @@ value() {
 
 expect valid valid "$(cat "${HERE}/../payload/opt/brewau/share/brewau.conf.default")"
 expect valid valid 'ALLOWED_TAPS="acme/tools other/tap"' 'UPGRADE_HOUR="08"' 'UPGRADE_MINUTE="59"'
+expect valid valid 'CLEANUP_PRUNE_DAYS="all"'
+expect valid valid 'CLEANUP_PRUNE_DAYS="1"'
+expect invalid valid 'CLEANUP_PRUNE_DAYS="-1"'
+expect invalid valid 'CLEANUP_PRUNE_DAYS="tomorrow"'
 expect valid valid 'UPGRADE_EXCLUDE="node@22 libxml++3 acme/tools/thing"'
 
 # Anything that could hide or change a restriction is always fatal.
