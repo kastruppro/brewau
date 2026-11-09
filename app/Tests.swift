@@ -196,7 +196,7 @@ import Darwin
         check(runNotice(job: "scan", succeeded: false, result: staleOffline) == .silent, "while its own offline run stays quiet")
 
         // --- the per-run channel leaves standing blocks to the per-package channel ----
-        check(blocked.isBlockOnly && runNotice(job: "upgrade", succeeded: false, result: blocked) == .silent,
+        check(blocked.isBlockOnly(succeeded: false) && runNotice(job: "upgrade", succeeded: false, result: blocked) == .silent,
               "The first block does not also raise the ordinary failure banner")
         check(runNotice(job: "upgrade", succeeded: true, result: standingBlock) == .silent,
               "A standing block does not announce a finished upgrade")
@@ -204,7 +204,7 @@ import Darwin
               "A failing retry does not explain the block again")
         check(runNotice(job: "upgrade", succeeded: false, result: brewError) == .failure, "An unrelated failure is still notified")
         let mixed = try RunResult.decode(Data(#"{"upgraded":[],"failed":[{"name":"parallels","kind":"cask","version":"1","reason":"app-management","installed":""},{"name":"ffmpeg","kind":"formula","version":"8.0","reason":"brew-error","installed":""}],"blocked":[{"name":"parallels","kind":"cask","version":"1","reason":"app-management","installed":""}],"job":"upgrade","status":"upgrade-failed","reason":"brew-error"}"#.utf8))
-        check(!mixed.isBlockOnly && runNotice(job: "upgrade", succeeded: false, result: mixed) == .failure, "A failure next to a block is notified")
+        check(!mixed.isBlockOnly(succeeded: false) && runNotice(job: "upgrade", succeeded: false, result: mixed) == .failure, "A failure next to a block is notified")
         check(mixed.danishSummary(includingBlocks: false) == "ffmpeg kunne ikke opdateres, fordi Homebrew meldte en fejl. Se loggen for detaljer.",
               "and its banner leaves the block to the block banner")
         check(mixed.danishSummary()?.contains("App Management") == true, "while the menu still explains both")
@@ -214,6 +214,52 @@ import Darwin
         check(runNotice(job: "upgrade", succeeded: true, result: nil) == .upgradeFinished, "Without a result file the old behaviour stands")
         check(runNotice(job: "scan", succeeded: true, result: didUpgrade) == .updatesAvailable, "A finished scan reports what it found")
         check(runNotice(job: "scan", succeeded: true, result: offline) == .silent, "An offline scan reports nothing")
+
+        // --- a standing block never hides a failure of its own run -------------------
+        // The job keeps one status per run and leaves reason=app-management from the skipped
+        // cask, so these runs look block-only in everything but their status.
+        let standingItem = #"{"name":"parallels","kind":"cask","version":"26.2.1","reason":"app-management","installed":"x"}"#
+        func besideBlock(_ status: String, _ reason: String, upgraded: String = "", failed: String = "") throws -> RunResult {
+            var json = #"{"upgraded":["# + upgraded + #"],"failed":["# + failed + "],"
+            json += #""blocked":["# + standingItem + #"],"finished":"2026-11-09T09:00:00Z","job":"upgrade","#
+            json += #""status":""# + status + #"","reason":""# + reason + #""}"#
+            return try RunResult.decode(Data(json.utf8))
+        }
+        let formulaUpgraded = #"{"name":"tailscale","kind":"formula","version":"1.90","reason":"ok","installed":""}"#
+        let restartBeside = try besideBlock("restart-failed", "app-management", upgraded: formulaUpgraded)
+        check(!restartBeside.statusIsBlockOnly && !restartBeside.isBlockOnly(succeeded: false), "restart-failed is not explained by a block")
+        check(runNotice(job: "upgrade", succeeded: false, result: restartBeside) == .failure, "A failed service restart beside a block is notified")
+        check(restartBeside.danishHeadline == "Opdateringen mislykkedes", "and keeps the failure headline")
+        check(restartBeside.danishSummary()?.hasPrefix("En systemtjeneste kunne ikke genstartes") == true, "and is named before the block")
+        check(restartBeside.danishSummary()?.contains("App Management") == true, "while the block is still explained")
+        check(restartBeside.logSummary.contains("status restart-failed"), "and upgrade.log records the status too")
+
+        let protectBeside = try besideBlock("protect-failed", "protect-failed")
+        check(runNotice(job: "upgrade", succeeded: false, result: protectBeside) == .failure, "A protection failure beside a block is notified")
+        let snapshotBeside = try besideBlock("snapshot-failed", "brew-error")
+        check(runNotice(job: "upgrade", succeeded: false, result: snapshotBeside) == .failure, "A snapshot failure beside a block is notified")
+        let pinBeside = try besideBlock("pin-failed", "app-management")
+        check(runNotice(job: "upgrade", succeeded: false, result: pinBeside) == .failure, "A pin failure beside a block is notified")
+        check(pinBeside.danishSummary()?.hasPrefix("brewau kunne ikke bekræfte") == true, "and has its own wording")
+        let outdatedBeside = try besideBlock("outdated-failed", "app-management")
+        check(runNotice(job: "upgrade", succeeded: false, result: outdatedBeside) == .failure, "A failed outdated query beside a block is notified")
+        // A cask can be both blocked and unprotected; the protection failure is its own.
+        let blockedAndUnprotected = try besideBlock("ok", "ok", failed: #"{"name":"parallels","kind":"cask","version":"26.2.1","reason":"protect-failed","installed":""}"#)
+        check(blockedAndUnprotected.otherFailures.count == 1, "A protection failure is not filtered out with the block of the same cask")
+        check(blockedAndUnprotected.danishSummary()?.contains("ikke kunne sikres") == true, "and is explained")
+        // The scheduler's verdict has to agree with the status it reports.
+        check(!standingBlock.isBlockOnly(succeeded: false), "A run that exited non-zero is not a standing block")
+        check(standingBlock.isBlockOnly(succeeded: true), "while its own successful run is")
+        check(!blocked.isBlockOnly(succeeded: true), "and a discovered block did not succeed")
+        // A formula upgrade could have had its restart failure overwritten by the block.
+        let blockAfterFormula = try besideBlock("upgrade-failed", "app-management", upgraded: formulaUpgraded,
+                                                failed: #"{"name":"parallels","kind":"cask","version":"26.2.1","reason":"app-management","installed":"x"}"#)
+        check(!blockAfterFormula.isBlockOnly(succeeded: false), "A block discovered after a formula upgrade keeps its banner")
+        check(runNotice(job: "upgrade", succeeded: false, result: blockAfterFormula) == .failure, "so an overwritten restart failure cannot be lost")
+        let blockAfterCask = try besideBlock("upgrade-failed", "app-management", upgraded: #"{"name":"firefox","kind":"cask","version":"145.0","reason":"ok","installed":""}"#,
+                                             failed: #"{"name":"parallels","kind":"cask","version":"26.2.1","reason":"app-management","installed":"x"}"#)
+        check(blockAfterCask.isBlockOnly(succeeded: false), "while casks alone cannot have hidden one")
+        check(runNotice(job: "upgrade", succeeded: false, result: blockAfterCask) == .silent, "and that run stays silent")
 
         // --- a one-shot notification survives a permission granted later -------------
         var ledger = OneShotNotice()

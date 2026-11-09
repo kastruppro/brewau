@@ -283,17 +283,36 @@ struct RunResult: Equatable, Sendable {
     var isFailure: Bool { !["ok", "blocked", "skipped", ""].contains(status) }
     /// Casks macOS App Management keeps the background job from upgrading.
     var appManagementBlocks: [RunResultItem] { blocked.filter { $0.reason == "app-management" } }
-    /// Failures that are not already explained by a block.
-    var otherFailures: [RunResultItem] {
-        let names = Set(appManagementBlocks.map(\.name))
-        return failed.filter { !names.contains($0.name) }
-    }
+    /// Failures that are not the block itself. The job records a blocked cask in both arrays
+    /// with the same reason, while the same cask can separately fail to be protected, which
+    /// is its own problem and must not be filtered out with the block.
+    var otherFailures: [RunResultItem] { failed.filter { $0.reason != "app-management" } }
     var hasSomethingToReport: Bool { isOffline || isFailure || !appManagementBlocks.isEmpty }
+    /// True when the run's own status is fully accounted for by App Management. The job
+    /// publishes `blocked` once a block is standing and `upgrade-failed` on the run that
+    /// discovers it, both with reason `app-management`. Every other non-ok status means
+    /// something else went wrong in the same run — a service that would not restart, a
+    /// snapshot, pin or protection failure — even though `reason` can still read
+    /// `app-management` because the skipped cask set it.
+    var statusIsBlockOnly: Bool {
+        reason == "app-management" && otherFailures.isEmpty && !appManagementBlocks.isEmpty
+            && (status == "blocked" || status == "upgrade-failed")
+    }
     /// Everything this run has to say is that App Management blocks a cask. The block is
     /// announced once per package and version by its own channel, so the per-run channel
     /// stays quiet: otherwise the first block raises two banners, every standing-block run
     /// afterwards claims an upgrade finished, and every failing retry explains it again.
-    var isBlockOnly: Bool { !isOffline && otherFailures.isEmpty && !appManagementBlocks.isEmpty }
+    /// `succeeded` is the scheduler's verdict, which must agree: `blocked` exits 0 and
+    /// `upgrade-failed` exits 1.
+    func isBlockOnly(succeeded: Bool) -> Bool {
+        guard statusIsBlockOnly else { return false }
+        if succeeded { return status == "blocked" }
+        guard status == "upgrade-failed" else { return false }
+        // The job keeps one status per run, so a cask blocked after a formula's service
+        // failed to restart overwrites restart-failed. A run that upgraded a formula could
+        // be hiding that, and keeps its failure banner.
+        return upgraded.allSatisfy(\.isCask)
+    }
 
     /// Danish explanation for the menu, or nil when the run needs no comment.
     /// `displayName` turns a package into the app name the user recognises.
@@ -313,16 +332,22 @@ struct RunResult: Equatable, Sendable {
                 parts.append("\(name) kunne ikke opdateres, fordi Homebrew meldte en fejl. Se loggen for detaljer.")
             }
         }
+        // A job-level failure has no package of its own (nothing is recorded in `failed` for
+        // a service that would not restart, or for a snapshot, pin or protection failure).
+        // It must still be named, also when a standing block would otherwise explain the run.
+        if isFailure, otherFailures.isEmpty, !statusIsBlockOnly {
+            parts.append(RunResult.danishStatus(status, job: job))
+        }
         if includingBlocks, let blocks = RunResult.danishBlocks(appManagementBlocks.map(displayName)) { parts.append(blocks) }
-        if parts.isEmpty, isFailure { parts.append(RunResult.danishStatus(status, job: job)) }
         return parts.isEmpty ? nil : parts.joined(separator: " ")
     }
 
     /// Short Danish headline for the menu, or nil when the run needs no headline of its own.
     var danishHeadline: String? {
         // A run whose only problem is App Management is reported as blocked, not as a failure,
-        // also on the first run: there is nothing for the user to retry blindly.
-        if isFailure, !otherFailures.isEmpty || appManagementBlocks.isEmpty {
+        // also on the first run: there is nothing for the user to retry blindly. A failure the
+        // block does not account for keeps the failure headline.
+        if isFailure, !statusIsBlockOnly {
             return job == "scan" ? "Scanningen mislykkedes" : "Opdateringen mislykkedes"
         }
         if !appManagementBlocks.isEmpty {
@@ -340,7 +365,10 @@ struct RunResult: Equatable, Sendable {
         for item in appManagementBlocks {
             parts.append("\(item.name) \(item.version): blocked by macOS App Management, skipped until a newer version or a manual upgrade")
         }
-        if parts.isEmpty { parts.append("status \(status.isEmpty ? "unknown" : status) (reason \(reason.isEmpty ? "unknown" : reason))") }
+        // A job-level failure has no package to name, so the status itself has to carry it.
+        if parts.isEmpty || (isFailure && otherFailures.isEmpty && !statusIsBlockOnly) {
+            parts.append("status \(status.isEmpty ? "unknown" : status) (reason \(reason.isEmpty ? "unknown" : reason))")
+        }
         return parts.joined(separator: "; ")
     }
 
@@ -361,6 +389,7 @@ struct RunResult: Equatable, Sendable {
         case "snapshot-failed": return "Opdateringslisten kunne ikke gemmes. Se loggen for detaljer."
         case "restart-failed": return "En systemtjeneste kunne ikke genstartes efter opdateringen. Se loggen for detaljer."
         case "protect-failed": return "Apps i /Applications kunne ikke sikres efter opdateringen. Se loggen for detaljer."
+        case "pin-failed": return "brewau kunne ikke bekræfte, at udelukkede pakker er fastlåst, og sprang formulae over. Se loggen for detaljer."
         case "tap-check-failed": return "brewau kunne ikke afgøre, hvilke taps der er tilladt, og kørte ikke Homebrew."
         default: return job == "scan" ? "Scanningen mislykkedes. Se loggen for detaljer." : "Opdateringen mislykkedes. Se loggen for detaljer."
         }
@@ -418,8 +447,9 @@ enum RunNotice: Equatable, Sendable {
 func runNotice(job: String, succeeded: Bool, result: RunResult?) -> RunNotice {
     // No network: nothing was changed and nothing is worth a banner.
     if result?.isOffline == true { return .silent }
-    // A standing App Management block has its own once-per-version banner.
-    if result?.isBlockOnly == true { return .silent }
+    // A standing App Management block has its own once-per-version banner. Only a run the
+    // block fully accounts for is silent; a failure beside it is still reported.
+    if result?.isBlockOnly(succeeded: succeeded) == true { return .silent }
     if !succeeded { return .failure }
     guard job == "upgrade" else { return .updatesAvailable }
     // A run that installed nothing is not news. Without a result file (an older brewau)
