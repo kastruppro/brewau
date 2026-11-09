@@ -14,6 +14,18 @@ versions. Pinned and excluded packages stay visible and are labeled. **Opdater
 alle** starts the existing protected upgrade flow. **Vis log** opens the service
 log. Work runs independently of the GUI.
 
+A finished run is described by what the service recorded, not by a generic failure:
+`state/last-result.json` (upgrades) and `state/last-scan-result.json` (scans) name the
+packages that were upgraded, failed or blocked, and why. The popover names the package
+and the reason. A run that found no network is reported as skipped, not as a failure.
+Both files are optional: a brewau that has not written them yet leaves the GUI on its
+previous information.
+
+A cask that macOS App Management keeps the background job from replacing is reported
+once, as blocked: it is skipped until a newer version appears or the user upgrades it
+by hand. **Åbn Systemindstillinger…** opens Anonymitet og sikkerhed › App-administration,
+and **Prøv igen** asks the helper to drop the block list and starts a new upgrade.
+
 - **Tidsplan:** scans every 15/30 minutes, 1/6/12 hours or daily. Upgrades can run
   by hour interval, daily, or weekly, with up to 24 distinct local times. Press
   **Gem** to apply the schedule. Schedules and Homebrew preferences apply to all
@@ -24,7 +36,9 @@ log. Work runs independently of the GUI.
   after a 15-second grace period. The allowlist is tied to cask, app path and bundle
   identity. Failed or refused restarts are reported and do not spin in a retry loop.
 - **Notifikationer:** separately select discovery, completion, restart and failure
-  events. Request macOS permission from this page; a denied permission is shown.
+  events. A blocked package is notified once per package and version, not on every
+  scheduled run, and a run without network is not notified at all.
+  Request macOS permission from this page; a denied permission is shown.
   Login startup uses `SMAppService.mainApp` and reflects the actual system status.
 - **Homebrew:** refresh Homebrew before scanning, include self-updating apps, and
   repair terminal completions. Homebrew itself always updates before upgrading.
@@ -73,14 +87,30 @@ make release               # Developer ID signatures, notarization, stapling
 The privileged helper accepts only eight validated schedule preferences as JSON
 on stdin. It cannot edit taps, forbidden packages, allowed services, arbitrary
 files, commands or paths. Only `brewau_users` receive sudo access to its fixed
-`configure` and `completions` entry points; root remains responsible for access
-policy. Settings are parsed as data and atomically replaced. The helper and GUI
+`configure`, `completions` and `clear-blocked` entry points; root remains
+responsible for access policy. Settings are parsed as data and atomically
+replaced. `clear-blocked` takes no arguments and only creates the state marker
+that makes the next upgrade retry blocked casks; it opens that path with
+`O_NOFOLLOW` and never truncates, so a symlink in the `_brewau`-owned state
+directory cannot aim root at another file. The helper and GUI
 are separate arm64 executables with hardened runtime signing for release.
 
 Changing preferences does not reload or kill running workers. Installer preflight
 and daemon reload refuse to replace an active worker. The upgrade flow preserves
 app protection and signature verification, and forces noninteractive confirmation
 and no automatic cask quitting using Homebrew's supported environment settings.
+
+The app, the scheduler and the helper log operations, failures and privileged calls
+to the unified log under subsystem `com.kastruppro.brewau`, in the categories `app`,
+`agent` and `helper`:
+
+```sh
+log show --last 1h --predicate 'subsystem == "com.kastruppro.brewau"'
+```
+
+Lines carry package names, job names and exit codes only; no secrets, file contents
+or environments. The scheduler's own lines in `/opt/brewau/var/log/upgrade.log` are
+English and use the same `<timestamp> [<job>] <message>` shape as the shell layer.
 
 The original visual prototype remains in `mockup/` for design reference and is
 not included in the installer.

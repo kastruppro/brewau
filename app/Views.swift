@@ -74,9 +74,22 @@ struct UpdatePopover: View {
                         }.padding(12).background(Color.orange.opacity(0.1), in: RoundedRectangle(cornerRadius: 8))
                     }
                     VStack(alignment: .leading, spacing: 6) {
-                        Text(!model.installed ? "Tjenesten skal opdateres" : model.failed ? "Kørsel mislykkedes" : !model.hasScanned ? "Klar til scanning" : model.updates.isEmpty ? "Alt er opdateret" : "\(model.updates.count) opdateringer klar")
-                            .font(.system(size: 20, weight: .semibold))
+                        Text(model.headline).font(.system(size: 20, weight: .semibold))
                         Text(model.status).font(.system(size: 11)).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                    }
+                    if let blocked = model.blockedMessage {
+                        VStack(alignment: .leading, spacing: 8) {
+                            Label("macOS blokerer opdateringen", systemImage: "exclamationmark.shield.fill")
+                                .font(.system(size: 12, weight: .semibold)).foregroundStyle(.orange)
+                            Text(blocked).font(.system(size: 11)).fixedSize(horizontal: false, vertical: true)
+                            HStack {
+                                Spacer()
+                                Button("Åbn Systemindstillinger…") { model.openAppManagementSettings() }
+                                Button(model.clearingBlocked ? "Prøver igen…" : "Prøv igen") { Task { await model.retryBlocked() } }
+                                    .buttonStyle(.borderedProminent)
+                                    .disabled(model.busy || model.clearingBlocked || !model.installed)
+                            }.controlSize(.small)
+                        }.padding(12).background(Color.orange.opacity(0.1), in: RoundedRectangle(cornerRadius: 8))
                     }
                     if !model.updates.isEmpty {
                         HStack {
@@ -90,6 +103,9 @@ struct UpdatePopover: View {
                                 VStack(alignment: .leading, spacing: 3) {
                                     Text(model.name(for: update)).font(.system(size: 12, weight: .medium))
                                     if update.blocked { Text("Fastlåst eller udelukket").font(.system(size: 10)).foregroundStyle(.secondary) }
+                                    else if model.appManagementBlock(for: update) != nil {
+                                        Text("Blokeret af macOS App Management").font(.system(size: 10)).foregroundStyle(.orange)
+                                    }
                                 }
                                 Spacer(minLength: 4)
                                 HStack(spacing: 5) {

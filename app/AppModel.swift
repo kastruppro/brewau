@@ -30,6 +30,11 @@ struct PendingApp: Identifiable {
     @Published var restarting: Set<String> = []
     @Published var repairStatus: String?
     @Published var homebrewVersion = "Ukendt"
+    @Published var upgradeResult: RunResult?
+    @Published var scanResult: RunResult?
+    @Published var clearingBlocked = false
+    /// Which job the newest finished run belonged to, so the headline describes that run.
+    @Published var lastRunJob: String?
     @Published var notificationPreferences = NotificationPreferences() { didSet { savePreferences() } }
     @Published var forceAllowed: Set<String> = [] { didSet { savePreferences() } }
     private let defaults = UserDefaults.standard
@@ -65,6 +70,47 @@ struct PendingApp: Identifiable {
     }
     var availableUpdates: [PackageUpdate] { updates.filter { !$0.blocked } }
     func name(for update: PackageUpdate) -> String { apps.first(where: { $0.token == update.token })?.name ?? update.name }
+    func result(for job: String) -> RunResult? { job == "scan" ? scanResult : upgradeResult }
+    /// Casks the last upgrade could not touch because macOS App Management stops the daemon.
+    var blockedByAppManagement: [RunResultItem] { upgradeResult?.appManagementBlocks ?? [] }
+    func displayName(for item: RunResultItem) -> String { apps.first(where: { $0.token == item.token })?.name ?? item.token }
+    func appManagementBlock(for update: PackageUpdate) -> RunResultItem? {
+        blockedByAppManagement.first { $0.token == update.token }
+    }
+    var blockedMessage: String? { RunResult.danishBlocks(blockedByAppManagement.map { displayName(for: $0) }) }
+    var headline: String {
+        if !installed { return "Tjenesten skal opdateres" }
+        if let line = (lastRunJob.flatMap { result(for: $0) })?.danishHeadline { return line }
+        if failed { return "Kørsel mislykkedes" }
+        if !hasScanned { return "Klar til scanning" }
+        return updates.isEmpty ? "Alt er opdateret" : "\(updates.count) opdateringer klar"
+    }
+    /// Lets a blocked cask be tried again: root drops the block list, then a new run starts.
+    func retryBlocked() async {
+        guard !clearingBlocked, !busy, installed else { return }
+        clearingBlocked = true
+        BrewauLog.app.notice("clearing the blocked cask list")
+        do {
+            _ = try await Task.detached {
+                try runCommand("/usr/bin/sudo", ["-n", "/opt/brewau/libexec/brewau-agent", "clear-blocked"])
+            }.value
+            clearingBlocked = false
+            await request("upgrade")
+        } catch {
+            clearingBlocked = false
+            BrewauLog.app.error("clear-blocked failed: \(error.localizedDescription, privacy: .public)")
+            self.error = error.localizedDescription
+        }
+    }
+    /// Privacy & Security > App Management, where the user can add the background job.
+    func openAppManagementSettings() {
+        BrewauLog.app.notice("opening the App Management privacy settings")
+        for identifier in ["com.apple.settings.PrivacySecurity.extension", "com.apple.preference.security"] {
+            if let url = URL(string: "x-apple.systempreferences:\(identifier)?Privacy_AppBundles"),
+               NSWorkspace.shared.open(url) { return }
+        }
+        error = "Systemindstillinger kunne ikke åbnes. Gå til Anonymitet og sikkerhed › App-administration."
+    }
 
     func refresh() async {
         struct Snapshot: Sendable {
@@ -74,6 +120,8 @@ struct PendingApp: Identifiable {
             var operation: OperationState?
             var lastScan: OperationState?
             var lastUpgrade: OperationState?
+            var upgradeResult: RunResult?
+            var scanResult: RunResult?
             var error: String?
             var installed: Bool
             var homebrew: String
@@ -97,10 +145,16 @@ struct PendingApp: Identifiable {
                 snapshot.operation = try? readOperation(state.appendingPathComponent("operation.json"))
                 snapshot.lastScan = try? readOperation(state.appendingPathComponent("last-scan.json"))
                 snapshot.lastUpgrade = try? readOperation(state.appendingPathComponent("last-upgrade.json"))
+                // Written by brewau-upgrade. Absent before the first run of brewau 0.8.0.
+                snapshot.upgradeResult = readRunResult(state.appendingPathComponent("last-result.json"))
+                snapshot.scanResult = readRunResult(state.appendingPathComponent("last-scan-result.json"))
                 if let version = try? String(contentsOf: state.appendingPathComponent("homebrew-version"), encoding: .utf8) {
                     snapshot.homebrew = version.trimmingCharacters(in: .whitespacesAndNewlines)
                 }
-            } catch { snapshot.error = error.localizedDescription }
+            } catch {
+                BrewauLog.app.error("reading brewau state failed: \(error.localizedDescription, privacy: .public)")
+                snapshot.error = error.localizedDescription
+            }
             return snapshot
         }.value
         installed = snapshot.installed
@@ -119,8 +173,13 @@ struct PendingApp: Identifiable {
             catch { self.error = error.localizedDescription }
         }
         if let updates = snapshot.updates { self.updates = updates; hasScanned = true }
+        upgradeResult = snapshot.upgradeResult
+        scanResult = snapshot.scanResult
         let operation = snapshot.operation
-        failed = snapshot.error != nil || operation?.succeeded == false
+        lastRunJob = operation?.finished == nil ? nil : operation?.kind
+        let result = operation.flatMap { self.result(for: $0.kind) }
+        // A run that found no network changed nothing and is not a failure.
+        failed = snapshot.error != nil || (operation?.succeeded == false && result?.isOffline != true)
         let running = operation?.finished == nil && operation?.processID.map { kill($0, 0) == 0 || errno == EPERM } == true
         busy = running || (requestPendingUntil.map { Date() < $0 } ?? false)
         if running {
@@ -130,7 +189,14 @@ struct PendingApp: Identifiable {
                 requestPendingUntil = nil
                 busy = false
             }
-            status = operation.succeeded == true ? "Sidst tjekket \(finished.formatted(.relative(presentation: .named)))" : (operation.message ?? "Handlingen mislykkedes. Se loggen.")
+            // The result file names the package and the reason; the old message only said
+            // that something failed and pointed at the log.
+            let detail = result?.danishSummary { self.displayName(for: $0) }
+            if operation.succeeded == true {
+                status = detail ?? "Sidst tjekket \(finished.formatted(.relative(presentation: .named)))"
+            } else {
+                status = detail ?? operation.message ?? "Handlingen mislykkedes. Se loggen."
+            }
         } else if operation?.finished == nil && operation != nil && !running {
             status = "Sidste kørsel blev afbrudt. Du kan prøve igen."
         } else if hasScanned { status = "Opdateringslisten er klar" }
@@ -139,8 +205,9 @@ struct PendingApp: Identifiable {
         await refreshNotificationStatus()
         detectPending()
         for event in [snapshot.lastScan, snapshot.lastUpgrade].compactMap({ $0 }) {
-            await notify(event)
+            await notify(event, result: self.result(for: event.kind))
         }
+        await notifyBlocked()
         if !busy { await automaticallyRestartAllowed() }
         refreshLoginStatus()
     }
@@ -149,10 +216,12 @@ struct PendingApp: Identifiable {
         guard !busy, installed else { return }
         busy = true
         requestPendingUntil = Date().addingTimeInterval(15)
+        BrewauLog.app.notice("requesting \(kind, privacy: .public)")
         do {
             _ = try await Task.detached { try runCommand("/opt/brewau/bin/brewau", [kind == "upgrade" ? "run" : "scan"]) }.value
             await refresh()
         } catch {
+            BrewauLog.app.error("\(kind, privacy: .public) could not be started: \(error.localizedDescription, privacy: .public)")
             self.error = error.localizedDescription
             requestPendingUntil = nil
             busy = false
@@ -169,8 +238,12 @@ struct PendingApp: Identifiable {
                 try runCommand("/usr/bin/sudo", ["-n", "/opt/brewau/libexec/brewau-agent", "configure"], input: data)
             }.value
             savedSettings = settings
+            BrewauLog.app.notice("schedule saved")
             await refresh()
-        } catch { self.error = error.localizedDescription }
+        } catch {
+            BrewauLog.app.error("saving the schedule failed: \(error.localizedDescription, privacy: .public)")
+            self.error = error.localizedDescription
+        }
     }
     func setLogin(_ enabled: Bool) {
         do {
@@ -193,17 +266,34 @@ struct PendingApp: Identifiable {
         notificationAllowed = permission.authorizationStatus == .authorized || permission.authorizationStatus == .provisional
         notificationStatus = notificationAllowed ? "Tilladt i macOS" : permission.authorizationStatus == .denied ? "Blokeret i macOS" : "Kræver tilladelse"
     }
-    func notify(_ event: OperationState) async {
+    func notify(_ event: OperationState, result: RunResult?) async {
         guard let finished = event.finished else { return }
         let key = "notified-\(event.kind)"
         guard finished.timeIntervalSince1970 > defaults.double(forKey: key) else { return }
         defaults.set(finished.timeIntervalSince1970, forKey: key)
         guard notificationPreferences.enabled else { return }
+        // A run without network did nothing; it is neither a failure nor news worth a banner.
+        guard result?.isOffline != true else { return }
         var body: String?
-        if event.succeeded == false, notificationPreferences.failure { body = event.message ?? "En opdatering mislykkedes. Åbn brewau for detaljer." }
+        if event.succeeded == false, notificationPreferences.failure {
+            body = result?.danishSummary { self.displayName(for: $0) } ?? event.message ?? "En opdatering mislykkedes. Åbn brewau for detaljer."
+        }
         else if event.kind == "upgrade", notificationPreferences.complete { body = "Opdateringen er færdig.\(pending.isEmpty ? "" : " \(pending.count) apps afventer genstart.")" }
         else if event.kind == "scan", notificationPreferences.available, !availableUpdates.isEmpty { body = "\(availableUpdates.count) opdateringer er klar til installation." }
         if let body { await sendNotification(id: key, title: "brewau", body: body) }
+    }
+    /// A block repeats on every scheduled run, so the banner is tied to the package and the
+    /// version it got stuck on instead of to the run.
+    func notifyBlocked() async {
+        guard notificationPreferences.enabled, notificationPreferences.failure else { return }
+        for item in blockedByAppManagement {
+            let key = "blocked-\(item.name)-\(item.version)"
+            guard !defaults.bool(forKey: key) else { continue }
+            defaults.set(true, forKey: key)
+            BrewauLog.app.notice("reporting blocked package \(item.name, privacy: .public) \(item.version, privacy: .public)")
+            await sendNotification(id: key, title: "\(displayName(for: item)) kunne ikke opdateres",
+                                   body: "macOS App Management blokerer baggrundsjobbet. Åbn brewau for at se, hvad du kan gøre.")
+        }
     }
     func sendNotification(id: String, title: String, body: String) async {
         guard notificationAllowed else { return }
@@ -273,6 +363,7 @@ struct PendingApp: Identifiable {
             }
         }
         guard item.process.isTerminated else {
+            BrewauLog.app.error("\(item.app.token, privacy: .public) would not quit")
             error = "\(item.app.name) kunne ikke afsluttes. Gem dit arbejde, og luk appen selv, eller tillad tvungen genstart i indstillingerne."
             return
         }
