@@ -44,15 +44,31 @@ private let config = root.appendingPathComponent("etc/brewau.conf")
                 try withFileLock(state.appendingPathComponent("operation.lock").path, nonblocking: true) {
                     try perform(CommandLine.arguments[1])
                 }
+            case "clear-blocked":
+                // Root marks the retry because the state directory belongs to _brewau.
+                // The next upgrade drops the block list and tries the casks again.
+                try requireRoot()
+                try requestBlockedRetry()
+                BrewauLog.agent.notice("blocked casks will be retried on the next upgrade")
+                print("Blocked casks will be retried on the next upgrade.")
             default: throw BrewauError.message("Unknown command.")
             }
         } catch {
-            fputs("brewau: \(error.localizedDescription)\n", stderr)
+            if let line = (error as? BrewauError)?.logDescription { fputs("\(line)\n", stderr) }
+            else { fputs("brewau: \(error.localizedDescription)\n", stderr) }
             exit(1)
         }
     }
     static func requireRoot() throws {
         guard getuid() == 0 else { throw BrewauError.message("This command must run as root.") }
+    }
+    /// `O_NOFOLLOW` and no `O_TRUNC`: _brewau owns the directory, so a symlink planted there
+    /// must never make root create or shorten a file somewhere else.
+    static func requestBlockedRetry() throws {
+        let path = state.appendingPathComponent("clear-blocked").path
+        let descriptor = open(path, O_CREAT | O_WRONLY | O_NOFOLLOW | O_CLOEXEC, mode_t(0o644))
+        guard descriptor >= 0 else { throw BrewauError.message("Kunne ikke anmode om et nyt forsøg.") }
+        close(descriptor)
     }
     static func perform(_ request: String) throws {
         let settings = try ScheduleSettings.readConfig(String(contentsOf: config, encoding: .utf8))
@@ -73,6 +89,7 @@ private let config = root.appendingPathComponent("etc/brewau.conf")
         if kind == "upgrade" { try Data(String(now.timeIntervalSince1970).utf8).write(to: state.appendingPathComponent("scan-attempt"), options: .atomic) }
         var operation = OperationState(kind: kind, started: now, processID: getpid())
         try writeJSON(operation, to: state.appendingPathComponent("operation.json"))
+        BrewauLog.agent.notice("\(kind, privacy: .public) started")
         var failure: Error?
         do {
             // Child logs go directly to launchd's log file, not a terminal or a memory buffer.
@@ -84,7 +101,7 @@ private let config = root.appendingPathComponent("etc/brewau.conf")
             child.standardInput = FileHandle.nullDevice
             try child.run()
             child.waitUntilExit()
-            if child.terminationStatus != 0 { throw BrewauError.message("\(kind == "scan" ? "Scanning" : "Opdatering") mislykkedes. Se loggen for detaljer.") }
+            if child.terminationStatus != 0 { throw resultFailure(kind, exit: child.terminationStatus) }
         } catch { failure = error }
         // A fixed root-only command refreshes trusted completion copies after any Homebrew run.
         do { _ = try runCommand("/usr/bin/sudo", ["-n", root.appendingPathComponent("libexec/brewau-agent").path, "completions"]) }
@@ -94,7 +111,31 @@ private let config = root.appendingPathComponent("etc/brewau.conf")
         operation.message = failure?.localizedDescription
         try writeJSON(operation, to: state.appendingPathComponent("operation.json"))
         try writeJSON(operation, to: state.appendingPathComponent("last-\(kind).json"))
-        if let failure { throw failure }
+        if let failure {
+            // resultFailure already carries a tagged English line; anything else (a missing
+            // helper, a failed completions refresh) gets one here so upgrade.log stays uniform.
+            guard (failure as? BrewauError)?.logDescription != nil else {
+                BrewauLog.agent.error("\(kind, privacy: .public) failed: \(failure.localizedDescription, privacy: .public)")
+                throw BrewauError.reported(ui: failure.localizedDescription,
+                                           log: brewauLogLine(kind, "failed: \(failure.localizedDescription)"))
+            }
+            throw failure
+        }
+        // The script already wrote its own lines to upgrade.log; this only mirrors the outcome
+        // into the unified log.
+        let result = readRunResult(state.appendingPathComponent(kind == "scan" ? "last-scan-result.json" : "last-result.json"))
+        BrewauLog.agent.notice("\(kind, privacy: .public) finished: \(result?.logSummary ?? "no result file", privacy: .public)")
+    }
+    /// The script records what actually went wrong, so the run no longer reports a generic
+    /// "see the log for details". The GUI gets Danish; upgrade.log and the unified log get
+    /// the English line, tagged like the shell layer's own lines.
+    static func resultFailure(_ kind: String, exit code: Int32) -> Error {
+        let file = state.appendingPathComponent(kind == "scan" ? "last-scan-result.json" : "last-result.json")
+        let result = readRunResult(file).flatMap { $0.job == kind && $0.hasSomethingToReport ? $0 : nil }
+        let english = result?.logSummary ?? "exited with code \(code) and left no usable result"
+        let danish = result?.danishSummary() ?? RunResult.danishStatus(result?.status ?? "", job: kind)
+        BrewauLog.agent.error("\(kind, privacy: .public) failed: \(english, privacy: .public)")
+        return BrewauError.reported(ui: danish, log: brewauLogLine(kind, english))
     }
     static func selfUpdate(now: Bool) throws {
         let marker = root.appendingPathComponent("etc/self-update.pid")
@@ -106,9 +147,15 @@ private let config = root.appendingPathComponent("etc/brewau.conf")
         child.environment = ["PATH": "/usr/bin:/bin:/usr/sbin:/sbin"]
         child.currentDirectoryURL = URL(fileURLWithPath: "/")
         child.standardInput = FileHandle.nullDevice
+        BrewauLog.agent.notice("self-update started")
         try child.run()
         child.waitUntilExit()
-        if child.terminationStatus != 0 { throw BrewauError.message("Selvopdatering mislykkedes. Se loggen for detaljer.") }
+        if child.terminationStatus != 0 {
+            BrewauLog.agent.error("self-update failed: brewau-setup exited \(child.terminationStatus)")
+            throw BrewauError.reported(ui: "Selvopdatering mislykkedes. Se loggen for detaljer.",
+                                       log: brewauLogLine("self-update", "brewau-setup self-update exited \(child.terminationStatus)"))
+        }
+        BrewauLog.agent.notice("self-update finished")
     }
     static func timestamp(_ name: String) -> Date? {
         guard let text = try? String(contentsOf: state.appendingPathComponent(name), encoding: .utf8), let value = Double(text) else { return nil }
