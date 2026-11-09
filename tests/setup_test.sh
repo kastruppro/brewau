@@ -243,6 +243,20 @@ check "yes" "$(homebrew_installing_brewau && echo yes || echo no)" "Homebrew of 
 kill "${FAKE_BREW}" 2>/dev/null
 wait "${FAKE_BREW}" 2>/dev/null
 
+# --- restarting the brewau app after an upgrade ------------------------------------------
+: >"${WORK}/app-calls"
+ps() { printf '%s\n' "101 501 /Applications/brewau.app/Contents/MacOS/brewau" "102 502 /usr/bin/other" \
+  "103 777 /Applications/brewau.app/Contents/MacOS/brewau"; }
+id() { case "$2" in 501) echo alice ;; *) return 1 ;; esac; }
+kill() { [[ "$1" == "-0" ]] && return 1; echo "kill $*" >>"${WORK}/app-calls"; }
+launchctl() { echo "launchctl $*" >>"${WORK}/app-calls"; }
+check "kill -TERM 101|launchctl asuser 501 sudo -u alice /usr/bin/open -g /Applications/brewau.app" \
+  "$( (set -euo pipefail; restart_brewau_app >/dev/null); paste -sd '|' "${WORK}/app-calls")" \
+  "a running brewau app is stopped and opened again in its user's session, other processes are left alone"
+launchctl() { return 1; }
+check "ok" "$( (set -euo pipefail; restart_brewau_app >/dev/null 2>&1; echo ok) )" "a failed relaunch never fails the install"
+unset -f ps id kill launchctl
+
 # --- failure report -------------------------------------------------------------
 # A command that fails under errexit is named, so install.log shows the cause.
 got="$( (set -euo pipefail; inner() { grep -q nothing /dev/null; }; cmd_reload() { inner; echo after; }; main reload) 2>&1)"

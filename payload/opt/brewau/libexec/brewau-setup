@@ -36,6 +36,7 @@ OWN_TAP_MARKER="${BREWAU_ROOT}/etc/own-tap-added"
 FINISH_LABEL="com.kastruppro.brewau.finish-install"
 FINISH_PLIST="/Library/LaunchDaemons/${FINISH_LABEL}.plist"
 SELF_UPDATE_LABEL="com.kastruppro.brewau.selfupdate"
+BREWAU_APP="/Applications/brewau.app"
 
 log() { echo "brewau-setup: $*"; }
 
@@ -522,6 +523,27 @@ cmd_finish_install() {
   BREWAU_NO_DEFER=1 cmd_install
 }
 
+# A running brewau app keeps the old version's code after an upgrade (the
+# package replaces the bundle under it), so restart it for every user who had
+# it open, in that user's own GUI session. Never fails the install.
+restart_brewau_app() {
+  local pid uid user command i
+  while read -r pid uid command; do
+    [[ "${command}" == "${BREWAU_APP}/Contents/MacOS/brewau" ]] || continue
+    user="$(id -un "${uid}" 2>/dev/null)" || continue
+    log "restarting the brewau app for ${user}"
+    kill -TERM "${pid}" 2>/dev/null || continue
+    for ((i = 0; i < 50; i++)); do
+      kill -0 "${pid}" 2>/dev/null || break
+      sleep 0.1
+    done
+    kill -0 "${pid}" 2>/dev/null && kill -KILL "${pid}" 2>/dev/null
+    launchctl asuser "${uid}" sudo -u "${user}" /usr/bin/open -g "${BREWAU_APP}" ||
+      log "warning: could not start the brewau app again for ${user}; it starts at the next login"
+  done < <(ps -axo pid=,uid=,comm= 2>/dev/null)
+  return 0
+}
+
 cmd_reload() {
   require_root
   brewau_load_config
@@ -586,6 +608,7 @@ cmd_install() {
   write_launchdaemon
   dscacheutil -flushcache 2>/dev/null || true
   touch "${INSTALLED_MARKER}"
+  restart_brewau_app
 
   log "installed. Open a new terminal; \`brew\` now runs through brewau."
   log "shell profiles of brewau users are configured with backups. Open /Applications/brewau.app for settings."

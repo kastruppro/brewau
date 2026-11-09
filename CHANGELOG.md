@@ -4,6 +4,14 @@ All notable changes to brewau. The format follows [Keep a Changelog](https://kee
 and versions follow [Semantic Versioning](https://semver.org/). Details of each finding behind
 0.4.0 are in [FIXES.md](FIXES.md).
 
+## [0.7.1] - 2026-11-09
+
+### Changed
+
+- Upgrading brewau (package, self-update or `brew upgrade`) restarts the brewau menu bar app
+  for every user who had it open, so it runs the new version. It is opened again in the
+  background in that user's session.
+
 ## [0.7.0] - 2026-11-03
 
 ### Added
