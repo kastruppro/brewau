@@ -104,14 +104,18 @@ import Darwin
         check(audit.isEmpty, "zsh compaudit accepts the completion snapshot")
 
         // --- run results from brewau-upgrade ------------------------------------------
+        // A discovered App Management block is a block, not a job error: the job records no
+        // failed step for it and exits 0.
         let blockedRun = Data(#"""
         {"upgraded":[{"name":"firefox","kind":"cask","version":"145.0","reason":"ok","installed":"[\"144.0\"]"}],
          "failed":[{"name":"kastruppro/tap/parallels","kind":"cask","version":"26.2.1","reason":"app-management","installed":"[\"26.1.0\"]"}],
          "blocked":[{"name":"kastruppro/tap/parallels","kind":"cask","version":"26.2.1","reason":"app-management","installed":"[\"26.1.0\"]"}],
-         "finished":"2026-11-09T02:00:11Z","job":"upgrade","status":"upgrade-failed","reason":"app-management"}
+         "errors":[],
+         "finished":"2026-11-09T02:00:11Z","job":"upgrade","status":"blocked","reason":"app-management"}
         """#.utf8)
         let blocked = try RunResult.decode(blockedRun)
-        check(blocked.job == "upgrade" && blocked.status == "upgrade-failed" && blocked.reason == "app-management", "Run result header read")
+        check(blocked.job == "upgrade" && blocked.status == "blocked" && blocked.reason == "app-management", "Run result header read")
+        check(blocked.hasErrorList && blocked.errors.isEmpty && !blocked.isFailure, "A discovered block records no failed step")
         check(blocked.finished == date("2026-11-09T02:00:11Z"), "Run result timestamp read")
         check(blocked.upgraded.map(\.name) == ["firefox"] && blocked.upgraded.first?.isCask == true, "Successful package kept next to the failure")
         check(blocked.appManagementBlocks.count == 1 && blocked.appManagementBlocks.first?.token == "parallels", "Block is attributed to the cask")
@@ -121,17 +125,17 @@ import Darwin
         check(blocked.logSummary == "kastruppro/tap/parallels 26.2.1: blocked by macOS App Management, skipped until a newer version or a manual upgrade", "Log line names package and version in English")
         check(blocked.hasSomethingToReport, "A blocked run is reported")
 
-        let standingBlock = try RunResult.decode(Data(#"{"upgraded":[],"failed":[],"blocked":[{"name":"parallels","kind":"cask","version":"26.2.1","reason":"app-management","installed":"x"}],"finished":"2026-11-09T04:00:00Z","job":"upgrade","status":"blocked","reason":"app-management"}"#.utf8))
+        let standingBlock = try RunResult.decode(Data(#"{"upgraded":[],"failed":[],"blocked":[{"name":"parallels","kind":"cask","version":"26.2.1","reason":"app-management","installed":"x"}],"errors":[],"finished":"2026-11-09T04:00:00Z","job":"upgrade","status":"blocked","reason":"app-management"}"#.utf8))
         check(!standingBlock.isFailure, "A standing block is not a failure")
         check(standingBlock.danishHeadline == "1 app er blokeret af macOS", "A standing block keeps its headline")
 
-        let offline = try RunResult.decode(Data(#"{"upgraded":[],"failed":[],"blocked":[],"finished":"2026-11-09T06:00:00Z","job":"scan","status":"skipped","reason":"offline"}"#.utf8))
+        let offline = try RunResult.decode(Data(#"{"upgraded":[],"failed":[],"blocked":[],"errors":[],"finished":"2026-11-09T06:00:00Z","job":"scan","status":"skipped","reason":"offline"}"#.utf8))
         check(offline.isOffline && !offline.isFailure, "An offline run is not a failure")
         check(offline.danishHeadline == "Sprunget over – ingen forbindelse", "Offline headline")
         check(offline.danishSummary() == "Ingen forbindelse til Homebrew. brewau prøver igen ved næste kørsel.", "Offline explains itself")
         check(offline.logSummary == "offline, nothing was changed", "Offline log line")
 
-        let brewError = try RunResult.decode(Data(#"{"upgraded":[],"failed":[{"name":"ffmpeg","kind":"formula","version":"8.0","reason":"brew-error","installed":""}],"blocked":[],"finished":"2026-11-09T07:00:00Z","job":"upgrade","status":"upgrade-failed","reason":"brew-error"}"#.utf8))
+        let brewError = try RunResult.decode(Data(#"{"upgraded":[],"failed":[{"name":"ffmpeg","kind":"formula","version":"8.0","reason":"brew-error","installed":""}],"blocked":[],"errors":[{"stage":"upgrade","reason":"brew-error"}],"finished":"2026-11-09T07:00:00Z","job":"upgrade","status":"upgrade-failed","reason":"brew-error"}"#.utf8))
         check(brewError.isFailure && brewError.danishHeadline == "Opdateringen mislykkedes", "An ordinary failure is still a failure")
         check(brewError.danishSummary() == "ffmpeg kunne ikke opdateres, fordi Homebrew meldte en fejl. Se loggen for detaljer.", "Ordinary failure names the package")
         check(brewError.logSummary == "ffmpeg: brew-error", "Ordinary failure log line")
@@ -196,15 +200,13 @@ import Darwin
         check(runNotice(job: "scan", succeeded: false, result: staleOffline) == .silent, "while its own offline run stays quiet")
 
         // --- the per-run channel leaves standing blocks to the per-package channel ----
-        check(blocked.isBlockOnly(succeeded: false) && runNotice(job: "upgrade", succeeded: false, result: blocked) == .silent,
-              "The first block does not also raise the ordinary failure banner")
+        check(blocked.isBlockOnly && runNotice(job: "upgrade", succeeded: true, result: blocked) == .upgradeFinished,
+              "The run that discovers a block reports the package it did upgrade, and nothing else")
         check(runNotice(job: "upgrade", succeeded: true, result: standingBlock) == .silent,
               "A standing block does not announce a finished upgrade")
-        check(runNotice(job: "upgrade", succeeded: false, result: blocked) == .silent,
-              "A failing retry does not explain the block again")
         check(runNotice(job: "upgrade", succeeded: false, result: brewError) == .failure, "An unrelated failure is still notified")
-        let mixed = try RunResult.decode(Data(#"{"upgraded":[],"failed":[{"name":"parallels","kind":"cask","version":"1","reason":"app-management","installed":""},{"name":"ffmpeg","kind":"formula","version":"8.0","reason":"brew-error","installed":""}],"blocked":[{"name":"parallels","kind":"cask","version":"1","reason":"app-management","installed":""}],"job":"upgrade","status":"upgrade-failed","reason":"brew-error"}"#.utf8))
-        check(!mixed.isBlockOnly(succeeded: false) && runNotice(job: "upgrade", succeeded: false, result: mixed) == .failure, "A failure next to a block is notified")
+        let mixed = try RunResult.decode(Data(#"{"upgraded":[],"failed":[{"name":"parallels","kind":"cask","version":"1","reason":"app-management","installed":""},{"name":"ffmpeg","kind":"formula","version":"8.0","reason":"brew-error","installed":""}],"blocked":[{"name":"parallels","kind":"cask","version":"1","reason":"app-management","installed":""}],"errors":[{"stage":"upgrade","reason":"brew-error"}],"job":"upgrade","status":"upgrade-failed","reason":"brew-error"}"#.utf8))
+        check(!mixed.isBlockOnly && runNotice(job: "upgrade", succeeded: false, result: mixed) == .failure, "A failure next to a block is notified")
         check(mixed.danishSummary(includingBlocks: false) == "ffmpeg kunne ikke opdateres, fordi Homebrew meldte en fejl. Se loggen for detaljer.",
               "and its banner leaves the block to the block banner")
         check(mixed.danishSummary()?.contains("App Management") == true, "while the menu still explains both")
@@ -215,51 +217,80 @@ import Darwin
         check(runNotice(job: "scan", succeeded: true, result: didUpgrade) == .updatesAvailable, "A finished scan reports what it found")
         check(runNotice(job: "scan", succeeded: true, result: offline) == .silent, "An offline scan reports nothing")
 
-        // --- a standing block never hides a failure of its own run -------------------
-        // The job keeps one status per run and leaves reason=app-management from the skipped
-        // cask, so these runs look block-only in everything but their status.
+        // --- every failed step of a run is reported, also next to a standing block ---
         let standingItem = #"{"name":"parallels","kind":"cask","version":"26.2.1","reason":"app-management","installed":"x"}"#
-        func besideBlock(_ status: String, _ reason: String, upgraded: String = "", failed: String = "") throws -> RunResult {
-            var json = #"{"upgraded":["# + upgraded + #"],"failed":["# + failed + "],"
-            json += #""blocked":["# + standingItem + #"],"finished":"2026-11-09T09:00:00Z","job":"upgrade","#
-            json += #""status":""# + status + #"","reason":""# + reason + #""}"#
+        let formulaUpgraded = #"{"name":"tailscale","kind":"formula","version":"1.90","reason":"ok","installed":""}"#
+        /// A result in the job's own shape: the first failed step decides status and reason.
+        func run(_ errors: [(String, String)], upgraded: String = "", failed: String = "", blocked: String = "") throws -> RunResult {
+            let steps = errors.map { #"{"stage":""# + $0.0 + #"","reason":""# + $0.1 + #""}"# }.joined(separator: ",")
+            let status = errors.first.map { $0.0 + "-failed" } ?? (blocked.isEmpty ? "ok" : "blocked")
+            let reason = errors.first?.1 ?? (blocked.isEmpty ? "ok" : "app-management")
+            var json = #"{"upgraded":["# + upgraded + #"],"failed":["# + failed + #"],"#
+            json += #""blocked":["# + blocked + #"],"errors":["# + steps + #"],"#
+            json += #""finished":"2026-11-09T09:00:00Z","job":"upgrade","status":""# + status + #"","reason":""# + reason + #""}"#
             return try RunResult.decode(Data(json.utf8))
         }
-        let formulaUpgraded = #"{"name":"tailscale","kind":"formula","version":"1.90","reason":"ok","installed":""}"#
-        let restartBeside = try besideBlock("restart-failed", "app-management", upgraded: formulaUpgraded)
-        check(!restartBeside.statusIsBlockOnly && !restartBeside.isBlockOnly(succeeded: false), "restart-failed is not explained by a block")
+        let restartBeside = try run([("restart", "brew-error")], upgraded: formulaUpgraded, blocked: standingItem)
+        check(restartBeside.status == "restart-failed" && !restartBeside.isBlockOnly, "A failed step beside a block is not block-only")
         check(runNotice(job: "upgrade", succeeded: false, result: restartBeside) == .failure, "A failed service restart beside a block is notified")
         check(restartBeside.danishHeadline == "Opdateringen mislykkedes", "and keeps the failure headline")
-        check(restartBeside.danishSummary()?.hasPrefix("En systemtjeneste kunne ikke genstartes") == true, "and is named before the block")
-        check(restartBeside.danishSummary()?.contains("App Management") == true, "while the block is still explained")
-        check(restartBeside.logSummary.contains("status restart-failed"), "and upgrade.log records the status too")
+        check(restartBeside.danishSummary { $0.token.capitalized } == "En systemtjeneste kunne ikke genstartes efter opdateringen. Se loggen for detaljer. Parallels kunne ikke opdateres, fordi macOS App Management blokerer baggrundsjobbet. Den springes over, indtil der kommer en nyere version eller du opdaterer den manuelt.",
+              "and is named before the block, which is still explained")
+        check(restartBeside.danishSummary(includingBlocks: false) == "En systemtjeneste kunne ikke genstartes efter opdateringen. Se loggen for detaljer.",
+              "while its banner leaves the block to the block banner")
+        check(restartBeside.logSummary == "restart stage failed (brew-error); parallels 26.2.1: blocked by macOS App Management, skipped until a newer version or a manual upgrade",
+              "and upgrade.log names the step in English")
 
-        let protectBeside = try besideBlock("protect-failed", "protect-failed")
+        let protectBeside = try run([("protect", "protect-failed")], blocked: standingItem)
         check(runNotice(job: "upgrade", succeeded: false, result: protectBeside) == .failure, "A protection failure beside a block is notified")
-        let snapshotBeside = try besideBlock("snapshot-failed", "brew-error")
-        check(runNotice(job: "upgrade", succeeded: false, result: snapshotBeside) == .failure, "A snapshot failure beside a block is notified")
-        let pinBeside = try besideBlock("pin-failed", "app-management")
-        check(runNotice(job: "upgrade", succeeded: false, result: pinBeside) == .failure, "A pin failure beside a block is notified")
-        check(pinBeside.danishSummary()?.hasPrefix("brewau kunne ikke bekræfte") == true, "and has its own wording")
-        let outdatedBeside = try besideBlock("outdated-failed", "app-management")
-        check(runNotice(job: "upgrade", succeeded: false, result: outdatedBeside) == .failure, "A failed outdated query beside a block is notified")
-        // A cask can be both blocked and unprotected; the protection failure is its own.
-        let blockedAndUnprotected = try besideBlock("ok", "ok", failed: #"{"name":"parallels","kind":"cask","version":"26.2.1","reason":"protect-failed","installed":""}"#)
+        check(protectBeside.status == "protect-failed" && protectBeside.reason == "protect-failed", "with the reason the step reported")
+        check(protectBeside.danishSummary(includingBlocks: false) == "Apps i /Applications kunne ikke sikres, så casks blev ikke opdateret. Se loggen for detaljer.", "and its own wording")
+        // Several steps can fail independently in one run; all of them are named, in order.
+        let pinAndUpgrade = try run([("pin", "brew-error"), ("upgrade", "brew-error")],
+                                    failed: #"{"name":"ffmpeg","kind":"formula","version":"8.0","reason":"brew-error","installed":""}"#)
+        check(pinAndUpgrade.status == "pin-failed", "The first failed step decides the status")
+        check(pinAndUpgrade.errors.map(\.stage) == ["pin", "upgrade"], "and every step is kept in order")
+        check(pinAndUpgrade.danishSummary() == "brewau kunne ikke bekræfte, at udelukkede pakker er fastlåst, og sprang formulae over. ffmpeg kunne ikke opdateres, fordi Homebrew meldte en fejl. Se loggen for detaljer.",
+              "The pin failure is named next to the package the upgrade step could not install")
+        check(pinAndUpgrade.logSummary == "pin stage failed (brew-error); ffmpeg: brew-error", "and the log names the step and the package it could not install")
+        let everyStage = ["tap-check", "update", "protect", "pin", "outdated", "restart", "upgrade", "cleanup", "snapshot"]
+        check(everyStage.allSatisfy { RunResult.danishStage($0) != RunResult.danishStage("unknown-stage") }, "Every stage the job records has its own wording")
+        check(RunResult.danishStage("future").contains("future"), "and an unknown one still names itself")
+        check(try run([("cleanup", "brew-error")]).danishSummary() == "Homebrews oprydning af hentede filer mislykkedes. Se loggen for detaljer.", "A failed cleanup is reported")
+        check(try run([("tap-check", "brew-error")]).danishHeadline == "Opdateringen mislykkedes", "A refused tap check is a failed run")
+        // A cask can be both blocked and left unprotected; the protection failure is its own.
+        let blockedAndUnprotected = try run([("protect", "protect-failed")],
+                                            failed: #"{"name":"parallels","kind":"cask","version":"26.2.1","reason":"protect-failed","installed":""}"#,
+                                            blocked: standingItem)
         check(blockedAndUnprotected.otherFailures.count == 1, "A protection failure is not filtered out with the block of the same cask")
         check(blockedAndUnprotected.danishSummary()?.contains("ikke kunne sikres") == true, "and is explained")
-        // The scheduler's verdict has to agree with the status it reports.
-        check(!standingBlock.isBlockOnly(succeeded: false), "A run that exited non-zero is not a standing block")
-        check(standingBlock.isBlockOnly(succeeded: true), "while its own successful run is")
-        check(!blocked.isBlockOnly(succeeded: true), "and a discovered block did not succeed")
-        // A formula upgrade could have had its restart failure overwritten by the block.
-        let blockAfterFormula = try besideBlock("upgrade-failed", "app-management", upgraded: formulaUpgraded,
-                                                failed: #"{"name":"parallels","kind":"cask","version":"26.2.1","reason":"app-management","installed":"x"}"#)
-        check(!blockAfterFormula.isBlockOnly(succeeded: false), "A block discovered after a formula upgrade keeps its banner")
-        check(runNotice(job: "upgrade", succeeded: false, result: blockAfterFormula) == .failure, "so an overwritten restart failure cannot be lost")
-        let blockAfterCask = try besideBlock("upgrade-failed", "app-management", upgraded: #"{"name":"firefox","kind":"cask","version":"145.0","reason":"ok","installed":""}"#,
-                                             failed: #"{"name":"parallels","kind":"cask","version":"26.2.1","reason":"app-management","installed":"x"}"#)
-        check(blockAfterCask.isBlockOnly(succeeded: false), "while casks alone cannot have hidden one")
-        check(runNotice(job: "upgrade", succeeded: false, result: blockAfterCask) == .silent, "and that run stays silent")
+        // Offline: the job stops before any step, and a standing block is still carried over.
+        let offlineWithBlock = try RunResult.decode(Data((#"{"upgraded":[],"failed":[],"blocked":["# + standingItem + #"],"errors":[],"finished":"2026-11-09T09:00:00Z","job":"upgrade","status":"skipped","reason":"offline"}"#).utf8))
+        check(!offlineWithBlock.isFailure && !offlineWithBlock.isBlockOnly, "An offline run is neither a failure nor block-only")
+        check(runNotice(job: "upgrade", succeeded: true, result: offlineWithBlock) == .silent, "and is not notified")
+        check(offlineWithBlock.danishSummary()?.hasPrefix("Ingen forbindelse") == true, "but still says why nothing happened")
+
+        // --- result files from a brewau before this contract --------------------------
+        // No step list: the status is the only signal, and that version published
+        // upgrade-failed for the run that discovered a block.
+        let legacyBlock = try RunResult.decode(Data((#"{"upgraded":[],"failed":[{"name":"parallels","kind":"cask","version":"26.2.1","reason":"app-management","installed":"x"}],"blocked":["# + standingItem + #"],"finished":"2026-11-09T02:00:00Z","job":"upgrade","status":"upgrade-failed","reason":"app-management"}"#).utf8))
+        check(!legacyBlock.hasErrorList && legacyBlock.isBlockOnly, "An old discovered block is still block-only")
+        check(runNotice(job: "upgrade", succeeded: false, result: legacyBlock) == .silent, "so its failed run raises no second banner")
+        check(legacyBlock.danishHeadline == "1 app er blokeret af macOS", "and it is presented as blocked")
+        let legacyRestart = try RunResult.decode(Data((#"{"upgraded":[],"failed":[],"blocked":["# + standingItem + #"],"finished":"2026-11-09T02:00:00Z","job":"upgrade","status":"restart-failed","reason":"app-management"}"#).utf8))
+        check(!legacyRestart.isBlockOnly, "An old failure the block cannot explain is still a failure")
+        check(runNotice(job: "upgrade", succeeded: false, result: legacyRestart) == .failure, "and is notified")
+        check(legacyRestart.danishSummary(includingBlocks: false) == "En systemtjeneste kunne ikke genstartes efter opdateringen. Se loggen for detaljer.", "from its status alone")
+        check(legacyRestart.logSummary.contains("status restart-failed"), "which upgrade.log records")
+
+        // --- the step list is bounded and single-line like the other arrays ----------
+        let manyErrors = #"{"job":"upgrade","status":"restart-failed","reason":"brew-error","errors":["#
+            + (0..<600).map { _ in #"{"stage":"restart","reason":"brew-error"}"# }.joined(separator: ",") + "]}"
+        check(try RunResult.decode(Data(manyErrors.utf8)).errors.count == RunResult.itemLimit, "The step count is bounded")
+        let forgedStage = try RunResult.decode(Data(#"{"job":"upgrade","status":"restart-failed","reason":"brew-error","errors":[{"stage":"rest\nart","reason":"brew\u0007error"},{"reason":"brew-error"}]}"#.utf8))
+        check(forgedStage.errors.count == 1 && !forgedStage.errors[0].stage.contains("\n"), "A step without a stage is skipped and control characters are flattened")
+        check(brewauLogLine("upgrade", forgedStage.logSummary, at: morning).components(separatedBy: "\n").count == 1, "so a step cannot forge a log line")
+        check(try RunResult.decode(Data(#"{"job":"upgrade","status":"ok","reason":"ok","errors":"none"}"#.utf8)).hasErrorList == false, "A step list of the wrong type is treated as absent")
 
         // --- a one-shot notification survives a permission granted later -------------
         var ledger = OneShotNotice()

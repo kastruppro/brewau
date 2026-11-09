@@ -16,14 +16,21 @@ log. Work runs independently of the GUI.
 
 A finished run is described by what the service recorded, not by a generic failure:
 `state/last-result.json` (upgrades) and `state/last-scan-result.json` (scans) name the
-packages that were upgraded, failed or blocked, and why. The popover names the package
-and the reason. A run that found no network is reported as skipped, not as a failure.
-Both files are optional: a brewau that has not written them yet leaves the GUI on its
-previous information.
+packages that were upgraded, failed or blocked, and why, plus an `errors` array with
+every step of the run that failed — `tap-check`, `update`, `protect`, `pin`,
+`outdated`, `restart`, `upgrade`, `cleanup` or `snapshot` — in the order they ran.
+The first entry decides the run's status (`<stage>-failed`) and any entry means the
+job exited non-zero. The popover names every failed step and every package, and its
+notification leaves out what the block banner already covers. A run that found no
+network is reported as skipped, not as a failure. Both files are optional, and one
+without an `errors` array (from an older brewau) is read by its status alone, so the
+GUI keeps working across an upgrade.
 
 A cask that macOS App Management keeps the background job from replacing is reported
-once, as blocked: it is skipped until a newer version appears or the user upgrades it
-by hand. **Åbn Systemindstillinger…** opens Anonymitet og sikkerhed › App-administration,
+once, as blocked, and not as a failed run: it is skipped until a newer version appears
+or the user upgrades it by hand. A run whose only news is such a block records no
+failed step, so it never hides a failure of its own — a service that would not
+restart, or a failed cleanup or snapshot, is still reported next to the block. **Åbn Systemindstillinger…** opens Anonymitet og sikkerhed › App-administration,
 and **Prøv igen** asks the helper to drop the block list and starts a new upgrade.
 
 - **Tidsplan:** scans every 15/30 minutes, 1/6/12 hours or daily. Upgrades can run
@@ -118,8 +125,8 @@ The scheduler's own lines in that log are English and use the same
 `<timestamp> [<job>] <message>` shape as the shell layer. Every line passes through
 one formatter that flattens control characters, line and paragraph separators, so a
 package name or a child's output cannot forge a second, untagged entry. Result files
-are read with a 1 MB limit, at most 500 items per array, and each string bounded and
-flattened as it is parsed.
+are read with a 1 MB limit, at most 500 items per array (`errors` included), and each
+string bounded and flattened as it is parsed.
 
 The original visual prototype remains in `mockup/` for design reference and is
 not included in the installer.
