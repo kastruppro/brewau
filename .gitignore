@@ -1,2 +1,5 @@
 build/
 .DS_Store
+
+# Local agent config (Paseo teams, vendored skills); never committed
+.agents/
