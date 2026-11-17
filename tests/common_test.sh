@@ -197,7 +197,7 @@ for stage in lock pin; do
     )"
     reason=protect-failed
     [[ "${error}" == 'Operation not permitted' ]] && reason=app-management
-    check "paseo"$'\t'"${reason}" "${got}" "${stage}: ${error} has the precise cause"
+    check "paseo"$'\t'"${reason}" "$(cut -f1,2 <<<"${got}")" "${stage}: ${error} has the precise cause"
   done
 done
 got="$(
@@ -207,13 +207,48 @@ got="$(
   brewau_lock_app() { echo "mv: $1: Operation not permitted" >&2; echo "brewau: WARNING: could not put $1 back; it is in staging/old" >&2; return 1; }
   brewau_protect_apps unused --report-reasons '' 2>/dev/null
 )"
-check "paseo"$'\tprotect-failed' "${got}" "failed rollback is not downgraded to a block"
+check "paseo"$'\tprotect-failed' "$(cut -f1,2 <<<"${got}")" "failed rollback is not downgraded to a block"
+for trust_case in untrusted symlink multi; do
+  got="$(
+    fixture_app="${BREWAU_APPDIR}/Standing-${trust_case}.app"
+    other="${BREWAU_APPDIR}/Other.app"
+    [[ "${trust_case}" != symlink ]] || ln -s One.app "${fixture_app}"
+    brewau_cask_apps() { printf 'paseo\t%s\n' "${fixture_app}"; [[ "${trust_case}" != multi ]] || printf 'paseo\t%s\n' "${other}"; }
+    brewau_app_untrusted() { [[ "${trust_case}" == untrusted ]]; }
+    brewau_app_needs_protection() { return 1; }
+    brewau_pin_app() { echo "pinned $1" >>"${WORK}/protected-artifacts"; }
+    brewau_protect_apps unused --report-reasons "${fixture_app}"$'\tpin' 2>"${WORK}/standing-${trust_case}"
+  )"
+  if [[ "${trust_case}" == multi ]]; then
+    check "paseo"$'\tapp-management' "$(cut -f1,2 <<<"${got}")" "standing pin block is retained"
+    check yes "$(grep -q 'pinned .*Other.app' "${WORK}/protected-artifacts" && echo yes)" "other app artifact still gets protected"
+  else
+    check "paseo"$'\tprotect-failed' "$(cut -f1,2 <<<"${got}")" "standing block never bypasses ${trust_case} checks"
+  fi
+done
 got="$(
-  brewau_cask_apps() { printf 'paseo\t%s/Paseo.app\n' "${BREWAU_APPDIR}"; }
-  brewau_app_untrusted() { echo 'must not attempt protection'; return 0; }
-  brewau_protect_apps unused --report-reasons paseo 2>/dev/null
+  fixture_app="${BREWAU_APPDIR}/NewlyWritable.app"
+  brewau_cask_apps() { printf 'paseo\t%s\n' "${fixture_app}"; }
+  brewau_app_untrusted() { return 1; }
+  brewau_app_needs_protection() { [[ ! -e "${WORK}/relocked" ]]; }
+  brewau_app_trusted() { return 0; }
+  brewau_lock_app() { touch "${WORK}/relocked"; }
+  brewau_pin_app() { echo 'must not retry blocked pin'; return 1; }
+  brewau_protect_apps unused --report-reasons "${fixture_app}"$'\tpin' 2>/dev/null
 )"
-check "paseo"$'\tapp-management' "${got}" "known scheduled block avoids protection work"
+check yes "$(test -f "${WORK}/relocked" && echo yes)" "standing pin block does not skip new lock work"
+check "paseo"$'\tapp-management' "$(cut -f1,2 <<<"${got}")" "only the previously blocked pin is skipped"
+for stage in lock pin; do
+  got="$(
+    brewau_cask_apps() { printf 'paseo\t%s/Paseo.app\n' "${BREWAU_APPDIR}"; }
+    brewau_app_untrusted() { return 1; }
+    brewau_app_needs_protection() { [[ "${stage}" == lock ]]; }
+    brewau_lock_app() { printf 'mv: %s: Operation not permitted\ncp: /tmp/unrelated: Input/output error\n' "$1" >&2; return 1; }
+    brewau_pin_app() { printf 'chmod: %s: Operation not permitted\nchmod: /tmp/unrelated: Permission denied\n' "$1" >&2; return 1; }
+    brewau_protect_apps unused --report-reasons '' 2>/dev/null
+  )"
+  check "paseo"$'\tprotect-failed' "$(cut -f1,2 <<<"${got}")" "${stage} mixed diagnostics remain real failures"
+done
 
 # --- code signatures ---------------------------------------------------------
 BREWAU_APP_STATE_DIR="${WORK}/state/apps"

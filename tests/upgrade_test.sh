@@ -64,10 +64,10 @@ brewau_protect_installed_apps() {
   fi
   if [[ -n "${MOCK_PROTECT_REPORT:-}" ]]; then printf '%s\n' "${MOCK_PROTECT_REPORT}"; return 1; fi
   for token in ${MOCK_UNPROTECTED:-}; do
-    if brewau_in_words "${token}" "${2:-}"; then
+    if grep -Fxq "${BREWAU_APPDIR}/Paseo.app"$'\tpin' <<<"${2:-}"; then
       printf '%s\tapp-management\n' "${token}"
     else
-      printf '%s\t%s\n' "${token}" "${MOCK_PROTECT_REASON:-protect-failed}"
+      printf '%s\t%s\t%s\tpin\n' "${token}" "${MOCK_PROTECT_REASON:-protect-failed}" "${BREWAU_APPDIR}/Paseo.app"
     fi
   done
   return "${MOCK_PROTECT_RC:-0}"
@@ -293,7 +293,7 @@ for target in /Applications/Paseo.app "${WORK}/Custom Apps/Paseo.app"; do
     "cp: /opt/homebrew/Caskroom/paseo/2/Paseo.app/file: could not copy extended attributes to ${target}/file: Operation not permitted" \
     "cp: utimensat: ${target}/Contents: Operation not permitted" \
     "cp: \"${target}/Contents\": Operation not permitted" \
-    "mv: rename ${target} to /tmp/old: Operation not permitted"; do
+    "mv: rename ${target} to ${BREWAU_STAGING_DIR}/old: Operation not permitted"; do
     rm -f "${BREWAU_STATE_DIR}/blocked-casks.json"
     run
     check '[[ ${RC} == 0 && "${STATUS}" == blocked ]]' "artifact EPERM is a block"
@@ -315,6 +315,23 @@ for target in /Applications/Paseo.app "${WORK}/Custom Apps/Paseo.app"; do
   done
 done
 BREWAU_APPDIR=/Applications
+
+for error in \
+  $'cp: /Applications/Paseo.app/file: Operation not permitted\nWarning: Rolling back the failed upgrade of paseo also failed: RuntimeError: restore failed' \
+  $'App Management permissions\nWarning: Rolling back the failed upgrade of paseo also failed: restore failed' \
+  $'cp: /Applications/Paseo.app/file: Operation not permitted\ncp: /private/tmp/unrelated: Input/output error' \
+  $'App Management permissions\ncp: /private/tmp/unrelated: Input/output error' \
+  'cp: /Applications/Paseo.app/Contents/data: could not copy extended attributes to /private/tmp/backup/data: Operation not permitted' \
+  'mv: rename /Applications/Paseo.app to /private/tmp/backup: Operation not permitted'; do
+  scenario "independent failure is not hidden by EPERM"
+  MOCK_CATALOG='{"casks":[{"token":"paseo","artifacts":[{"app":["Paseo.app"],"target":"/Applications/Paseo.app"}]}]}'
+  MOCK_OUTDATED_CASKS=paseo
+  MOCK_CASK_FAIL=paseo
+  MOCK_CASK_ERROR="${error}"
+  run
+  check '[[ ${RC} != 0 && "${STATUS}" == upgrade-failed ]]' "mixed diagnostics or unrelated destination stay failures"
+  check '[[ "$(plutil -extract blocked raw -o - "${BREWAU_STATE_DIR}/last-result.json")" == 0 ]]' "failure does not persist a block"
+done
 
 scenario "protection EPERM blocks once and follows version lifecycle"
 MOCK_OUTDATED_CASKS=paseo
@@ -339,6 +356,22 @@ MOCK_UNPROTECTED=''
 MOCK_PROTECT_RC=0
 run
 check '[[ "${STATUS}" == ok && "$(plutil -extract blocked raw -o - "${BREWAU_STATE_DIR}/blocked-casks.json")" == 0 ]]' "manual upgrade drops protection block"
+
+scenario "legacy token block gains artifact protection scope"
+MOCK_OUTDATED_CASKS=paseo
+MOCK_CASK_FAIL=paseo
+MOCK_CASK_ERROR='App Management permissions'
+run
+MOCK_CASK_FAIL=never
+MOCK_UNPROTECTED=paseo
+MOCK_PROTECT_RC=1
+MOCK_PROTECT_REASON=app-management
+run
+EXPECTED_PROTECTION="${BREWAU_APPDIR}/Paseo.app"$'\tpin'
+check '[[ "$(plutil -extract blocked.0.protection raw -o - "${BREWAU_STATE_DIR}/last-result.json")" == "${EXPECTED_PROTECTION}" ]]' "old token block records the specific blocked operation"
+MOCK_PROTECT_REPORT=$'paseo\tprotect-failed\t/Applications/Paseo.app\tlock'
+run
+check '[[ ${RC} != 0 && "${STATUS}" == protect-failed ]]' "new trust failure stays visible beside saved operation block"
 
 scenario "mixed protection causes for one cask stay a real failure"
 MOCK_OUTDATED_CASKS=paseo
@@ -436,7 +469,7 @@ MOCK_PROTECT_RC=1
 MOCK_UNPROTECTED=parallels
 : >"${CALLS}"
 run
-check '[[ "${STATUS}" == blocked ]]' "known blocked cask skips scheduled protection"
+check '[[ "${STATUS}" == protect-failed ]]' "standing block does not hide a new protection failure"
 check '[[ "$(plutil -extract blocked.0.name raw -o - "${BREWAU_STATE_DIR}/blocked-casks.json")" == parallels ]]' "protection failure retains block"
 MOCK_PROTECT_RC=0
 MOCK_UNPROTECTED=""

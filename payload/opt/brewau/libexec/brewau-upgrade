@@ -258,21 +258,23 @@ clean_tmp() {
 
 # Only artifact errors for this cask's validated app target imply App Management.
 cask_app_management_error() {
-  local name="$1" output="$2" catalog token app line rest prefix
-  [[ "${output}" == *"App Management permissions"* ]] && return 0
+  local name="$1" output="$2" catalog token app line diagnostics="" explicit=0
+  while IFS= read -r line; do
+    [[ "${line}" != *"Rolling back"* && "${line}" != *"rollback"* ]] || return 1
+    case "${line}" in
+      cp:* | mv:* | ditto:* | chmod:* | chown:* | chflags:*) diagnostics+="${line}"$'\n' ;;
+      *"App Management permissions"*) explicit=1 ;;
+      curl:* | tar:* | unzip:* | hdiutil:* | rsync:*) return 1 ;;
+      Error:* | *'Error: '*)
+        [[ "${line}" == *'Failure while executing;'* ]] || return 1 ;;
+    esac
+  done <<<"${output}"
+  if [[ -z "${diagnostics}" ]]; then [[ ${explicit} == 1 ]]; return; fi
   catalog="$(mktemp "${BREWAU_TMP}/cask-error.XXXXXX")" || return 1
   if ! brew_run info --json=v2 --installed --cask >"${catalog}"; then rm -f "${catalog}"; return 1; fi
   while IFS=$'\t' read -r token app; do
     [[ "${token}" == "${name##*/}" ]] || continue
-    while IFS= read -r line; do
-      case "${line}" in cp:* | mv:* | ditto:*) ;; *) continue ;; esac
-      [[ "${line}" == *"Operation not permitted"* && "${line}" == *"${app}"* ]] || continue
-      for prefix in ': ' ' to ' 'rename ' "'" '"'; do
-        [[ "${line}" == *"${prefix}${app}"* ]] || continue
-        rest="${line#*"${prefix}${app}"}"
-        case "${rest}" in '' | /* | :* | ' to '* | \'* | \"*) rm -f "${catalog}"; return 0 ;; esac
-      done
-    done <<<"${output}"
+    if brewau_app_eperm "${app}" "${diagnostics}"; then rm -f "${catalog}"; return 0; fi
   done < <(brewau_cask_app_targets "${catalog}")
   rm -f "${catalog}"
   return 1
@@ -304,14 +306,14 @@ protection_versions() {
 
 # Structured reports are only requested by this job; policy callers keep plain tokens.
 protect_for_upgrade() {
-  local report rc=0 token cause version installed metadata seen=""
-  report="$(brewau_protect_installed_apps --report-reasons "${protect_skip}" /usr/bin/sudo -n)" || rc=$?
+  local report rc=0 token cause app operation version installed metadata seen="" index count blocked_token app_blocks previous
+  report="$(brewau_protect_installed_apps --report-reasons "${protection_skip}" /usr/bin/sudo -n)" || rc=$?
   [[ ${rc} != 2 ]] || { result_error protect protect-failed; return 2; }
-  while IFS=$'\t' read -r token cause; do
+  while IFS=$'\t' read -r token cause app operation; do
     [[ -n "${token}" ]] || continue
     brewau_in_words "${token}" "${seen}" && continue
     seen="${seen} ${token}"
-    grep -Fxq "${token}"$'\tprotect-failed' <<<"${report}" && cause=protect-failed
+    grep -Eq "^${token}"$'\tprotect-failed(\t|$)' <<<"${report}" && cause=protect-failed
     unprotected="${unprotected} ${token}"
     # A different failure for another app in the same cask must still win.
     if [[ "${cause}" == app-management ]] &&
@@ -321,6 +323,20 @@ protect_for_upgrade() {
         result_item blocked "${token}" cask "${version}" app-management "${installed}" || return 1
         protect_skip="${protect_skip} ${token}"
         log "${token}: blocked by macOS App Management; skipped"
+      fi
+      if [[ -n "${app}" && ( "${operation}" == lock || "${operation}" == pin ) ]]; then
+        count="$(plutil -extract blocked raw -o - "${RESULT}")" || return 1
+        for ((index=0; index<count; index++)); do
+          blocked_token="$(plutil -extract "blocked.${index}.name" raw -o - "${RESULT}")" || return 1
+          [[ "${blocked_token##*/}" == "${token}" ]] || continue
+          app_blocks="$(awk -F '\t' -v token="${token}" '$1 == token && $2 == "app-management" {print $3 "\t" $4}' <<<"${report}")"
+          previous="$(plutil -extract "blocked.${index}.protection" raw -o - "${RESULT}" 2>/dev/null)" || previous=""
+          app_blocks="$(printf '%s\n%s\n' "${previous}" "${app_blocks}" | sed '/^$/d' | sort -u)"
+          plutil -remove "blocked.${index}.protection" "${RESULT}" >/dev/null 2>&1 || true
+          plutil -insert "blocked.${index}.protection" -string "${app_blocks}" "${RESULT}" || return 1
+          protection_skip+=$'\n'"${app_blocks}"
+          break
+        done
       fi
     else
       result_error protect protect-failed || return 1
@@ -365,7 +381,7 @@ run_upgrade() {
   # otherwise look like "nothing is outdated".
   # shellcheck disable=SC2086
   json="$(brew_run outdated --json=v2 ${greedy})" || enumeration_ok=0
-  local protect_skip="" unprotected="" protect_rc=0 protection_after=0
+  local protection_skip="" protect_skip="" unprotected="" protect_rc=0 protection_after=0
   if [[ ${enumeration_ok} == 1 ]]; then
     plutil -replace blocked -json '[]' "${RESULT}" || return 1
     local block_count block_i metadata
@@ -378,6 +394,12 @@ run_upgrade() {
       if blocked_match "${name}" "${version}" "${installed}"; then
         protect_skip="${protect_skip} ${name##*/}"
         result_item blocked "${name}" cask "${version}" app-management "${installed}" || return 1
+        local saved_protection new_index
+        if saved_protection="$(plutil -extract "blocked.${block_i}.protection" raw -o - "${BREWAU_STATE_DIR}/blocked-casks.json" 2>/dev/null)"; then
+          new_index="$(plutil -extract blocked raw -o - "${RESULT}")" || return 1
+          plutil -insert "blocked.$((new_index - 1)).protection" -string "${saved_protection}" "${RESULT}" || return 1
+          protection_skip+=$'\n'"${saved_protection}"
+        fi
       fi
     done
   fi

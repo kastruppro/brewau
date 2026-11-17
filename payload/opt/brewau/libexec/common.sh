@@ -435,9 +435,42 @@ brewau_cask_apps() {
   done < <(brewau_cask_app_targets "$1")
 }
 
+# Accept only diagnostics fully explained by EPERM at the operation's app target.
+brewau_app_eperm() {
+  local app="$1" output="$2" line path found=0
+  while IFS= read -r line; do
+    [[ -n "${line}" ]] || continue
+    [[ "${line}" != *"Rolling back"* && "${line}" != *"could not put "* ]] || return 1
+    case "${line}" in
+      cp:* | mv:* | ditto:* | chmod:* | chown:* | chflags:*)
+        case "${line}" in
+          *'could not copy '*' to '*) path="${line##* to }" ;;
+          'mv: rename '*' to '*)
+            path="${line#mv: rename }"; path="${path%% to *}"
+            [[ "${path}" == "${app}" || "${path}" == "${app}/"* ]] || return 1
+            path="${line#* to }"
+            # Moving an app out is valid only to brewau's staging directory.
+            [[ "${path}" == "${BREWAU_STAGING_DIR}/"* ]] && path="${app}: ${line##*: }"
+            ;;
+          *) path="${line#*: }"; case "${path}" in utimensat:* | chown:* | chmod:* | chflags:*) path="${path#*: }" ;; esac ;;
+        esac
+        path="${path#\"}"; path="${path#\'}"
+        [[ "${path}" == "${app}:"* || "${path}" == "${app}/"* || "${path}" == "${app}\":"* || "${path}" == "${app}\':"* ]] || return 1
+        case "${line}" in
+          *': Operation not permitted') found=1 ;;
+          *'could not copy ACL '*'Bad file descriptor' | *': No such file or directory') ;;
+          *) return 1 ;;
+        esac
+        ;;
+      *) return 1 ;;
+    esac
+  done <<<"${output}"
+  [[ ${found} == 1 ]]
+}
+
 brewau_protection_failure() {
   printf '%s' "$1"
-  [[ "$3" == 1 ]] && printf '\t%s' "$2"
+  [[ "$3" == 1 ]] && printf '\t%s\t%s\t%s' "$2" "${4:-}" "${5:-}"
   printf '\n'
 }
 
@@ -454,17 +487,12 @@ brewau_cask_app_paths() {
 # $1 is the JSON file; the rest is an optional command prefix that gives root
 # (e.g. sudo -n). Prints the tokens of casks whose apps are still unprotected
 # afterwards or untrusted (and then fails); progress goes to stderr.
-# --report-reasons <skip-tokens> adds a tab-separated cause and skips known blocks.
+# --report-reasons <app/operation rows> reports causes and skips only known operations.
 brewau_protect_apps() {
   local json="$1" token app locked output reason result=0 report=0 skip=""
   shift
   if [[ "${1:-}" == --report-reasons ]]; then report=1; skip="$2"; shift 2; fi
   while IFS=$'\t' read -r token app; do
-    if brewau_in_words "${token}" "${skip}"; then
-      brewau_protection_failure "${token}" app-management "${report}"
-      result=1
-      continue
-    fi
     if brewau_app_untrusted "${app}"; then
       echo "brewau: WARNING: ${app} is marked untrusted; an administrator must check it, then run: sudo brewau trust-app '${app}'" >&2
       brewau_protection_failure "${token}" protect-failed "${report}"
@@ -478,6 +506,11 @@ brewau_protect_apps() {
       continue
     fi
     if brewau_app_needs_protection "${app}"; then
+      if grep -Fxq "${app}"$'\tlock' <<<"${skip}"; then
+        brewau_protection_failure "${token}" app-management "${report}" "${app}" lock
+        result=1
+        continue
+      fi
       echo "brewau: protecting ${app}" >&2
       locked=1
       if [[ $# -gt 0 ]]; then
@@ -496,8 +529,8 @@ brewau_protect_apps() {
       if [[ ${locked} -eq 0 ]] || brewau_app_needs_protection "${app}"; then
         echo "brewau: WARNING: could not protect ${app} (App Management permission?)" >&2
         reason=protect-failed
-        [[ "${output}" == *"Operation not permitted"* && "${output}" != *"could not put ${app} back;"* ]] && reason="app-management"
-        brewau_protection_failure "${token}" "${reason}" "${report}"
+        brewau_app_eperm "${app}" "${output}" && reason="app-management"
+        brewau_protection_failure "${token}" "${reason}" "${report}" "${app}" lock
         result=1
         continue
       elif [[ "${BREWAU_APPS_BASELINE}" != "1" ]] && ! brewau_app_trusted "${app}"; then
@@ -508,12 +541,17 @@ brewau_protect_apps() {
         continue
       fi
     fi
+    if grep -Fxq "${app}"$'\tpin' <<<"${skip}"; then
+      brewau_protection_failure "${token}" app-management "${report}" "${app}" pin
+      result=1
+      continue
+    fi
     if ! output="$(brewau_pin_app "${app}" "$@" 2>&1)"; then
       [[ -z "${output}" ]] || printf '%s\n' "${output}" >&2
       echo "brewau: WARNING: could not pin ${app} in place (App Management permission?)" >&2
       reason=protect-failed
-      [[ "${output}" == *"Operation not permitted"* ]] && reason="app-management"
-      brewau_protection_failure "${token}" "${reason}" "${report}"
+      brewau_app_eperm "${app}" "${output}" && reason="app-management"
+      brewau_protection_failure "${token}" "${reason}" "${report}" "${app}" pin
       result=1
     fi
   done < <(brewau_cask_apps "${json}")
