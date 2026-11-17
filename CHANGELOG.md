@@ -4,10 +4,20 @@ All notable changes to brewau. The format follows [Keep a Changelog](https://kee
 and versions follow [Semantic Versioning](https://semver.org/). Details of each finding behind
 0.4.0 are in [FIXES.md](FIXES.md).
 
-## [0.8.1] - 2026-11-09
+## [0.9.0] - 2026-11-17
+
+### Added
+
+- `brew shellenv` sets `NPM_CONFIG_PREFIX=$HOME/.npm-global` and `GEM_HOME=$HOME/.gem`
+  and adds their bin directories to PATH when the user has not set their own prefixes.
+  This avoids `npm install -g` failing with EACCES under `/opt/homebrew`.
+- `brewau doctor` checks npm and gem prefix writability and lists shared npm globals in
+  `/opt/homebrew/lib/node_modules` for per-user reinstallation.
 
 ### Fixed
 
+- `brewau doctor` no longer repeats stale App Management warnings from old log lines: it
+  checks the latest result and current blocks.
 - `brewau doctor` no longer reports `_brewau` as visible when `dscl` returns the native
   attribute name `dsAttrTypeNative:IsHidden`.
 - The 0.8.0 release notes pointed to `/var/log/system.log` for sudo audit entries; on the

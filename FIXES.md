@@ -26,12 +26,17 @@ All fixed items have tests (`make test`) except where root is needed (noted).
 | A standing block hid other job failures; a single status lost independent failures. | Review | Record all failed steps in `errors`, and report them alongside blocks. |
 | A scheduler failure after a block-only run was hidden. | Review | Report the scheduler failure separately when the result does not explain it. |
 
-### 0.8.1 fixes
+### 0.9.0 fixes and additions
 
 - [x] `brewau doctor` falsely reported a visible account when `dscl` printed the native
   `dsAttrTypeNative:IsHidden` attribute; parse the attribute value correctly.
 - [x] The sudo audit location in the 0.8.0 notes pointed to `/var/log/system.log`; the README
   now points to the unified log observed on this Mac.
+
+- [x] `brew shellenv` supplies per-user npm and gem prefixes when not configured, and doctor
+  checks writability and lists old shared npm globals.
+- [x] Doctor checks current App Management blocks and the latest result instead of warning from
+  stale log entries (with a legacy fallback when no result exists).
 
 ### Open follow-ups
 

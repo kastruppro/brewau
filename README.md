@@ -138,6 +138,16 @@ to `_brewau`, allowlists any taps you already have, and loads the daily job. On 
 only, it also adds the console user and the previous prefix owner to `brewau_users`; upgrades
 leave group membership alone, so `deny-user` sticks.
 
+After `brewau setup-shell`, open a new shell so its `eval "$(brew shellenv)"` takes effect.
+Unless you have configured your own prefix, it sets npm's prefix to `~/.npm-global` and
+`GEM_HOME` to `~/.gem`, and adds their `bin` directories to PATH. Set `NPM_CONFIG_PREFIX`
+(or `npm_config_prefix` or an npm user config `prefix`) and `GEM_HOME` before shellenv to use
+your own prefixes. `npm install -g` and `gem install` then use those per-user locations.
+
+`brewau doctor` lists existing shared npm globals under `/opt/homebrew/lib/node_modules`.
+Reinstall each package as your user with `npm install -g <package>` after opening the new shell;
+check that it works before removing the old shared copy through your administrator.
+
 ## Updating brewau
 
 brewau updates itself from its own tap, `kastruppro/tap`, which it adds to `ALLOWED_TAPS` (once,
@@ -295,9 +305,9 @@ The menu also offers retry and a link to App Management settings.
 ## Limitations
 
 - `brew bundle` is blocked: Brewfiles are Ruby.
-- Files under `/opt/homebrew` are no longer writable by you. That includes `npm -g`,
-  `gem install` into Homebrew's Ruby, and editing configs in `/opt/homebrew/etc`. Use
-  per-user prefixes (`npm config set prefix ~/.npm-global`), or `sudo -u _brewau` for one-off config edits.
+- Files under `/opt/homebrew` are no longer writable by you. npm global and gem installs use
+  per-user prefixes after shell setup; editing configs in `/opt/homebrew/etc` still requires
+  appropriate privileges (e.g. `sudo -u _brewau` for one-off config edits).
 - Apps installed by casks can no longer update themselves as you (they are owned by
   `_brewau`); the nightly job updates them instead, including self-updating ones with
   `UPGRADE_GREEDY=1`.
