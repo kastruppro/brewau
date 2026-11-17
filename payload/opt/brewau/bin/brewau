@@ -209,7 +209,7 @@ doctor_sudoers() {
 }
 
 doctor_app_protection() {
-  local file array count i reason name seen=$'\n' protection_failed=0
+  local file array count i reason name seen=$'\n' protection_failed=0 named_failure=0
   for file in "${BREWAU_STATE_DIR}/last-result.json" "${BREWAU_STATE_DIR}/blocked-casks.json"; do
     [[ -e "${file}" ]] || continue
     if ! plutil -convert xml1 -o /dev/null "${file}" >/dev/null 2>&1; then
@@ -224,13 +224,19 @@ doctor_app_protection() {
         case "${reason}" in app-management | protect-failed) ;; *) continue ;; esac
         if [[ "${array}" == errors ]]; then protection_failed=1; continue; fi
         name="$(plutil -extract "${array}.${i}.name" raw -o - "${file}" 2>/dev/null)"
-        [[ -n "${name}" && "${seen}" != *$'\n'"${name}"$'\n'* ]] || continue
-        seen+="${name}"$'\n'
-        bad "${name} is blocked or unprotected (${reason}); allow macOS App Management for the upgrade job, then: sudo brewau clear-blocked"
+        [[ -n "${name}" && "${seen}" != *$'\n'"${name}:${reason}"$'\n'* ]] || continue
+        seen+="${name}:${reason}"$'\n'
+        if [[ "${reason}" == app-management ]]; then
+          echo "Blocked cask: ${name} (macOS App Management)"
+          echo "Skipped until a newer version or manual upgrade; retry with: sudo brewau clear-blocked"
+        else
+          named_failure=1
+          bad "${name} is unprotected (${reason}); see: brewau log"
+        fi
       done
     done
   done
-  if [[ ${protection_failed} == 1 && "${seen}" == $'\n' ]]; then
+  if [[ ${protection_failed} == 1 && ${named_failure} == 0 ]]; then
     bad "latest run could not protect apps; see: brewau log"
   fi
   if [[ ! -e "${BREWAU_STATE_DIR}/last-result.json" ]]; then

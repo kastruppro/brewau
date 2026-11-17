@@ -410,7 +410,7 @@ brewau_cache_forbidden_taps() {
 
 # Prints "token<TAB>path" for every installed app artifact in the output of
 # `brew info --json=v2 --installed --cask`, read from the file $1.
-brewau_cask_apps() {
+brewau_cask_app_targets() {
   local json="$1" casks artifacts i j token target
   casks="$(plutil -extract casks raw -o - "${json}" 2>/dev/null)" || return 0
   [[ "${casks}" =~ ^[0-9]+$ ]] || return 0
@@ -422,10 +422,23 @@ brewau_cask_apps() {
       plutil -extract "casks.${i}.artifacts.${j}.app" raw -o - "${json}" >/dev/null 2>&1 || continue
       target="$(plutil -extract "casks.${i}.artifacts.${j}.target" raw -o - "${json}" 2>/dev/null)" || continue
       [[ "${target}" == "${BREWAU_APPDIR}"/*.app && "${target}" != *..* ]] || continue
-      # Symlinks too: brew would run the cask's steps from wherever one points.
-      [[ -d "${target}" || -L "${target}" ]] && printf '%s\t%s\n' "${token}" "${target}"
+      printf '%s\t%s\n' "${token}" "${target}"
     done
   done
+}
+
+# Symlinks too: brew would run the cask's steps from wherever one points.
+brewau_cask_apps() {
+  local token target
+  while IFS=$'\t' read -r token target; do
+    [[ -d "${target}" || -L "${target}" ]] && printf '%s\t%s\n' "${token}" "${target}"
+  done < <(brewau_cask_app_targets "$1")
+}
+
+brewau_protection_failure() {
+  printf '%s' "$1"
+  [[ "$3" == 1 ]] && printf '\t%s' "$2"
+  printf '\n'
 }
 
 # Prints the installed path of every app artifact (see brewau_cask_apps).
@@ -441,19 +454,26 @@ brewau_cask_app_paths() {
 # $1 is the JSON file; the rest is an optional command prefix that gives root
 # (e.g. sudo -n). Prints the tokens of casks whose apps are still unprotected
 # afterwards or untrusted (and then fails); progress goes to stderr.
+# --report-reasons <skip-tokens> adds a tab-separated cause and skips known blocks.
 brewau_protect_apps() {
-  local json="$1" token app locked result=0
+  local json="$1" token app locked output reason result=0 report=0 skip=""
   shift
+  if [[ "${1:-}" == --report-reasons ]]; then report=1; skip="$2"; shift 2; fi
   while IFS=$'\t' read -r token app; do
+    if brewau_in_words "${token}" "${skip}"; then
+      brewau_protection_failure "${token}" app-management "${report}"
+      result=1
+      continue
+    fi
     if brewau_app_untrusted "${app}"; then
       echo "brewau: WARNING: ${app} is marked untrusted; an administrator must check it, then run: sudo brewau trust-app '${app}'" >&2
-      echo "${token}"
+      brewau_protection_failure "${token}" protect-failed "${report}"
       result=1
       continue
     fi
     if [[ -L "${app}" ]]; then
       echo "brewau: WARNING: ${app} is a symlink; an administrator must remove it, then reinstall the cask" >&2
-      echo "${token}"
+      brewau_protection_failure "${token}" protect-failed "${report}"
       result=1
       continue
     fi
@@ -461,10 +481,11 @@ brewau_protect_apps() {
       echo "brewau: protecting ${app}" >&2
       locked=1
       if [[ $# -gt 0 ]]; then
-        "$@" /bin/bash -p -c 'source /opt/brewau/libexec/common.sh && brewau_lock_app "$1"' brewau "${app}" </dev/null >&2 || locked=0
+        output="$("$@" /bin/bash -p -c 'source /opt/brewau/libexec/common.sh && brewau_lock_app "$1"' brewau "${app}" </dev/null 2>&1)" || locked=0
       else
-        (brewau_lock_app "${app}") </dev/null >&2 || locked=0
+        output="$(brewau_lock_app "${app}" </dev/null 2>&1)" || locked=0
       fi
+      [[ -z "${output}" ]] || printf '%s\n' "${output}" >&2
       # On the first install apps are taken as they are (see BREWAU_APPS_BASELINE).
       [[ "${BREWAU_APPS_BASELINE}" == "1" ]] && { brewau_record_app "${app}" || true; }
       # Locked but not replaced by a fresh copy (see brewau_lock_app): files
@@ -474,20 +495,25 @@ brewau_protect_apps() {
       fi
       if [[ ${locked} -eq 0 ]] || brewau_app_needs_protection "${app}"; then
         echo "brewau: WARNING: could not protect ${app} (App Management permission?)" >&2
-        echo "${token}"
+        reason=protect-failed
+        [[ "${output}" == *"Operation not permitted"* && "${output}" != *"could not put ${app} back;"* ]] && reason="app-management"
+        brewau_protection_failure "${token}" "${reason}" "${report}"
         result=1
         continue
       elif [[ "${BREWAU_APPS_BASELINE}" != "1" ]] && ! brewau_app_trusted "${app}"; then
         echo "brewau: WARNING: ${app} could be changed by others, and it no longer carries the signature brewau recorded." >&2
         echo "brewau: an administrator must check it, then run: sudo brewau trust-app '${app}'" >&2
-        echo "${token}"
+        brewau_protection_failure "${token}" protect-failed "${report}"
         result=1
         continue
       fi
     fi
-    if ! brewau_pin_app "${app}" "$@"; then
+    if ! output="$(brewau_pin_app "${app}" "$@" 2>&1)"; then
+      [[ -z "${output}" ]] || printf '%s\n' "${output}" >&2
       echo "brewau: WARNING: could not pin ${app} in place (App Management permission?)" >&2
-      echo "${token}"
+      reason=protect-failed
+      [[ "${output}" == *"Operation not permitted"* ]] && reason="app-management"
+      brewau_protection_failure "${token}" "${reason}" "${report}"
       result=1
     fi
   done < <(brewau_cask_apps "${json}")
@@ -500,10 +526,11 @@ brewau_protect_apps() {
 # still unprotected or untrusted and returns 1, or returns 2 if the installed
 # casks could not be listed.
 brewau_protect_installed_apps() {
-  local json result=0
+  local json result=0 report_args=()
+  if [[ "${1:-}" == --report-reasons ]]; then report_args=("$1" "$2"); shift 2; fi
   json="$(mktemp "${BREWAU_TMP}/casks.XXXXXX")" || return 2
   if (brewau_exec_brew info --json=v2 --installed --cask) >"${json}" 2>/dev/null; then
-    brewau_protect_apps "${json}" "$@" || result=1
+    brewau_protect_apps "${json}" ${report_args[@]+"${report_args[@]}"} "$@" || result=1
     brewau_record_apps "${json}"
   else
     echo "brewau: WARNING: could not list installed casks to protect their apps" >&2
@@ -528,7 +555,7 @@ brewau_pin_app() {
   local app="$1"
   shift
   [[ "$(brewau_acl "${app}")" == "${BREWAU_APP_ACL_SHOWN}" ]] && return 0
-  "$@" /bin/chmod -h +a "${BREWAU_APP_ACL}" "${app}" 2>/dev/null &&
+  "$@" /bin/chmod -h +a "${BREWAU_APP_ACL}" "${app}" &&
     [[ "$(brewau_acl "${app}")" == "${BREWAU_APP_ACL_SHOWN}" ]]
 }
 

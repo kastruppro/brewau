@@ -179,6 +179,42 @@ check "fail" "$(brewau_unlink_copy "${BREWAU_APPDIR}/Linked.app/Contents/flagged
 chflags nouchg "${OUTSIDE}/shared"
 check "fail" "$( (brewau_lock_app "${BREWAU_APPDIR}/Link.app") && echo ok || echo fail)" "a symlinked app is refused"
 
+# Reason reporting is opt-in; policy callers keep the plain-token contract.
+for stage in lock pin; do
+  for error in 'Operation not permitted' 'Permission denied'; do
+    got="$(
+      brewau_cask_apps() { printf 'paseo\t%s/Paseo.app\n' "${BREWAU_APPDIR}"; }
+      brewau_app_untrusted() { return 1; }
+      brewau_app_needs_protection() { [[ "${stage}" == lock ]]; }
+      brewau_lock_app() { echo "mv: $1: ${error}" >&2; return 1; }
+      brewau_acl() { :; }
+      root_command() { echo "chmod: ${BREWAU_APPDIR}/Paseo.app: ${error}" >&2; return 1; }
+      if [[ "${stage}" == lock ]]; then
+        brewau_protect_apps unused --report-reasons '' 2>/dev/null
+      else
+        brewau_protect_apps unused --report-reasons '' root_command 2>/dev/null
+      fi
+    )"
+    reason=protect-failed
+    [[ "${error}" == 'Operation not permitted' ]] && reason=app-management
+    check "paseo"$'\t'"${reason}" "${got}" "${stage}: ${error} has the precise cause"
+  done
+done
+got="$(
+  brewau_cask_apps() { printf 'paseo\t%s/Paseo.app\n' "${BREWAU_APPDIR}"; }
+  brewau_app_untrusted() { return 1; }
+  brewau_app_needs_protection() { return 0; }
+  brewau_lock_app() { echo "mv: $1: Operation not permitted" >&2; echo "brewau: WARNING: could not put $1 back; it is in staging/old" >&2; return 1; }
+  brewau_protect_apps unused --report-reasons '' 2>/dev/null
+)"
+check "paseo"$'\tprotect-failed' "${got}" "failed rollback is not downgraded to a block"
+got="$(
+  brewau_cask_apps() { printf 'paseo\t%s/Paseo.app\n' "${BREWAU_APPDIR}"; }
+  brewau_app_untrusted() { echo 'must not attempt protection'; return 0; }
+  brewau_protect_apps unused --report-reasons paseo 2>/dev/null
+)"
+check "paseo"$'\tapp-management' "${got}" "known scheduled block avoids protection work"
+
 # --- code signatures ---------------------------------------------------------
 BREWAU_APP_STATE_DIR="${WORK}/state/apps"
 APP="${BREWAU_APPDIR}/Signed.app"
