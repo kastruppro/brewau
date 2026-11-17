@@ -258,23 +258,52 @@ clean_tmp() {
 
 # Only artifact errors for this cask's validated app target imply App Management.
 cask_app_management_error() {
-  local name="$1" output="$2" catalog token app line diagnostics="" explicit=0
+  local name="$1" output="$2" catalog token app line diagnostics="" explicit=0 wrappers="" wrapper command tool prefix rest explained
   while IFS= read -r line; do
+    line="${line#"${line%%[![:space:]]*}"}"
     [[ "${line}" != *"Rolling back"* && "${line}" != *"rollback"* ]] || return 1
     case "${line}" in
       cp:* | mv:* | ditto:* | chmod:* | chown:* | chflags:*) diagnostics+="${line}"$'\n' ;;
       *"App Management permissions"*) explicit=1 ;;
-      curl:* | tar:* | unzip:* | hdiutil:* | rsync:*) return 1 ;;
       Error:* | *'Error: '*)
-        [[ "${line}" == *'Failure while executing;'* ]] || return 1 ;;
+        [[ "${line}" == *'Failure while executing;'* ]] || return 1
+        wrappers+="${line}"$'\n' ;;
+      Warning:* | '==>'* | '') ;;
+      *:*) return 1 ;;
     esac
   done <<<"${output}"
+  while IFS= read -r wrapper; do
+    [[ -n "${wrapper}" ]] || continue
+    command="${wrapper#*\`}"
+    if [[ "${command}" == '/usr/bin/sudo '* ]]; then
+      [[ "${command}" == *' -- '* ]] || return 1
+      command="${command#* -- }"
+    fi
+    command="${command%% *}"
+    case "${command}" in /bin/cp | /bin/mv | /usr/bin/ditto | /bin/chmod | /usr/sbin/chown | /usr/bin/chflags) ;; *) return 1 ;; esac
+    tool="${command##*/}"
+    awk -F: -v tool="${tool}" '$1 == tool {found=1} END {exit !found}' <<<"${diagnostics}" || return 1
+  done <<<"${wrappers}"
   if [[ -z "${diagnostics}" ]]; then [[ ${explicit} == 1 ]]; return; fi
   catalog="$(mktemp "${BREWAU_TMP}/cask-error.XXXXXX")" || return 1
   if ! brew_run info --json=v2 --installed --cask >"${catalog}"; then rm -f "${catalog}"; return 1; fi
   while IFS=$'\t' read -r token app; do
     [[ "${token}" == "${name##*/}" ]] || continue
-    if brewau_app_eperm "${app}" "${diagnostics}"; then rm -f "${catalog}"; return 0; fi
+    if brewau_app_eperm "${app}" "${diagnostics}"; then
+      explained=1
+      while IFS= read -r wrapper; do
+        [[ -n "${wrapper}" ]] || continue
+        command="${wrapper#*\`}"; command="${command%%\`*}"
+        explained=0
+        for prefix in ' ' "'" '"'; do
+          [[ "${command}" == *"${prefix}${app}"* ]] || continue
+          rest="${command#*"${prefix}${app}"}"
+          case "${rest}" in '' | ' '* | /* | \'* | \"*) explained=1; break ;; esac
+        done
+        [[ ${explained} == 1 ]] || break
+      done <<<"${wrappers}"
+      if [[ ${explained} == 1 ]]; then rm -f "${catalog}"; return 0; fi
+    fi
   done < <(brewau_cask_app_targets "${catalog}")
   rm -f "${catalog}"
   return 1
@@ -313,7 +342,7 @@ protect_for_upgrade() {
     [[ -n "${token}" ]] || continue
     brewau_in_words "${token}" "${seen}" && continue
     seen="${seen} ${token}"
-    grep -Eq "^${token}"$'\tprotect-failed(\t|$)' <<<"${report}" && cause=protect-failed
+    awk -F '\t' -v token="${token}" '$1 == token && $2 == "protect-failed" {found=1} END {exit !found}' <<<"${report}" && cause=protect-failed
     unprotected="${unprotected} ${token}"
     # A different failure for another app in the same cask must still win.
     if [[ "${cause}" == app-management ]] &&

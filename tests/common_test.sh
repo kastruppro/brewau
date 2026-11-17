@@ -179,6 +179,24 @@ check "fail" "$(brewau_unlink_copy "${BREWAU_APPDIR}/Linked.app/Contents/flagged
 chflags nouchg "${OUTSIDE}/shared"
 check "fail" "$( (brewau_lock_app "${BREWAU_APPDIR}/Link.app") && echo ok || echo fail)" "a symlinked app is refused"
 
+# Native macOS denial formats reproduced with sandbox-exec on disposable files.
+for diagnostic in \
+  "chmod: Failed to set ACL on file '${BREWAU_APPDIR}/Native.app': Operation not permitted" \
+  "chown: ${BREWAU_APPDIR}/Native.app: Operation not permitted" \
+  "xattr: [Errno 1] Operation not permitted: '${BREWAU_APPDIR}/Native.app'"; do
+  check yes "$(brewau_app_eperm "${BREWAU_APPDIR}/Native.app" "${diagnostic}" && echo yes)" "native chmod/chown/xattr EPERM targets the app"
+  check no "$(brewau_app_eperm "${BREWAU_APPDIR}/Other.app" "${diagnostic}" || echo no)" "native denial on another target is not attributed to this app"
+done
+got="$(
+  brewau_cask_apps() { printf 'paseo\t%s/Native.app\n' "${BREWAU_APPDIR}"; }
+  brewau_app_untrusted() { return 1; }
+  brewau_app_needs_protection() { return 1; }
+  brewau_acl() { :; }
+  denied_chmod() { echo "chmod: Failed to set ACL on file '${BREWAU_APPDIR}/Native.app': Operation not permitted" >&2; return 1; }
+  brewau_protect_apps unused --report-reasons '' denied_chmod 2>/dev/null
+)"
+check "paseo"$'\tapp-management' "$(cut -f1,2 <<<"${got}")" "real chmod ACL denial becomes an app-management pin block"
+
 # Reason reporting is opt-in; policy callers keep the plain-token contract.
 for stage in lock pin; do
   for error in 'Operation not permitted' 'Permission denied'; do

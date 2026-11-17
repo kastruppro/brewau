@@ -333,6 +333,60 @@ for error in \
   check '[[ "$(plutil -extract blocked raw -o - "${BREWAU_STATE_DIR}/last-result.json")" == 0 ]]' "failure does not persist a block"
 done
 
+for independent in \
+  'rm: /private/tmp/unrelated: Operation not permitted' \
+  'rm: /private/tmp/unrelated: Permission denied' \
+  'mkdir: /private/tmp/unrelated: Permission denied' \
+  'rmdir: /private/tmp/unrelated: Permission denied' \
+  "xattr: [Errno 1] Operation not permitted: '/private/tmp/unrelated'" \
+  'unknown-tool: independent failure'; do
+  for signal in 'cp: /Applications/Paseo.app/file: Operation not permitted' 'App Management permissions'; do
+    scenario "independent utility diagnostics remain failures"
+    MOCK_CATALOG='{"casks":[{"token":"paseo","artifacts":[{"app":["Paseo.app"],"target":"/Applications/Paseo.app"}]}]}'
+    MOCK_OUTDATED_CASKS=paseo
+    MOCK_CASK_FAIL=paseo
+    MOCK_CASK_ERROR="${signal}"$'\n'"${independent}"
+    run
+    check '[[ ${RC} != 0 && "${STATUS}" == upgrade-failed ]]' "explicit or artifact EPERM does not hide utility diagnostics"
+    check '[[ "$(plutil -extract blocked raw -o - "${BREWAU_STATE_DIR}/last-result.json")" == 0 ]]' "independent error never creates a block"
+  done
+done
+for command in '/usr/bin/sudo -E -- /bin/cp source /Applications/Paseo.app' '/bin/cp source "/Applications/Paseo.app"' '/bin/rm /private/tmp/unrelated' '/bin/bash script.sh' '/bin/cp /private/tmp/a /private/tmp/b'; do
+  scenario "failed-command wrapper must describe the artifact operation"
+  MOCK_CATALOG='{"casks":[{"token":"paseo","artifacts":[{"app":["Paseo.app"],"target":"/Applications/Paseo.app"}]}]}'
+  MOCK_OUTDATED_CASKS=paseo
+  MOCK_CASK_FAIL=paseo
+  MOCK_CASK_ERROR="Error: paseo: Failure while executing; \`${command}\` exited with 1. Here's the output:"$'\ncp: /Applications/Paseo.app/file: Operation not permitted'
+  run
+  if [[ "${command}" == *'/bin/cp source '* ]]; then
+    check '[[ ${RC} == 0 && "${STATUS}" == blocked ]]' "matching native cp wrapper permits the artifact block"
+  else
+    check '[[ ${RC} != 0 && "${STATUS}" == upgrade-failed ]]' "unrelated failed wrapper remains a failure"
+  fi
+done
+scenario "every failed wrapper must be explained"
+MOCK_CATALOG='{"casks":[{"token":"paseo","artifacts":[{"app":["Paseo.app"],"target":"/Applications/Paseo.app"}]}]}'
+MOCK_OUTDATED_CASKS=paseo
+MOCK_CASK_FAIL=paseo
+MOCK_CASK_ERROR=$'Error: Failure while executing; `/bin/rm /private/tmp/unrelated` exited with 1.\nError: Failure while executing; `/bin/cp source /Applications/Paseo.app` exited with 1.\ncp: /Applications/Paseo.app/file: Operation not permitted'
+run
+check '[[ ${RC} != 0 && "${STATUS}" == upgrade-failed ]]' "later matching wrapper cannot hide an earlier independent command failure"
+
+for token in tool+ tool.; do
+  scenario "mixed report matches punctuation literally"
+  MOCK_OUTDATED_CASKS="${token}"
+  MOCK_PROTECT_REPORT="${token}"$'\tapp-management\t/Applications/A.app\tpin\n'"${token}"$'\tprotect-failed\t/Applications/B.app\tlock'
+  run
+  check '[[ ${RC} != 0 && "${STATUS}" == protect-failed ]]' "literal punctuation token retains its independent protection failure"
+  check '[[ "$(plutil -extract blocked raw -o - "${BREWAU_STATE_DIR}/last-result.json")" == 0 ]]' "same-token mixed failure is never blocked"
+done
+scenario "dot token does not match a different token"
+MOCK_OUTDATED_CASKS='tool. toolx'
+MOCK_PROTECT_REPORT=$'tool.\tapp-management\t/Applications/A.app\tpin\ntoolx\tprotect-failed\t/Applications/B.app\tlock'
+run
+check '[[ "$(plutil -extract blocked.0.name raw -o - "${BREWAU_STATE_DIR}/last-result.json")" == tool. ]]' "dot token keeps its own block despite another token failure"
+check '[[ ${RC} != 0 && "${STATUS}" == protect-failed ]]' "other token independent failure is retained"
+
 scenario "protection EPERM blocks once and follows version lifecycle"
 MOCK_OUTDATED_CASKS=paseo
 MOCK_UNPROTECTED=paseo

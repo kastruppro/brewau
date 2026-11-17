@@ -442,8 +442,10 @@ brewau_app_eperm() {
     [[ -n "${line}" ]] || continue
     [[ "${line}" != *"Rolling back"* && "${line}" != *"could not put "* ]] || return 1
     case "${line}" in
-      cp:* | mv:* | ditto:* | chmod:* | chown:* | chflags:*)
+      cp:* | mv:* | ditto:* | chmod:* | chown:* | chflags:* | xattr:*)
         case "${line}" in
+          "chmod: Failed to set ACL on file "*) path="${line#chmod: Failed to set ACL on file }" ;;
+          "xattr: [Errno 1] Operation not permitted: "*) path="${line#"xattr: [Errno 1] Operation not permitted: "}"; path="${path}: Operation not permitted" ;;
           *'could not copy '*' to '*) path="${line##* to }" ;;
           'mv: rename '*' to '*)
             path="${line#mv: rename }"; path="${path%% to *}"
@@ -455,9 +457,9 @@ brewau_app_eperm() {
           *) path="${line#*: }"; case "${path}" in utimensat:* | chown:* | chmod:* | chflags:*) path="${path#*: }" ;; esac ;;
         esac
         path="${path#\"}"; path="${path#\'}"
-        [[ "${path}" == "${app}:"* || "${path}" == "${app}/"* || "${path}" == "${app}\":"* || "${path}" == "${app}\':"* ]] || return 1
+        [[ "${path}" == "${app}:"* || "${path}" == "${app}/"* || "${path}" == "${app}\":"* || "${path}" == "${app}':"* ]] || return 1
         case "${line}" in
-          *': Operation not permitted') found=1 ;;
+          'xattr: [Errno 1] Operation not permitted: '* | *': Operation not permitted') found=1 ;;
           *'could not copy ACL '*'Bad file descriptor' | *': No such file or directory') ;;
           *) return 1 ;;
         esac
