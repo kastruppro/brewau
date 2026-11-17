@@ -256,9 +256,36 @@ clean_tmp() {
   return 0
 }
 
+# Decode Shellwords.shelljoin as data, retaining argument boundaries without a shell.
+shellwords_has_app() {
+  local command="$1" app="$2" arg="" quote="" char escaped=0 found=0 i
+  for ((i=0; i<${#command}; i++)); do
+    char="${command:i:1}"
+    if [[ ${escaped} == 1 ]]; then
+      arg+="${char}"; escaped=0
+    elif [[ "${quote}" == "'" ]]; then
+      if [[ "${char}" == "'" ]]; then quote=""; else arg+="${char}"; fi
+    elif [[ "${char}" == \\ ]]; then
+      escaped=1
+    elif [[ -n "${quote}" ]]; then
+      if [[ "${char}" == "${quote}" ]]; then quote=""; else arg+="${char}"; fi
+    elif [[ "${char}" == "'" || "${char}" == '"' ]]; then
+      quote="${char}"
+    elif [[ "${char}" == ' ' ]]; then
+      [[ "${arg}" == "${app}" || "${arg}" == "${app}/"* ]] && found=1
+      arg=""
+    else
+      arg+="${char}"
+    fi
+  done
+  [[ -z "${quote}" && ${escaped} == 0 ]] || return 1
+  [[ "${arg}" == "${app}" || "${arg}" == "${app}/"* ]] && found=1
+  [[ ${found} == 1 ]]
+}
+
 # Only artifact errors for this cask's validated app target imply App Management.
 cask_app_management_error() {
-  local name="$1" output="$2" catalog token app line diagnostics="" explicit=0 wrappers="" wrapper command tool prefix rest explained
+  local name="$1" output="$2" catalog token app line diagnostics="" explicit=0 wrappers="" wrapper command tool explained
   while IFS= read -r line; do
     line="${line#"${line%%[![:space:]]*}"}"
     [[ "${line}" != *"Rolling back"* && "${line}" != *"rollback"* ]] || return 1
@@ -293,13 +320,8 @@ cask_app_management_error() {
       explained=1
       while IFS= read -r wrapper; do
         [[ -n "${wrapper}" ]] || continue
-        command="${wrapper#*\`}"; command="${command%%\`*}"
-        explained=0
-        for prefix in ' ' "'" '"'; do
-          [[ "${command}" == *"${prefix}${app}"* ]] || continue
-          rest="${command#*"${prefix}${app}"}"
-          case "${rest}" in '' | ' '* | /* | \'* | \"*) explained=1; break ;; esac
-        done
+        command="${wrapper#*\`}"; command="${command%\` exited with *}"
+        shellwords_has_app "${command}" "${app}" || { explained=0; break; }
         [[ ${explained} == 1 ]] || break
       done <<<"${wrappers}"
       if [[ ${explained} == 1 ]]; then rm -f "${catalog}"; return 0; fi

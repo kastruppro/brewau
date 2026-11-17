@@ -364,6 +364,31 @@ for command in '/usr/bin/sudo -E -- /bin/cp source /Applications/Paseo.app' '/bi
     check '[[ ${RC} != 0 && "${STATUS}" == upgrade-failed ]]' "unrelated failed wrapper remains a failure"
   fi
 done
+for target in '/Applications/Parallels Desktop.app' "/Applications/Owner's App.app" '/Applications/Tool "Beta".app' '/Applications/Tool (Beta).app' '/Applications/Æble Ø.app' '/Applications/Tool\Data.app' '/Applications/Tool`data`.app'; do
+  scenario "Ruby Shellwords wrapper for ${target}"
+  MOCK_CATALOG='{"casks":[{"token":"paseo","artifacts":[{"app":["Source.app"],"target":""}]}]}'
+  MOCK_CATALOG="$(plutil -replace casks.0.artifacts.0.target -string "${target}" -o - - <<<"${MOCK_CATALOG}")"
+  MOCK_OUTDATED_CASKS=paseo
+  MOCK_CASK_FAIL=paseo
+  command="$(/usr/bin/ruby -rshellwords -e 'puts ARGV.shelljoin' -- /usr/bin/sudo -E -- /bin/cp -pR source "${target}")"
+  check 'shellwords_has_app "${command}" "${target}"' "real Ruby shelljoin preserves app argument exactly"
+  MOCK_CASK_ERROR="Error: paseo: Failure while executing; \`${command}\` exited with 1. Here's the output:"$'\n'"cp: source: could not copy extended attributes to ${target}/file: Operation not permitted"
+  run
+  check '[[ ${RC} == 0 && "${STATUS}" == blocked ]]' "Homebrew shelljoin wrapper yields app-management"
+  command="$(/usr/bin/ruby -rshellwords -e 'puts ARGV.shelljoin' -- /bin/cp source "${target}.backup")"
+  check '! shellwords_has_app "${command}" "${target}"' "escaped backup path is not the app argument"
+  MOCK_CASK_ERROR="Error: paseo: Failure while executing; \`${command}\` exited with 1. Here's the output:"$'\n'"cp: ${target}/file: Operation not permitted"
+  rm -f "${BREWAU_STATE_DIR}/blocked-casks.json"
+  run
+  check '[[ ${RC} != 0 && "${STATUS}" == upgrade-failed ]]' "wrapper boundary mismatch stays a real failure"
+done
+scenario "Shellwords data is never evaluated or joined across arguments"
+command="$(/usr/bin/ruby -rshellwords -e 'puts ARGV.shelljoin' -- /bin/cp source '/Applications/Parallels' 'Desktop.app')"
+check '! shellwords_has_app "${command}" "/Applications/Parallels Desktop.app"' "distinct arguments cannot form one app path"
+command="$(/usr/bin/ruby -rshellwords -e 'puts ARGV.shelljoin' -- /bin/cp "\$(touch ${WORK}/must-not-exist)" '/Applications/Parallels Desktop.app')"
+check 'shellwords_has_app "${command}" "/Applications/Parallels Desktop.app" && [[ ! -e "${WORK}/must-not-exist" ]]' "command-substitution text remains inert data"
+check '! shellwords_has_app "/bin/cp source \"/Applications/Parallels Desktop.app" "/Applications/Parallels Desktop.app"' "unterminated quote cannot establish a target"
+
 scenario "every failed wrapper must be explained"
 MOCK_CATALOG='{"casks":[{"token":"paseo","artifacts":[{"app":["Paseo.app"],"target":"/Applications/Paseo.app"}]}]}'
 MOCK_OUTDATED_CASKS=paseo
