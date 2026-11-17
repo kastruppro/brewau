@@ -11,19 +11,45 @@ case "${1:-}" in
     shell="${2:-$(basename "${SHELL:-zsh}")}"
     shell="${shell#-}"
     /opt/homebrew/bin/brew shellenv "${shell}" 2>/dev/null
+    npm_default=0 gem_default=0
+    if [[ ! ${NPM_CONFIG_PREFIX+x} && ! ${npm_config_prefix+x} ]] &&
+      ! /usr/bin/grep -Eq '^[[:space:]]*prefix[[:space:]]*=' "${NPM_CONFIG_USERCONFIG:-${npm_config_userconfig:-${HOME}/.npmrc}}" 2>/dev/null; then
+      npm_default=1
+    fi
+    [[ ${GEM_HOME+x} ]] || gem_default=1
+    for variable in NPM_CONFIG_PREFIX GEM_HOME; do
+      if [[ "${variable}" == NPM_CONFIG_PREFIX ]]; then
+        [[ ${npm_default} == 1 ]] || continue
+        value='$HOME/.npm-global'
+      else
+        [[ ${gem_default} == 1 ]] || continue
+        value='$HOME/.gem'
+      fi
+      case "${shell}" in
+        fish) printf 'set -gx %s "%s";\n' "${variable}" "${value}" ;;
+        csh | tcsh) printf 'setenv %s "%s";\n' "${variable}" "${value}" ;;
+        *) printf 'export %s="%s";\n' "${variable}" "${value}" ;;
+      esac
+    done
+    # Include defaults on subsequent evaluations too, without adding unused dirs.
+    dirs='/opt/brewau/bin'
+    if [[ ${npm_default} == 1 || "${NPM_CONFIG_PREFIX:-${npm_config_prefix:-}}" == "${HOME}/.npm-global" ]]; then
+      dirs+=':$HOME/.npm-global/bin'
+    fi
+    if [[ ${gem_default} == 1 || "${GEM_HOME:-}" == "${HOME}/.gem" ]]; then
+      dirs+=':$HOME/.gem/bin'
+    fi
     case "${shell}" in
       zsh)
         echo 'fpath=(/opt/brewau/share/zsh/site-functions ${fpath:#/opt/homebrew/*});'
-        echo 'typeset -U path PATH; path=(/opt/brewau/bin ${path:#/opt/brewau/bin}); export PATH;'
+        printf 'typeset -U path PATH; path=("%s" $path); export PATH;\n' "${dirs//:/\" \"}"
         ;;
-      fish) echo "fish_add_path --global --move --path ${BREWAU_ROOT}/bin;" ;;
-      csh | tcsh) cat <<'PATH_EOF'
-setenv PATH "`printf '%s' "$PATH" | /usr/bin/awk -v RS=: 'BEGIN { printf "/opt/brewau/bin" } $0 != "/opt/brewau/bin" { printf ":%s", $0 }'`";
-PATH_EOF
+      fish) printf 'begin; set -l entries "%s" $PATH; set -gx PATH; for entry in $entries; contains -- "$entry" $PATH; or set -a PATH "$entry"; end; end;\n' "${dirs//:/\" \"}" ;;
+      csh | tcsh)
+        printf 'set -f path = ("%s" $path:q);\n' "${dirs//:/\" \"}"
         ;;
-      *) cat <<'PATH_EOF'
-export PATH="$(printf '%s' "$PATH" | /usr/bin/awk -v RS=: 'BEGIN { printf "/opt/brewau/bin" } $0 != "/opt/brewau/bin" { printf ":%s", $0 }')";
-PATH_EOF
+      *)
+        printf 'export PATH="$(printf '\''%%s'\'' "$PATH" | /usr/bin/awk -v first="%s" -v RS=: '\''BEGIN { n=split(first,a,":"); for(i=1;i<=n;i++) if(seen[a[i]]++ == 0) { printf "%%s%%s", sep,a[i]; sep=":" } } seen[$0]++ == 0 { printf ":%%s", $0 }'\'')";\n' "${dirs}"
         ;;
     esac
     exit 0

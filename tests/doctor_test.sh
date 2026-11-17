@@ -58,6 +58,62 @@ account
 check '[[ "${OUTPUT}" == *"cannot read"* && "${OUTPUT}" == *FAILED=1 ]]' "unreadable account warns"
 unset DSCL_RC
 
+BREWAU_STATE_DIR="${WORK}/state"
+BREWAU_LOG_DIR="${WORK}/logs"
+mkdir -p "${BREWAU_STATE_DIR}" "${BREWAU_LOG_DIR}"
+echo 'could not protect Docker.app' >"${BREWAU_LOG_DIR}/upgrade.log"
+protection() { FAILED=0; OUTPUT="$(doctor_app_protection; echo "FAILED=${FAILED}")"; }
+protection
+check '[[ "${OUTPUT}" == *Docker.app* && "${OUTPUT}" == *FAILED=1 ]]' "legacy log fallback names app"
+printf '%s' '{"status":"ok","blocked":[],"errors":[]}' >"${BREWAU_STATE_DIR}/last-result.json"
+protection
+check '[[ "${OUTPUT}" == *FAILED=0 ]]' "clean result overrides old protection log"
+printf '%s' '{"blocked":[{"name":"docker","reason":"app-management"}]}' >"${BREWAU_STATE_DIR}/blocked-casks.json"
+protection
+check '[[ "${OUTPUT}" == *docker* && "${OUTPUT}" == *FAILED=1 ]]' "persistent blocks remain visible after clean result"
+rm "${BREWAU_STATE_DIR}/blocked-casks.json"
+printf '%s' '{"blocked":[{"name":"parallels","reason":"app-management"}],"failed":[{"name":"docker","reason":"protect-failed"}],"errors":[{"stage":"protect","reason":"protect-failed"}]}' >"${BREWAU_STATE_DIR}/last-result.json"
+protection
+check '[[ "${OUTPUT}" == *parallels* && "${OUTPUT}" == *docker* && "${OUTPUT}" == *FAILED=1 ]]' "current protection failures name affected casks"
+printf '%s' '{"errors":[{"stage":"protect","reason":"protect-failed"}]}' >"${BREWAU_STATE_DIR}/last-result.json"
+protection
+check '[[ "${OUTPUT}" == *"latest run could not protect"* && "${OUTPUT}" == *FAILED=1 ]]' "unnamed protection error is reported"
+echo "{broken" >"${BREWAU_STATE_DIR}/last-result.json"
+protection
+check '[[ "${OUTPUT}" == *"cannot read app protection state"* && "${OUTPUT}" != *Docker.app* ]]' "invalid state warns without historical log fallback"
+
+USER_PATH="${PATH}"
+HOMEBREW_PREFIX_PATH="${WORK}/homebrew"
+mkdir -p "${HOMEBREW_PREFIX_PATH}/lib/node_modules/npm" "${HOMEBREW_PREFIX_PATH}/lib/node_modules/@microsoft/learn-cli" "${HOMEBREW_PREFIX_PATH}/lib/node_modules/plain"
+PREFIX="${WORK}/per user/new"
+npm() { [[ "$*" == 'config get prefix' ]] && printf '%s\n' "${PREFIX}"; }
+gem() { [[ "$*" == 'environment home' ]] && printf '%s\n' "${PREFIX}"; }
+id() { if [[ "$1" == -u ]]; then echo 501; else echo tester; fi; }
+languages() { FAILED=0; OUTPUT="$(doctor_language_prefixes; echo "FAILED=${FAILED}")"; }
+languages
+check '[[ "${OUTPUT}" == *FAILED=0 && "${OUTPUT}" == *"npm installs are writable"* && "${OUTPUT}" == *"gem installs are writable"* ]]' "missing user prefixes can be created without side effects"
+check '[[ ! -e "${PREFIX}" ]]' "doctor does not create prefixes"
+check '[[ "${OUTPUT}" == *"npm install -g @microsoft/learn-cli"* && "${OUTPUT}" == *"npm install -g plain"* && "${OUTPUT}" != *"shared npm global npm;"* ]]' "leftover globals include scoped packages and omit npm"
+PREFIX="relative"
+languages
+check '[[ "${OUTPUT}" == *FAILED=1 && "${OUTPUT}" == *"not writable"* ]]' "invalid effective prefix warns"
+PREFIX="${WORK}/not-a-directory"
+touch "${PREFIX}"
+languages
+check '[[ "${OUTPUT}" == *FAILED=1 ]]' "non-directory prefix warns"
+PREFIX=''
+languages
+check '[[ "${OUTPUT}" == *unknown* && "${OUTPUT}" == *FAILED=1 ]]' "unknown effective prefixes cannot pass"
+unset -f npm gem
+USER_PATH="${WORK}/missing-tools"
+languages
+check '[[ "${OUTPUT}" != *"installs are writable"* && "${OUTPUT}" != *"install directory is not writable"* ]]' "absent tools skip prefix checks"
+id() { echo 0; }
+languages
+check '[[ "${OUTPUT}" == *"as your normal user"* && "${OUTPUT}" == *FAILED=0 ]]' "root does not execute user tools"
+unset -f id
+USER_PATH="${PATH}"
+
 BREWAU_SUDOERS="${WORK}/managed"
 OTHER="${WORK}/other"
 printf '%s ALL=(root) NOPASSWD: ALL\n' "${BREWAU_USER}" >"${BREWAU_SUDOERS}"
