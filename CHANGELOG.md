@@ -4,6 +4,20 @@ All notable changes to brewau. The format follows [Keep a Changelog](https://kee
 and versions follow [Semantic Versioning](https://semver.org/). Details of each finding behind
 0.4.0 are in [FIXES.md](FIXES.md).
 
+## [0.9.1] - 2026-11-17
+
+### Fixed
+
+- Casks blocked by macOS App Management are now blocked per version and reported once even
+  without Homebrew's explicit permissions message. This includes `Operation not permitted`
+  from Homebrew's `cp`, `mv` or `ditto` targeting the cask's app, and failures to lock or pin
+  the installed app, including native chmod ACL and xattr denials. Paseo previously failed
+  every two hours. Independent failures and failed Homebrew rollbacks remain failures.
+- Homebrew's shell-escaped app paths (such as `Parallels\ Desktop.app`) are recognised, and
+  cask names such as `tool+` are compared literally.
+- A standing block no longer skips untrusted-file and symlink checks or protection of the
+  cask's other files.
+
 ## [0.9.0] - 2026-11-17
 
 ### Added

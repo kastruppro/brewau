@@ -38,6 +38,14 @@ All fixed items have tests (`make test`) except where root is needed (noted).
 - [x] Doctor checks current App Management blocks and the latest result instead of warning from
   stale log entries (with a legacy fallback when no result exists).
 
+### 0.9.1 fixes
+
+- [x] Paseo repeatedly failed when App Management denied app protection without Homebrew's
+  explicit permissions message; recognise app-targeted denials and block the affected version.
+- [x] Preserve independent failures and failed rollbacks beside blocks; match cask names
+  literally and recognise shell-escaped app paths.
+- [x] Keep untrusted-file and symlink checks and protect other app files beside a standing block.
+
 ### Open follow-ups
 
 - Redesign App Management around a signed `brewau-agent` with fixed identifier
@@ -47,6 +55,7 @@ All fixed items have tests (`make test`) except where root is needed (noted).
   delivery remain untested.
 - Live test blocking, offline behaviour and notifications on an installed build. The App
   Management block test is still pending: Docker updated itself before it could be reproduced.
+  It can be verified with Paseo on the owner’s Mac after installation.
 - Doctor's sudoers scan is lexical: aliases can cause false positives and UID or netgroup grants can escape it.
 - The worktree post-start hook copies `build/` (444 MB) into every worktree.
 

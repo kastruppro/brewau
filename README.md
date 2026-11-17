@@ -197,7 +197,7 @@ sudo brewau config add ALLOWED_TAPS openai/tools     # add to a list (and trust 
 sudo brewau config remove ALLOWED_TAPS openai/tools
 sudo brewau config set UPGRADE_MODE daily
 sudo brewau allow-user alice
-sudo brewau clear-blocked # retry blocked casks on the next run
+sudo brewau clear-blocked # retry App Management-blocked casks, including protection failures
 sudo brewau repair     # re-apply ownership, permissions and system files
 sudo brewau trust-app /Applications/Foo.app   # after checking an app brewau marked untrusted
 sudo brewau self-update                       # update brewau now from kastruppro/tap
@@ -299,7 +299,8 @@ blocks changes to app bundles, even by root, unless the app that started the com
 Enable your terminal (Terminal, iTerm, Ghostty, ...) in System Settings → Privacy & Security →
 App Management and run the command again. The scheduled job cannot obtain App Management
 without an MDM-delivered PPPC grant. Update blocked apps manually from an allowed terminal;
-brewau skips that version until a newer version, a manual upgrade, or `sudo brewau clear-blocked`.
+brewau also blocks a cask when App Management prevents protecting its installed app. It skips
+that version until a newer version, a manual upgrade, or `sudo brewau clear-blocked`.
 The menu also offers retry and a link to App Management settings.
 
 ## Limitations
@@ -311,8 +312,8 @@ The menu also offers retry and a link to App Management settings.
 - Apps installed by casks can no longer update themselves as you (they are owned by
   `_brewau`); the nightly job updates them instead, including self-updating ones with
   `UPGRADE_GREEDY=1`.
-- macOS "App Management" privacy protection may stop the background job from replacing some
-  apps. Check `brewau log` after the first run.
+- macOS "App Management" privacy protection may stop the background job from replacing or
+  protecting some apps; affected casks are blocked per version. Check `brewau log` after the first run.
 - Intel Macs (`/usr/local`) are not supported.
 
 ## Building and releasing
