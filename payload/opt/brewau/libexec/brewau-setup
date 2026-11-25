@@ -273,8 +273,8 @@ ${BREWAU_USER} ALL=(root) NOPASSWD: ALL
 %${BREWAU_USERS_GROUP} ALL=(root) NOPASSWD: /bin/launchctl kickstart system/${BREWAU_LABEL}
 %${BREWAU_USERS_GROUP} ALL=(root) NOPASSWD: /bin/launchctl kickstart system/com.kastruppro.brewau.scan
 # This helper takes no arguments beyond these fixed words; configure accepts only validated
-# schedule JSON on stdin, and clear-blocked only marks blocked casks for one more attempt.
-%${BREWAU_USERS_GROUP} ALL=(root) NOPASSWD: ${BREWAU_LIBEXEC}/brewau-agent configure, ${BREWAU_LIBEXEC}/brewau-agent completions, ${BREWAU_LIBEXEC}/brewau-agent clear-blocked
+# schedule JSON on stdin, clear-blocked marks casks for retry, and protect retries pending app protection.
+%${BREWAU_USERS_GROUP} ALL=(root) NOPASSWD: ${BREWAU_LIBEXEC}/brewau-agent configure, ${BREWAU_LIBEXEC}/brewau-agent completions, ${BREWAU_LIBEXEC}/brewau-agent clear-blocked, ${BREWAU_LIBEXEC}/brewau-agent protect
 EOF
   if ! visudo -cqf "${tmp}"; then
     rm -f "${tmp}"

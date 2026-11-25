@@ -26,11 +26,21 @@
             <key>PayloadUUID</key>
             <string>1281AE4E-495B-47CC-9D1F-A9781791946F</string>
             <key>PayloadDisplayName</key>
-            <string>brewau agent App Management</string>
+            <string>brewau App Management</string>
             <key>Services</key>
             <dict>
                 <key>SystemPolicyAppBundles</key>
                 <array>
+                    <dict>
+                        <key>IdentifierType</key>
+                        <string>bundleID</string>
+                        <key>Identifier</key>
+                        <string>com.kastruppro.brewau.app</string>
+                        <key>CodeRequirement</key>
+                        <string>identifier "com.kastruppro.brewau.app" and anchor apple generic and certificate leaf[subject.OU] = "5W98EXLE44"</string>
+                        <key>Authorization</key>
+                        <string>Allow</string>
+                    </dict>
                     <dict>
                         <key>IdentifierType</key>
                         <string>path</string>

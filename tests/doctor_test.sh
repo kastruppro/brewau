@@ -62,8 +62,6 @@ BREWAU_STATE_DIR="${WORK}/state"
 BREWAU_LOG_DIR="${WORK}/logs"
 mkdir -p "${BREWAU_STATE_DIR}" "${BREWAU_LOG_DIR}"
 echo 'could not protect Docker.app' >"${BREWAU_LOG_DIR}/upgrade.log"
-MACOS_VERSION=26.3
-sw_vers() { [[ "$*" == "-productVersion" ]] && printf '%s\n' "${MACOS_VERSION}"; }
 protection() { FAILED=0; OUTPUT="$(doctor_app_protection; echo "FAILED=${FAILED}")"; }
 protection
 check '[[ "${OUTPUT}" == *Docker.app* && "${OUTPUT}" == *FAILED=1 ]]' "legacy log fallback names app"
@@ -73,17 +71,12 @@ check '[[ "${OUTPUT}" == *FAILED=0 ]]' "clean result overrides old protection lo
 printf '%s' '{"blocked":[{"name":"docker","reason":"app-management"}]}' >"${BREWAU_STATE_DIR}/blocked-casks.json"
 protection
 check '[[ "${OUTPUT}" == *"Blocked cask: docker"* && "${OUTPUT}" == *FAILED=0 ]]' "persistent blocks remain visible after clean result"
-check '[[ "${OUTPUT}" == *"Privacy & Security > App Management"*"/opt/brewau/libexec/brewau-agent"*"sudo brewau clear-blocked"* ]]' "doctor names the agent and how to retry after enabling App Management"
-for MACOS_VERSION in 26.1 26.2.1; do
-  protection
-  check '[[ "${OUTPUT}" == *"Update to macOS 26.3 or later"*"MDM profile on managed Macs"*"sudo brewau clear-blocked"* &&
-    "${OUTPUT}" != *"click +"* && "${OUTPUT}" == *FAILED=0 ]]' "doctor shows alternatives on macOS ${MACOS_VERSION}"
-done
-OUTPUT="$(blocked_guidance)"
-check '[[ "${OUTPUT}" == *"Blocked cask: docker"*"Update to macOS 26.3 or later"* ]]' "status shows the same alternatives"
-MACOS_VERSION=15.7
+check '[[ "${OUTPUT}" == *"sudo brewau clear-blocked"* ]]' "doctor shows how to retry a Homebrew block"
+printf '%s' '{"items":[{"token":"paseo","version":"0.17.4","app":"/Applications/Paseo.app","operation":"pin"}]}' >"${BREWAU_STATE_DIR}/pending-protection.json"
 protection
-check '[[ "${OUTPUT}" == *"click +"* ]]' "manual grant guidance remains available on macOS 15"
+check '[[ "${OUTPUT}" == *"Paseo 0.17.4: afventer beskyttelse"*"åbn brewau-appen"*"sudo /opt/brewau/libexec/brewau-agent protect"* &&
+  "${OUTPUT}" == *FAILED=0 ]]' "pending protection is visible with app and command guidance"
+rm "${BREWAU_STATE_DIR}/pending-protection.json"
 rm "${BREWAU_STATE_DIR}/blocked-casks.json"
 printf '%s' '{"blocked":[{"name":"parallels","reason":"app-management"}],"failed":[{"name":"docker","reason":"protect-failed"}],"errors":[{"stage":"protect","reason":"protect-failed"}]}' >"${BREWAU_STATE_DIR}/last-result.json"
 protection

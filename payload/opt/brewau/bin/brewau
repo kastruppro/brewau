@@ -62,17 +62,23 @@ in_users_group() {
 }
 
 blocked_retry_guidance() {
-  case "$(sw_vers -productVersion 2>/dev/null)" in
-    26.1 | 26.1.* | 26.2 | 26.2.*)
-      echo "On macOS 26.1 and 26.2, System Settings cannot add ${BREWAU_ROOT}/libexec/brewau-agent to App Management."
-      echo "Update to macOS 26.3 or later, or deploy the brewau App Management MDM profile on managed Macs."
-      ;;
-    *)
-      echo "In System Settings > Privacy & Security > App Management, click + and use Cmd-Shift-G to add ${BREWAU_ROOT}/libexec/brewau-agent. Enable its switch."
-      ;;
-  esac
-  echo "After granting App Management, run: sudo brewau clear-blocked"
+  echo "After resolving the Homebrew upgrade failure, run: sudo brewau clear-blocked"
   echo "Without an explicit retry this version is skipped until a newer version or manual upgrade."
+}
+
+pending_protection_guidance() {
+  local file="${BREWAU_STATE_DIR}/pending-protection.json" count i app version
+  [[ -f "${file}" && ! -L "${file}" ]] || return 0
+  count="$(plutil -extract items raw -expect array -o - "${file}" 2>/dev/null)" || return 0
+  [[ ${count} -gt 0 ]] || return 0
+  for ((i=0; i<count; i++)); do
+    app="$(plutil -extract "items.${i}.app" raw -expect string -o - "${file}" 2>/dev/null)" || continue
+    version="$(plutil -extract "items.${i}.version" raw -expect string -o - "${file}" 2>/dev/null)" || continue
+    app="${app##*/}"
+    printf '%s %s: afventer beskyttelse\n' "${app%.app}" "${version}"
+  done
+  echo "Slå brewau til under App-administration, og åbn brewau-appen."
+  echo "Fra en terminal med App-administration kan du køre: sudo ${BREWAU_ROOT}/libexec/brewau-agent protect"
 }
 
 blocked_guidance() {
@@ -127,6 +133,7 @@ cmd_status() {
   fi
   status_errors
   blocked_guidance
+  pending_protection_guidance
   echo "Taps:       homebrew/* ${ALLOWED_TAPS}"
   if brewau_tap_allowed "${BREWAU_TAP}"; then
     echo "Self-update: after each scheduled upgrade, from ${BREWAU_CASK}"
@@ -224,6 +231,7 @@ doctor_sudoers() {
 
 doctor_app_protection() {
   local file array count i reason name seen=$'\n' protection_failed=0 named_failure=0
+  pending_protection_guidance
   for file in "${BREWAU_STATE_DIR}/last-result.json" "${BREWAU_STATE_DIR}/blocked-casks.json"; do
     [[ -e "${file}" ]] || continue
     if ! plutil -convert xml1 -o /dev/null "${file}" >/dev/null 2>&1; then

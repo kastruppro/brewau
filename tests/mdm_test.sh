@@ -5,7 +5,8 @@ set -eu
 HERE="$(cd "$(dirname "$0")" && pwd -P)"
 PROFILE="${HERE}/../mdm/brewau-app-management.mobileconfig"
 DDM="${HERE}/../mdm/brewau-app-management.ddm.json"
-ENTRY="PayloadContent.0.Services.SystemPolicyAppBundles.0"
+APP_ENTRY="PayloadContent.0.Services.SystemPolicyAppBundles.0"
+ENTRY="PayloadContent.0.Services.SystemPolicyAppBundles.1"
 
 expect() {
   local actual
@@ -21,12 +22,19 @@ expect "${PROFILE}" PayloadType Configuration
 expect "${PROFILE}" PayloadScope System
 expect "${PROFILE}" PayloadIdentifier com.kastruppro.brewau.pppc
 expect "${PROFILE}" PayloadContent.0.PayloadType com.apple.TCC.configuration-profile-policy
+expect "${PROFILE}" PayloadContent.0.Services.SystemPolicyAppBundles 2
+expect "${PROFILE}" "${APP_ENTRY}.IdentifierType" bundleID
+expect "${PROFILE}" "${APP_ENTRY}.Identifier" com.kastruppro.brewau.app
+expect "${PROFILE}" "${APP_ENTRY}.CodeRequirement" \
+  'identifier "com.kastruppro.brewau.app" and anchor apple generic and certificate leaf[subject.OU] = "5W98EXLE44"'
+expect "${PROFILE}" "${APP_ENTRY}.Authorization" Allow
 expect "${PROFILE}" "${ENTRY}.IdentifierType" path
 expect "${PROFILE}" "${ENTRY}.Identifier" /opt/brewau/libexec/brewau-agent
 expect "${PROFILE}" "${ENTRY}.CodeRequirement" \
   'identifier "com.kastruppro.brewau.agent" and anchor apple generic and certificate leaf[subject.OU] = "5W98EXLE44"'
 expect "${PROFILE}" "${ENTRY}.Authorization" Allow
 expect "${DDM}" 0.Type com.apple.configuration.legacy
+expect "${DDM}" 0.ServerToken v2
 expect "${DDM}" 1.Type com.apple.activation.simple
 expect "${DDM}" 1.Payload.StandardConfigurations.0 "$(plutil -extract 0.Identifier raw -o - "${DDM}")"
 echo "App Management profile and DDM example passed"

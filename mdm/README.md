@@ -1,22 +1,24 @@
 # App Management for brewau
 
-macOS checks App Management for the standalone agent at
-`/opt/brewau/libexec/brewau-agent` when the scheduled job updates cask apps in
-`/Applications`. Grant the agent App Management through MDM or System Settings.
+The brewau menu bar app can retry app protection that macOS deferred during a
+scheduled cask update. Give the signed brewau app App Management permission on
+the Mac or through MDM.
 
 ## MDM configuration profile
 
 Upload [brewau-app-management.mobileconfig](brewau-app-management.mobileconfig)
 as a custom profile and assign it on the device channel of a Mac with
-user-approved MDM. It grants `SystemPolicyAppBundles` to the agent at its
-installed path when the binary matches the code requirement. [Apple’s PPPC documentation](https://developer.apple.com/documentation/devicemanagement/privacypreferencespolicycontrol)
+user-approved MDM. The primary `SystemPolicyAppBundles` entry matches the
+app's bundle ID `com.kastruppro.brewau.app` and team `5W98EXLE44`.
+The profile also includes the standalone agent at
+`/opt/brewau/libexec/brewau-agent`. That entry may let the daemon protect apps
+at night without the menu bar app. Daemon authorization is unverified.
+[Apple’s PPPC documentation](https://developer.apple.com/documentation/devicemanagement/privacypreferencespolicycontrol)
 
-The signed agent
-must use the identifier `com.kastruppro.brewau.agent` and an Apple-issued
-certificate for team `5W98EXLE44`. Inspect the installed binary’s designated
-requirement and confirm the identifier and team match the profile.
+Check the identifiers and team against the installed Developer ID binaries.
 
 ```sh
+codesign -dr - /Applications/brewau.app
 codesign -dr - /opt/brewau/libexec/brewau-agent
 ```
 
@@ -37,14 +39,10 @@ DDM delivery is untested. [Apple’s legacy profile documentation](https://devel
 
 ## Manual grant
 
-macOS 26.1 and 26.2 cannot add standalone executables in System Settings.
-Update to macOS 26.3 or later, or use the MDM profile on managed Macs. The
-manual steps below also work on earlier releases such as macOS 15.
-[Apple Developer Technical Support](https://developer.apple.com/forums/thread/813989)
-
 1. Open **System Settings > Privacy & Security > App Management** and click **+**.
-2. Press **Command-Shift-G**, enter `/opt/brewau/libexec/brewau-agent`, and add
-   the executable. Turn on its App Management switch.
+2. Select **brewau.app** in Applications and enable its App Management switch.
+3. Open brewau to retry pending protections. Casks deferred before upgrade can
+   upgrade on the next run once protection succeeds.
 
-After either grant, choose **Prøv igen** in brewau or run
-`sudo brewau clear-blocked` to retry previously blocked casks on the next run.
+If Homebrew itself could not upgrade a cask, resolve the Homebrew error and
+choose **Prøv igen** in brewau or run `sudo brewau clear-blocked`.

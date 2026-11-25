@@ -68,6 +68,16 @@ check "755" "$(stat -f '%Lp' "${BREWAU_APPDIR}/Odd.app/Contents")" "and locks it
 check "group:everyone deny delete" "$(brewau_acl "${BREWAU_APPDIR}/Odd.app")" "and pins it in place"
 check "fail" "$( (cmd_trust_app "${WORK}/elsewhere.app") 2>/dev/null && echo ok || echo fail)" "apps outside the app directory are refused"
 
+# --- sudoers: only fixed agent verbs for members ------------------------------
+sudoers="$(
+  visudo() { return 0; }
+  install() { cat "${@: -2:1}"; }
+  BREWAU_SUDOERS="${WORK}/sudoers"
+  write_sudoers
+)"
+check "%${BREWAU_USERS_GROUP} ALL=(root) NOPASSWD: ${BREWAU_LIBEXEC}/brewau-agent configure, ${BREWAU_LIBEXEC}/brewau-agent completions, ${BREWAU_LIBEXEC}/brewau-agent clear-blocked, ${BREWAU_LIBEXEC}/brewau-agent protect" \
+  "$(grep -F "${BREWAU_LIBEXEC}/brewau-agent protect" <<<"${sudoers}")" "sudoers adds only the fixed protect verb"
+
 # --- LaunchDaemons: fixed entry points, validation, and safe reload -----------
 BREWAU_PLIST="${WORK}/launch/com.kastruppro.brewau.upgrade.plist"
 mkdir -p "${WORK}/launch" "${WORK}/loaded"

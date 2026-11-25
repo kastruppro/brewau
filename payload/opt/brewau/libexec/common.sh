@@ -490,11 +490,16 @@ brewau_cask_app_paths() {
 # (e.g. sudo -n). Prints the tokens of casks whose apps are still unprotected
 # afterwards or untrusted (and then fails); progress goes to stderr.
 # --report-reasons <app/operation rows> reports causes and skips only known operations.
+# --only-app <token> <path> applies the same checks to a single catalog entry.
 brewau_protect_apps() {
   local json="$1" token app locked output reason result=0 report=0 skip=""
+  local only_token="" only_app="" matched=0
   shift
   if [[ "${1:-}" == --report-reasons ]]; then report=1; skip="$2"; shift 2; fi
+  if [[ "${1:-}" == --only-app ]]; then only_token="$2"; only_app="$3"; shift 3; fi
   while IFS=$'\t' read -r token app; do
+    if [[ -n "${only_token}" && ( "${token}" != "${only_token}" || "${app}" != "${only_app}" ) ]]; then continue; fi
+    matched=1
     if brewau_app_untrusted "${app}"; then
       echo "brewau: WARNING: ${app} is marked untrusted; an administrator must check it, then run: sudo brewau trust-app '${app}'" >&2
       brewau_protection_failure "${token}" protect-failed "${report}"
@@ -529,7 +534,7 @@ brewau_protect_apps() {
         brewau_write_state "$(brewau_app_state "${app}").untrusted" "${app}" || true
       fi
       if [[ ${locked} -eq 0 ]] || brewau_app_needs_protection "${app}"; then
-        echo "brewau: WARNING: could not protect ${app} (for scheduled upgrades, check App Management for ${BREWAU_ROOT}/libexec/brewau-agent)" >&2
+        echo "brewau: WARNING: could not protect ${app}" >&2
         reason=protect-failed
         brewau_app_eperm "${app}" "${output}" && reason="app-management"
         brewau_protection_failure "${token}" "${reason}" "${report}" "${app}" lock
@@ -550,13 +555,14 @@ brewau_protect_apps() {
     fi
     if ! output="$(brewau_pin_app "${app}" "$@" 2>&1)"; then
       [[ -z "${output}" ]] || printf '%s\n' "${output}" >&2
-      echo "brewau: WARNING: could not pin ${app} in place (for scheduled upgrades, check App Management for ${BREWAU_ROOT}/libexec/brewau-agent)" >&2
+      echo "brewau: WARNING: could not pin ${app} in place" >&2
       reason=protect-failed
       brewau_app_eperm "${app}" "${output}" && reason="app-management"
       brewau_protection_failure "${token}" "${reason}" "${report}" "${app}" pin
       result=1
     fi
   done < <(brewau_cask_apps "${json}")
+  [[ -z "${only_token}" || ${matched} == 1 ]] || return 1
   return "${result}"
 }
 
@@ -569,7 +575,8 @@ brewau_protect_installed_apps() {
   local json result=0 report_args=()
   if [[ "${1:-}" == --report-reasons ]]; then report_args=("$1" "$2"); shift 2; fi
   json="$(mktemp "${BREWAU_TMP}/casks.XXXXXX")" || return 2
-  if (brewau_exec_brew info --json=v2 --installed --cask) >"${json}" 2>/dev/null; then
+  if (brewau_exec_brew info --json=v2 --installed --cask) >"${json}" 2>/dev/null &&
+    plutil -extract casks raw -expect array -o /dev/null "${json}" 2>/dev/null; then
     brewau_protect_apps "${json}" ${report_args[@]+"${report_args[@]}"} "$@" || result=1
     brewau_record_apps "${json}"
   else
