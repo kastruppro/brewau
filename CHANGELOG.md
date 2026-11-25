@@ -8,16 +8,19 @@ and versions follow [Semantic Versioning](https://semver.org/). Details of each 
 
 ### Added
 
-- A PPPC profile for App Management and a DDM delivery example in `mdm/`.
+- Pending app protection is recorded in `state/pending-protection.json`; the menu bar app retries
+  it through `brewau-agent protect`. An app-first PPPC profile and DDM example are in `mdm/`.
 
 ### Changed
 
-- `brewau-agent` is signed with the stable identifier `com.kastruppro.brewau.agent`. Re-add any
-  existing manual App Management grant for the old identifier.
+- `brewau-agent` is signed with the stable identifier `com.kastruppro.brewau.agent`.
 
 ### Fixed
 
-- App Management guidance now identifies the background agent as the responsible process.
+- Manual App Management grants never reached the daemon's `_brewau` account. The menu bar app
+  now requests pending protection in the user's session.
+- App restart waits for slow-quitting apps and reopens them; updated but unprotected apps are
+  no longer shown as blocked, and repeated block log messages are suppressed.
 
 ## [0.9.1] - 2026-11-17
 

@@ -298,15 +298,21 @@ and an `errors` array of stage and reason. `brewau status` lists errors and bloc
 can block changes to app bundles, including app protection, even by root. For a manual Homebrew
 command, enable your terminal in System Settings → Privacy & Security → App Management.
 
-For scheduled jobs, the responsible process is `/opt/brewau/libexec/brewau-agent`, not
-brewau.app. Open System Settings → Privacy & Security → App Management, click `+`, press
-Command-Shift-G, enter `/opt/brewau/libexec/brewau-agent`, and add and enable it. On macOS
-26.1–26.2, this picker cannot add standalone executables; update macOS (fixed in 26.3) or use
-the PPPC profile and DDM example in [the MDM guide](mdm/README.md) on a managed Mac.
+App Management grants are per user: a grant made in your account does not reach the scheduled
+job running as `_brewau`. Enable **brewau** in System Settings → Privacy & Security → App
+Management. When the daemon cannot lock or pin an app, it records the item in
+`state/pending-protection.json`. If the refusal happens before upgrading, the upgrade is deferred;
+if afterwards, the app is updated but remains unprotected until the menu bar app protects it.
+The app attempts protection automatically and offers “Beskyt nu”. You can also run:
 
-After granting access, clear the saved per-version block with “Prøv igen” in the menu or
-`sudo brewau clear-blocked`. A blocked app can also be upgraded manually from an allowed terminal;
-a newer version is retried automatically.
+```sh
+sudo /opt/brewau/libexec/brewau-agent protect
+```
+
+A Homebrew upgrade itself refused by App Management remains blocked per version: upgrade it
+manually from an allowed terminal or use MDM. After access is granted, retry with “Prøv igen” or
+`sudo brewau clear-blocked`. The [MDM guide](mdm/README.md) provides an app-first PPPC profile
+and a DDM example; its agent-path grant remains unverified.
 
 ## Limitations
 
@@ -317,8 +323,8 @@ a newer version is retried automatically.
 - Apps installed by casks can no longer update themselves as you (they are owned by
   `_brewau`); the nightly job updates them instead, including self-updating ones with
   `UPGRADE_GREEDY=1`.
-- macOS "App Management" privacy protection may stop the background job from replacing or
-  protecting some apps; affected casks are blocked per version. Check `brewau log` after the first run.
+- macOS "App Management" may stop a background upgrade or defer app protection. Check the menu
+  bar app or `brewau log` after the first run.
 - Intel Macs (`/usr/local`) are not supported.
 
 ## Building and releasing

@@ -46,11 +46,15 @@ All fixed items have tests (`make test`) except where root is needed (noted).
   literally and recognise shell-escaped app paths.
 - [x] Keep untrusted-file and symlink checks and protect other app files beside a standing block.
 
+### App Management redesign
+
+- [x] Record pending protection, retry it from the menu bar app through the signed agent, and
+  ship an app-first PPPC profile and DDM example.
+
 ### Open follow-ups
 
-- [x] Sign the launchd agent with the fixed identifier `com.kastruppro.brewau.agent` and ship
-  a path-based App Management PPPC profile with a DDM legacy configuration example in `mdm/`.
-- Live test the agent path grant on macOS 27 and DDM delivery; both remain unverified.
+- Live verify that app-launched protection is checked against the app's App Management grant,
+  that MDM/DDM delivery works, and whether the agent PPPC entry lets the daemon protect at night.
 - Live test blocking, offline behaviour and notifications on an installed build. The App
   Management block test is still pending: Docker updated itself before it could be reproduced.
   It can be verified with Paseo on the owner’s Mac after installation.
