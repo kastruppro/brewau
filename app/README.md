@@ -41,7 +41,11 @@ pre-upgrade lock or pin was refused has its upgrade deferred (`"deferred": true`
 it is protected. The menu bar app protects them through
 `sudo -n /opt/brewau/libexec/brewau-agent protect` (root, holding the operation lock),
 which runs `brewau-upgrade protect-pending`; that re-validates each app from Homebrew and
-logs to upgrade.log. It runs on launch, after each finished scan or upgrade, and from
+logs to upgrade.log. The agent ignores terminal signals and starts that script in a
+session of its own, so ^C, ^Z or a closed terminal cannot stop it while an app is in
+staging; after 15 minutes it stops waiting (and releases the lock) without killing it.
+A busy answer (exit 75: a scan, upgrade or self-update holds the lock) is retried after
+30 seconds. It runs on launch, after each finished scan or upgrade, and from
 **Beskyt nu**, once per state and never during a run. Exit 0 clears the notice; exit 3
 means App Management still refuses, and the notice asks the user to switch on **brewau**
 under Anonymitet og sikkerhed › App-administration (**Åbn Systemindstillinger…**,

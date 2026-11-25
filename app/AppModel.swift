@@ -105,6 +105,7 @@ struct PendingApp: Identifiable {
     var unprotectedMessage: String? {
         UnprotectedApp.danishNotice(unprotected, refused: protectRefused) { self.displayName(for: $0) }
     }
+    var finishedRuns: [Date?] { [upgradeResult?.finished, scanResult?.finished] }
     /// An update the daemon holds back until the app can be protected.
     func deferredProtection(for update: PackageUpdate) -> UnprotectedApp? {
         unprotected.first { $0.token == update.token && $0.deferred }
@@ -114,16 +115,19 @@ struct PendingApp: Identifiable {
     func protectPending(userInitiated: Bool = false) async {
         guard !protecting, !busy, installed, !unprotected.isEmpty else { return }
         protecting = true
+        let key = ProtectTrigger.key(pending: unprotected, finishedRuns: finishedRuns)
         let hadDeferred = unprotected.contains { $0.deferred }
         BrewauLog.app.notice("protecting pending apps")
         let answer = await Task.detached { () -> Result<(Int32, String), Error> in
             Result { try runCommandStatus("/usr/bin/sudo", ["-n", "/opt/brewau/libexec/brewau-agent", "protect"]) }
         }.value
         protecting = false
+        let outcome = (try? answer.get()).map { ProtectOutcome(exitCode: $0.0) } ?? .failed
+        protectTrigger.record(key, outcome: outcome)
         switch answer {
         case .failure(let failure): self.error = failure.localizedDescription
         case .success(let (code, text)):
-            switch ProtectOutcome(exitCode: code) {
+            switch outcome {
             case .protected:
                 protectRefused = false
                 await refresh()
@@ -134,7 +138,7 @@ struct PendingApp: Identifiable {
                 protectRefused = true
                 await refresh()
             case .busy: break
-            case .failed: self.error = text.isEmpty ? "Appene kunne ikke beskyttes (\(code))." : text
+            case .failed: self.error = text.isEmpty ? "Apperne kunne ikke beskyttes (\(code))." : text
             }
         }
     }
@@ -291,7 +295,7 @@ struct PendingApp: Identifiable {
         await notifyBlocked()
         if !busy { await automaticallyRestartAllowed() }
         refreshLoginStatus()
-        if !protecting, protectTrigger.shouldRun(pending: unprotected, finishedRuns: [upgradeResult?.finished, scanResult?.finished], busy: busy) {
+        if !protecting, protectTrigger.shouldRun(pending: unprotected, finishedRuns: finishedRuns, busy: busy) {
             Task { await protectPending() }
         }
     }

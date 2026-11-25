@@ -49,18 +49,33 @@ private let config = root.appendingPathComponent("etc/brewau.conf")
                 // pin against the user's App Management grant for brewau.app. Holding the
                 // operation lock keeps scans and upgrades out. brewau-upgrade validates every
                 // pending item from scratch and writes its own upgrade.log lines.
+                // An app can be in staging while this runs, so a terminal must not be able to
+                // stop or suspend it half-way: the agent ignores those signals and the script
+                // runs in a session of its own. A deadline releases the operation lock if the
+                // script hangs, without killing it.
                 try requireRoot()
+                for signal in [SIGINT, SIGTERM, SIGHUP, SIGTSTP, SIGQUIT, SIGTTIN, SIGTTOU] { Darwin.signal(signal, SIG_IGN) }
                 guard let account = getpwnam("_brewau") else { throw BrewauError.message("_brewau is missing.") }
-                let status: Int32? = try withFileLock(state.appendingPathComponent("operation.lock").path, nonblocking: true,
-                                                      owner: (account.pointee.pw_uid, account.pointee.pw_gid)) {
-                    try protectPending()
+                let finished: Int32?? = try withFileLock(state.appendingPathComponent("operation.lock").path, nonblocking: true,
+                                                         owner: (account.pointee.pw_uid, account.pointee.pw_gid)) {
+                    try runDetached(root.appendingPathComponent("libexec/brewau-upgrade").path, ["protect-pending"], deadline: protectDeadline)
                 }
-                guard let status else {
+                guard let ran = finished else {
                     fputs("brewau: brewau scanner eller opdaterer; prøv igen, når det er færdigt.\n", stderr)
                     exit(75)
                 }
+                guard let status = ran else {
+                    BrewauLog.agent.error("protect still running after \(Int(protectDeadline)) s; no longer waiting")
+                    fputs("brewau: Beskyttelsen kører stadig efter \(Int(protectDeadline / 60)) minutter. Se upgrade.log, og prøv igen senere.\n", stderr)
+                    exit(1)
+                }
                 let code: Int32 = status == 0 ? 0 : status == 3 ? 3 : 1
                 BrewauLog.agent.notice("protect finished with \(code)")
+                switch code {
+                case 0: print("Apps beskyttet.")
+                case 3: fputs("brewau: macOS App Management afviser stadig beskyttelsen. Slå brewau til under Anonymitet og sikkerhed › App-administration.\n", stderr)
+                default: fputs("brewau: Beskyttelsen mislykkedes. Se upgrade.log.\n", stderr)
+                }
                 exit(code)
             case "clear-blocked":
                 // Root marks the retry because the state directory belongs to _brewau.
@@ -167,18 +182,8 @@ private let config = root.appendingPathComponent("etc/brewau.conf")
         BrewauLog.agent.error("\(kind, privacy: .public) failed: \(english, privacy: .public)")
         return BrewauError.reported(ui: danish, log: brewauLogLine(kind, english))
     }
-    /// Exit status of `brewau-upgrade protect-pending`: 0 all protected, 3 some still refused.
-    static func protectPending() throws -> Int32 {
-        let child = Process()
-        child.executableURL = root.appendingPathComponent("libexec/brewau-upgrade")
-        child.arguments = ["protect-pending"]
-        child.environment = ["PATH": "/usr/bin:/bin:/usr/sbin:/sbin"]
-        child.currentDirectoryURL = URL(fileURLWithPath: "/")
-        child.standardInput = FileHandle.nullDevice
-        try child.run()
-        child.waitUntilExit()
-        return child.terminationReason == .exit ? child.terminationStatus : 1
-    }
+    /// Validating and protecting a handful of apps takes seconds; this only bounds a hang.
+    static let protectDeadline: TimeInterval = 15 * 60
     static func selfUpdate(now: Bool) throws {
         let marker = root.appendingPathComponent("etc/self-update.pid")
         try Data("\(getpid())\n".utf8).write(to: marker, options: .atomic)

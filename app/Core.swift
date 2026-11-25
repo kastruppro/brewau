@@ -85,17 +85,72 @@ struct UnprotectedApp: Equatable, Sendable {
 }
 
 /// Automatic protection runs once per state: on launch, and again only when a run has
-/// finished or the pending list changed. The refresh loop can never turn it into a retry loop.
+/// finished or the pending list changed. A completed attempt (0, 1 or 3) is remembered, so
+/// the refresh loop can never turn it into a retry loop. A busy helper (75) ran nothing, so
+/// that state stays eligible and is tried again after `busyRetry`.
 struct ProtectTrigger {
+    static let busyRetry: TimeInterval = 30
     private var lastKey: String?
-    mutating func shouldRun(pending: [UnprotectedApp], finishedRuns: [Date?], busy: Bool) -> Bool {
-        guard !pending.isEmpty, !busy else { return false }
-        let key = (pending.map(\.key).sorted() + finishedRuns.map { $0.map { String($0.timeIntervalSince1970) } ?? "-" })
+    private var busyUntil: Date?
+    static func key(pending: [UnprotectedApp], finishedRuns: [Date?]) -> String {
+        (pending.map(\.key).sorted() + finishedRuns.map { $0.map { String($0.timeIntervalSince1970) } ?? "-" })
             .joined(separator: "|")
-        guard key != lastKey else { return false }
-        lastKey = key
-        return true
     }
+    func shouldRun(pending: [UnprotectedApp], finishedRuns: [Date?], busy: Bool, now: Date = Date()) -> Bool {
+        guard !pending.isEmpty, !busy else { return false }
+        if let busyUntil, now < busyUntil { return false }
+        return ProtectTrigger.key(pending: pending, finishedRuns: finishedRuns) != lastKey
+    }
+    mutating func record(_ key: String, outcome: ProtectOutcome, now: Date = Date()) {
+        if outcome == .busy {
+            busyUntil = now.addingTimeInterval(ProtectTrigger.busyRetry)
+        } else {
+            lastKey = key
+            busyUntil = nil
+        }
+    }
+}
+
+/// Starts a fixed root command in a session of its own, so nothing a terminal sends (^C,
+/// ^Z, a closed window) reaches it, with default signal handling, stdin and output on
+/// /dev/null, and waits for it. Returns its exit status (1 for a signal), or nil once
+/// `deadline` has passed: the child is then left to finish, never killed half-way.
+func runDetached(_ path: String, _ arguments: [String], deadline: TimeInterval) throws -> Int32? {
+    var attributes: posix_spawnattr_t?
+    posix_spawnattr_init(&attributes)
+    defer { posix_spawnattr_destroy(&attributes) }
+    var defaults = sigset_t()
+    sigemptyset(&defaults)
+    for signal in [SIGINT, SIGTERM, SIGHUP, SIGTSTP, SIGQUIT, SIGTTIN, SIGTTOU, SIGPIPE] { sigaddset(&defaults, signal) }
+    var mask = sigset_t()
+    sigemptyset(&mask)
+    posix_spawnattr_setsigdefault(&attributes, &defaults)
+    posix_spawnattr_setsigmask(&attributes, &mask)
+    posix_spawnattr_setflags(&attributes, Int16(POSIX_SPAWN_SETSID | POSIX_SPAWN_SETSIGDEF | POSIX_SPAWN_SETSIGMASK))
+    var actions: posix_spawn_file_actions_t?
+    posix_spawn_file_actions_init(&actions)
+    defer { posix_spawn_file_actions_destroy(&actions) }
+    posix_spawn_file_actions_addopen(&actions, 0, "/dev/null", O_RDONLY, 0)
+    posix_spawn_file_actions_addopen(&actions, 1, "/dev/null", O_WRONLY, 0)
+    posix_spawn_file_actions_addopen(&actions, 2, "/dev/null", O_WRONLY, 0)
+    posix_spawn_file_actions_addchdir_np(&actions, "/")
+    let argv: [UnsafeMutablePointer<CChar>?] = ([path] + arguments).map { strdup($0) } + [nil]
+    let envp: [UnsafeMutablePointer<CChar>?] = [strdup("PATH=/usr/bin:/bin:/usr/sbin:/sbin"), nil]
+    defer { (argv + envp).forEach { free($0) } }
+    var pid: pid_t = 0
+    let spawned = posix_spawn(&pid, path, &actions, &attributes, argv, envp)
+    guard spawned == 0 else { throw BrewauError.message("Kunne ikke starte \(path) (\(spawned)).") }
+    let end = Date().addingTimeInterval(deadline)
+    var status: Int32 = 0
+    while true {
+        let waited = waitpid(pid, &status, WNOHANG)
+        if waited == pid { break }
+        if waited < 0, errno != EINTR { throw BrewauError.message("Kunne ikke vente på \(path).") }
+        if Date() >= end { return nil }
+        usleep(100_000)
+    }
+    // WIFEXITED / WEXITSTATUS, which Swift does not import.
+    return status & 0x7f == 0 ? (status >> 8) & 0xff : 1
 }
 
 enum BrewauError: LocalizedError {

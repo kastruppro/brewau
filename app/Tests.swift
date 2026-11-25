@@ -163,13 +163,43 @@ import Darwin
         // Automatic protection: once per state, never while busy, never without items.
         var trigger = ProtectTrigger()
         let finishedAt = [date("2026-11-25T12:00:00Z") as Date?, nil]
-        check(!trigger.shouldRun(pending: [], finishedRuns: finishedAt, busy: false), "Nothing pending, nothing to run")
-        check(!trigger.shouldRun(pending: merged, finishedRuns: finishedAt, busy: true), "Not while a run is busy")
-        check(trigger.shouldRun(pending: merged, finishedRuns: finishedAt, busy: false), "Runs on launch")
-        check(!trigger.shouldRun(pending: merged, finishedRuns: finishedAt, busy: false), "Not again on the next refresh")
-        check(!trigger.shouldRun(pending: Array(merged.reversed()), finishedRuns: finishedAt, busy: false), "Order does not count as a change")
-        check(trigger.shouldRun(pending: merged, finishedRuns: [date("2026-11-25T14:00:00Z"), nil], busy: false), "Runs again after a finished run")
-        check(trigger.shouldRun(pending: [merged[0]], finishedRuns: [date("2026-11-25T14:00:00Z"), nil], busy: false), "Runs again when the pending list changes")
+        let later = [date("2026-11-25T14:00:00Z") as Date?, nil]
+        let start = date("2026-11-25T12:00:05Z")
+        let firstKey = ProtectTrigger.key(pending: merged, finishedRuns: finishedAt)
+        check(!trigger.shouldRun(pending: [], finishedRuns: finishedAt, busy: false, now: start), "Nothing pending, nothing to run")
+        check(!trigger.shouldRun(pending: merged, finishedRuns: finishedAt, busy: true, now: start), "Not while a run is busy")
+        check(trigger.shouldRun(pending: merged, finishedRuns: finishedAt, busy: false, now: start), "Runs on launch")
+        // L1: the helper found the lock held (self-update, say) and ran nothing.
+        trigger.record(firstKey, outcome: .busy, now: start)
+        check(!trigger.shouldRun(pending: merged, finishedRuns: finishedAt, busy: false, now: start.addingTimeInterval(5)), "A busy answer is not retried on every poll")
+        check(trigger.shouldRun(pending: merged, finishedRuns: finishedAt, busy: false, now: start.addingTimeInterval(ProtectTrigger.busyRetry)), "A busy answer keeps the same state eligible")
+        for outcome in [ProtectOutcome.protected, .refused, .failed] {
+            var done = ProtectTrigger()
+            done.record(firstKey, outcome: outcome, now: start)
+            check(!done.shouldRun(pending: merged, finishedRuns: finishedAt, busy: false, now: start.addingTimeInterval(3600)), "A completed attempt (\(outcome)) is not repeated")
+            check(!done.shouldRun(pending: Array(merged.reversed()), finishedRuns: finishedAt, busy: false, now: start.addingTimeInterval(3600)), "Order does not count as a change")
+            check(done.shouldRun(pending: merged, finishedRuns: later, busy: false, now: start), "Runs again after a finished run")
+            check(done.shouldRun(pending: [merged[0]], finishedRuns: finishedAt, busy: false, now: start), "Runs again when the pending list changes")
+        }
+        trigger.record(firstKey, outcome: .refused, now: start.addingTimeInterval(40))
+        check(!trigger.shouldRun(pending: merged, finishedRuns: finishedAt, busy: false, now: start.addingTimeInterval(80)), "A retry that completes is deduplicated")
+
+        // M2: the protect child runs in its own session, with default signals, and a deadline
+        // stops waiting without killing it.
+        check(try runDetached("/bin/sh", ["-c", "exit 3"], deadline: 10) == 3, "Exit status is passed on")
+        check(try runDetached("/bin/sh", ["-c", "kill -TERM $$"], deadline: 10) == 1, "A child killed by a signal counts as failed")
+        check(try runDetached("/bin/sh", ["-c", #"[ "$(/bin/ps -o pgid= -p $$ | tr -d ' ')" = "$$" ] && [ "$PWD" = / ]"#], deadline: 10) == 0, "Child leads its own session and process group, in /")
+        let marker = FileManager.default.temporaryDirectory.appendingPathComponent("brewau-detached-\(getpid())")
+        try? FileManager.default.removeItem(at: marker)
+        let begun = Date()
+        check(try runDetached("/bin/sh", ["-c", "sleep 1; /usr/bin/touch '\(marker.path)'"], deadline: 0.2) == nil, "The deadline stops waiting")
+        check(Date().timeIntervalSince(begun) < 0.9, "and returns before the child is done")
+        usleep(1_500_000)
+        check(FileManager.default.fileExists(atPath: marker.path), "The child is not killed at the deadline")
+        try? FileManager.default.removeItem(at: marker)
+        signal(SIGINT, SIG_IGN)
+        check(try runDetached("/bin/sh", ["-c", "kill -INT $$; exit 0"], deadline: 10) == 1, "Ignored signals are reset to default in the child")
+        signal(SIGINT, SIG_DFL)
 
         let standingBlock = try RunResult.decode(Data(#"{"upgraded":[],"failed":[],"blocked":[{"name":"parallels","kind":"cask","version":"26.2.1","reason":"app-management","installed":"x"}],"errors":[],"finished":"2026-11-09T04:00:00Z","job":"upgrade","status":"blocked","reason":"app-management"}"#.utf8))
         check(!standingBlock.isFailure, "A standing block is not a failure")
