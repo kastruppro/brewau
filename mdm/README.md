@@ -37,12 +37,14 @@ DDM delivery is untested. [Apple’s legacy profile documentation](https://devel
 
 ## Manual grant
 
+macOS 26.1 and 26.2 cannot add standalone executables in System Settings.
+Update to macOS 26.3 or later, or use the MDM profile on managed Macs. The
+manual steps below also work on earlier releases such as macOS 15.
+[Apple Developer Technical Support](https://developer.apple.com/forums/thread/813989)
+
 1. Open **System Settings > Privacy & Security > App Management** and click **+**.
 2. Press **Command-Shift-G**, enter `/opt/brewau/libexec/brewau-agent`, and add
    the executable. Turn on its App Management switch.
-
-macOS 26.1 and 26.2 had a regression that prevented adding standalone executables.
-Apple fixed it in macOS 26.3. [Apple Developer Technical Support](https://developer.apple.com/forums/thread/813989)
 
 After either grant, choose **Prøv igen** in brewau or run
 `sudo brewau clear-blocked` to retry previously blocked casks on the next run.

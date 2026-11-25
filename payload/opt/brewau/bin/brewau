@@ -62,8 +62,16 @@ in_users_group() {
 }
 
 blocked_retry_guidance() {
-  echo "In System Settings > Privacy & Security > App Management, click + and use Cmd-Shift-G to add ${BREWAU_ROOT}/libexec/brewau-agent."
-  echo "Enable it, then run: sudo brewau clear-blocked"
+  case "$(sw_vers -productVersion 2>/dev/null)" in
+    26.1 | 26.1.* | 26.2 | 26.2.*)
+      echo "On macOS 26.1 and 26.2, System Settings cannot add ${BREWAU_ROOT}/libexec/brewau-agent to App Management."
+      echo "Update to macOS 26.3 or later, or deploy the brewau App Management MDM profile on managed Macs."
+      ;;
+    *)
+      echo "In System Settings > Privacy & Security > App Management, click + and use Cmd-Shift-G to add ${BREWAU_ROOT}/libexec/brewau-agent. Enable its switch."
+      ;;
+  esac
+  echo "After granting App Management, run: sudo brewau clear-blocked"
   echo "Without an explicit retry this version is skipped until a newer version or manual upgrade."
 }
 
