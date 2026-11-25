@@ -773,8 +773,8 @@ cmd_trust_app() {
     return 0
   fi
   [[ -d "${app}" && ! -L "${app}" ]] || brewau_die "${app} is not an app bundle"
-  brewau_lock_app "${app}" || brewau_die "could not lock ${app} (App Management permission?)"
-  brewau_pin_app "${app}" || brewau_die "could not pin ${app} in place (App Management permission?)"
+  brewau_lock_app "${app}" || brewau_die "could not lock ${app} (check App Management for the terminal running brewau trust-app)"
+  brewau_pin_app "${app}" || brewau_die "could not pin ${app} in place (check App Management for the terminal running brewau trust-app)"
   rm -f "${state}.untrusted" "${state}.team"
   brewau_record_app "${app}" || brewau_die "could not record the signature of ${app}"
   team="$(cut -f 2 "${state}.team" 2>/dev/null)"

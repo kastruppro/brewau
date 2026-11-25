@@ -1,0 +1,20 @@
+[
+  {
+    "Type": "com.apple.configuration.legacy",
+    "Identifier": "com.kastruppro.brewau.pppc.configuration",
+    "ServerToken": "v1",
+    "Payload": {
+      "ProfileURL": "https://mdm.example.com/profiles/brewau-app-management.mobileconfig"
+    }
+  },
+  {
+    "Type": "com.apple.activation.simple",
+    "Identifier": "com.kastruppro.brewau.pppc.activation",
+    "ServerToken": "v1",
+    "Payload": {
+      "StandardConfigurations": [
+        "com.kastruppro.brewau.pppc.configuration"
+      ]
+    }
+  }
+]

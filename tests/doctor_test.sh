@@ -70,7 +70,8 @@ protection
 check '[[ "${OUTPUT}" == *FAILED=0 ]]' "clean result overrides old protection log"
 printf '%s' '{"blocked":[{"name":"docker","reason":"app-management"}]}' >"${BREWAU_STATE_DIR}/blocked-casks.json"
 protection
-check '[[ "${OUTPUT}" == *"Blocked cask: docker"* && "${OUTPUT}" == *clear-blocked* && "${OUTPUT}" == *FAILED=0 ]]' "persistent blocks remain visible after clean result"
+check '[[ "${OUTPUT}" == *"Blocked cask: docker"* && "${OUTPUT}" == *FAILED=0 ]]' "persistent blocks remain visible after clean result"
+check '[[ "${OUTPUT}" == *"Privacy & Security > App Management"*"/opt/brewau/libexec/brewau-agent"*"sudo brewau clear-blocked"* ]]' "doctor names the agent and how to retry after enabling App Management"
 rm "${BREWAU_STATE_DIR}/blocked-casks.json"
 printf '%s' '{"blocked":[{"name":"parallels","reason":"app-management"}],"failed":[{"name":"docker","reason":"protect-failed"}],"errors":[{"stage":"protect","reason":"protect-failed"}]}' >"${BREWAU_STATE_DIR}/last-result.json"
 protection

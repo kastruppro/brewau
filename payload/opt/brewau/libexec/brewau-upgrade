@@ -373,7 +373,7 @@ protect_for_upgrade() {
       if ! brewau_in_words "${token}" "${protect_skip}"; then
         result_item blocked "${token}" cask "${version}" app-management "${installed}" || return 1
         protect_skip="${protect_skip} ${token}"
-        log "${token}: blocked by macOS App Management; skipped"
+        log "${token}: blocked by macOS App Management for ${BREWAU_ROOT}/libexec/brewau-agent; skipped"
       fi
       if [[ -n "${app}" && ( "${operation}" == lock || "${operation}" == pin ) ]]; then
         count="$(plutil -extract blocked raw -o - "${RESULT}")" || return 1
@@ -527,6 +527,7 @@ run_upgrade() {
           protect_skip="${protect_skip} ${name##*/}"
           item_reason="app-management"
           result_item blocked "${name}" cask "${version}" "${item_reason}" "${installed}" || return 1
+          log "${name}: blocked by macOS App Management for ${BREWAU_ROOT}/libexec/brewau-agent; skipped"
         fi
         result_item failed "${name}" "${kind}" "${version}" "${item_reason}" || return 1
         if [[ "${item_reason}" != app-management ]]; then

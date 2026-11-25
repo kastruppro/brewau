@@ -61,6 +61,12 @@ in_users_group() {
   return 1
 }
 
+blocked_retry_guidance() {
+  echo "In System Settings > Privacy & Security > App Management, click + and use Cmd-Shift-G to add ${BREWAU_ROOT}/libexec/brewau-agent."
+  echo "Enable it, then run: sudo brewau clear-blocked"
+  echo "Without an explicit retry this version is skipped until a newer version or manual upgrade."
+}
+
 blocked_guidance() {
   local file="${BREWAU_STATE_DIR}/blocked-casks.json" count i
   [[ -r "${file}" ]] || return 0
@@ -69,7 +75,7 @@ blocked_guidance() {
   for ((i=0; i<count; i++)); do
     printf 'Blocked cask: %s (macOS App Management)\n' "$(plutil -extract "blocked.${i}.name" raw -o - "${file}")"
   done
-  echo "Skipped until a newer version or manual upgrade; retry with: sudo brewau clear-blocked"
+  blocked_retry_guidance
 }
 
 status_errors() {
@@ -228,7 +234,7 @@ doctor_app_protection() {
         seen+="${name}:${reason}"$'\n'
         if [[ "${reason}" == app-management ]]; then
           echo "Blocked cask: ${name} (macOS App Management)"
-          echo "Skipped until a newer version or manual upgrade; retry with: sudo brewau clear-blocked"
+          blocked_retry_guidance
         else
           named_failure=1
           bad "${name} is unprotected (${reason}); see: brewau log"

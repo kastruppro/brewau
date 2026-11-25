@@ -1,0 +1,49 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>PayloadType</key>
+    <string>Configuration</string>
+    <key>PayloadScope</key>
+    <string>System</string>
+    <key>PayloadVersion</key>
+    <integer>1</integer>
+    <key>PayloadIdentifier</key>
+    <string>com.kastruppro.brewau.pppc</string>
+    <key>PayloadUUID</key>
+    <string>C867AB28-9046-4BB0-9D86-54EA0A9AD503</string>
+    <key>PayloadDisplayName</key>
+    <string>brewau App Management</string>
+    <key>PayloadContent</key>
+    <array>
+        <dict>
+            <key>PayloadType</key>
+            <string>com.apple.TCC.configuration-profile-policy</string>
+            <key>PayloadVersion</key>
+            <integer>1</integer>
+            <key>PayloadIdentifier</key>
+            <string>com.kastruppro.brewau.pppc.app-management</string>
+            <key>PayloadUUID</key>
+            <string>1281AE4E-495B-47CC-9D1F-A9781791946F</string>
+            <key>PayloadDisplayName</key>
+            <string>brewau agent App Management</string>
+            <key>Services</key>
+            <dict>
+                <key>SystemPolicyAppBundles</key>
+                <array>
+                    <dict>
+                        <key>IdentifierType</key>
+                        <string>path</string>
+                        <key>Identifier</key>
+                        <string>/opt/brewau/libexec/brewau-agent</string>
+                        <key>CodeRequirement</key>
+                        <string>identifier "com.kastruppro.brewau.agent" and anchor apple generic and certificate leaf[subject.OU] = "5W98EXLE44"</string>
+                        <key>Authorization</key>
+                        <string>Allow</string>
+                    </dict>
+                </array>
+            </dict>
+        </dict>
+    </array>
+</dict>
+</plist>

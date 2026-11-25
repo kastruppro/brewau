@@ -270,6 +270,7 @@ MOCK_CASK_FAIL=parallels
 MOCK_CASK_ERROR="Cannot change ownership because your terminal does not have App Management permissions."
 run
 check '[[ ${RC} == 0 && "${STATUS}" == blocked ]]' "new block is not a job failure"
+check '[[ "${OUTPUT}" == *"App Management for /opt/brewau/libexec/brewau-agent"* ]]' "cask block names the agent"
 check '[[ "$(sed -n "s/^upgraded=//p" "${LAST_RUN}")" == firefox ]]' "only successful cask is upgraded"
 check '[[ "$(plutil -extract blocked.0.name raw -o - "${BREWAU_STATE_DIR}/last-result.json")" == parallels ]]' "JSON attributes block to cask"
 : >"${CALLS}"

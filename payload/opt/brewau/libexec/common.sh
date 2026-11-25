@@ -529,7 +529,7 @@ brewau_protect_apps() {
         brewau_write_state "$(brewau_app_state "${app}").untrusted" "${app}" || true
       fi
       if [[ ${locked} -eq 0 ]] || brewau_app_needs_protection "${app}"; then
-        echo "brewau: WARNING: could not protect ${app} (App Management permission?)" >&2
+        echo "brewau: WARNING: could not protect ${app} (for scheduled upgrades, check App Management for ${BREWAU_ROOT}/libexec/brewau-agent)" >&2
         reason=protect-failed
         brewau_app_eperm "${app}" "${output}" && reason="app-management"
         brewau_protection_failure "${token}" "${reason}" "${report}" "${app}" lock
@@ -550,7 +550,7 @@ brewau_protect_apps() {
     fi
     if ! output="$(brewau_pin_app "${app}" "$@" 2>&1)"; then
       [[ -z "${output}" ]] || printf '%s\n' "${output}" >&2
-      echo "brewau: WARNING: could not pin ${app} in place (App Management permission?)" >&2
+      echo "brewau: WARNING: could not pin ${app} in place (for scheduled upgrades, check App Management for ${BREWAU_ROOT}/libexec/brewau-agent)" >&2
       reason=protect-failed
       brewau_app_eperm "${app}" "${output}" && reason="app-management"
       brewau_protection_failure "${token}" "${reason}" "${report}" "${app}" pin
