@@ -82,7 +82,7 @@ struct UpdatePopover: View {
                             Label("macOS blokerer opdateringen", systemImage: "exclamationmark.shield.fill")
                                 .font(.system(size: 12, weight: .semibold)).foregroundStyle(.orange)
                             Text(blocked).font(.system(size: 11)).fixedSize(horizontal: false, vertical: true)
-                            Text(AppManagementGuide.steps).font(.system(size: 11)).foregroundStyle(.secondary)
+                            Text(AppManagementGuide.steps(for: ProcessInfo.processInfo.operatingSystemVersion)).font(.system(size: 11)).foregroundStyle(.secondary)
                                 .fixedSize(horizontal: false, vertical: true)
                             Text(AppManagementGuide.agentPath).font(.system(size: 11, design: .monospaced)).textSelection(.enabled)
                             HStack {

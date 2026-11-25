@@ -131,6 +131,13 @@ import Darwin
             check(AppManagementGuide.steps.contains(needle), "App Management steps mention \(needle)")
         }
         check(AppManagementGuide.settingsFallback.hasSuffix("tilføj /opt/brewau/libexec/brewau-agent."), "Settings fallback names the path")
+        func macOS(_ major: Int, _ minor: Int) -> OperatingSystemVersion { OperatingSystemVersion(majorVersion: major, minorVersion: minor, patchVersion: 0) }
+        check(AppManagementGuide.plusCannotAddExecutables(macOS(26, 1)) && AppManagementGuide.plusCannotAddExecutables(macOS(26, 2)), "+ cannot add executables on 26.1 and 26.2")
+        for (major, minor) in [(15, 7), (26, 0), (26, 3), (27, 2), (27, 1)] {
+            check(!AppManagementGuide.plusCannotAddExecutables(macOS(major, minor)), "+ works on macOS \(major).\(minor)")
+        }
+        check(AppManagementGuide.steps(for: macOS(26, 2)).hasSuffix("\n" + AppManagementGuide.plusUnavailableNote), "26.2 gets the update/MDM note")
+        check(AppManagementGuide.steps(for: macOS(27, 2)) == AppManagementGuide.steps, "Other versions get the plain steps")
 
         let standingBlock = try RunResult.decode(Data(#"{"upgraded":[],"failed":[],"blocked":[{"name":"parallels","kind":"cask","version":"26.2.1","reason":"app-management","installed":"x"}],"errors":[],"finished":"2026-11-09T04:00:00Z","job":"upgrade","status":"blocked","reason":"app-management"}"#.utf8))
         check(!standingBlock.isFailure, "A standing block is not a failure")

@@ -22,6 +22,14 @@ enum AppManagementGuide {
     3. Slå brewau-agent til, og klik Prøv igen.
     På Macs, der administreres af IT (MDM), kan en profil give tilladelsen.
     """
+    /// macOS 26.1 and 26.2 cannot add a standalone executable with + (Apple DTS, fixed in 26.3).
+    static func plusCannotAddExecutables(_ version: OperatingSystemVersion) -> Bool {
+        version.majorVersion == 26 && (version.minorVersion == 1 || version.minorVersion == 2)
+    }
+    static let plusUnavailableNote = "På denne macOS-version kan + ikke tilføje programmet. Opdater macOS til 26.3 eller nyere, eller brug MDM-profilen på administrerede Macs."
+    static func steps(for version: OperatingSystemVersion) -> String {
+        plusCannotAddExecutables(version) ? steps + "\n" + plusUnavailableNote : steps
+    }
     static let settingsFallback = "Systemindstillinger kunne ikke åbnes. Gå til Anonymitet og sikkerhed › App-administration, og tilføj \(agentPath)."
 }
 
