@@ -79,7 +79,7 @@ struct UpdatePopover: View {
                     }
                     if let blocked = model.blockedMessage {
                         VStack(alignment: .leading, spacing: 8) {
-                            Label("macOS blokerer opdateringen", systemImage: "exclamationmark.shield.fill")
+                            Label(model.blockedByAppManagement.isEmpty ? "macOS blokerer beskyttelsen" : "macOS blokerer opdateringen", systemImage: "exclamationmark.shield.fill")
                                 .font(.system(size: 12, weight: .semibold)).foregroundStyle(.orange)
                             Text(blocked).font(.system(size: 11)).fixedSize(horizontal: false, vertical: true)
                             Text(AppManagementGuide.steps(for: ProcessInfo.processInfo.operatingSystemVersion)).font(.system(size: 11)).foregroundStyle(.secondary)
@@ -140,7 +140,8 @@ struct UpdatePopover: View {
                                 AppIcon(path: item.app.path)
                                 VStack(alignment: .leading, spacing: 3) {
                                     Text(item.app.name).font(.system(size: 12, weight: .medium))
-                                    Text("\(item.app.version) klar efter genstart").font(.system(size: 10)).foregroundStyle(.secondary)
+                                    Text(model.waitingToQuit.contains(item.id) ? "Venter på at \(item.app.name) lukker…" : "\(item.app.version) klar efter genstart")
+                                        .font(.system(size: 10)).foregroundStyle(.secondary)
                                 }
                                 Spacer()
                                 if restartConfirmation == item.id {

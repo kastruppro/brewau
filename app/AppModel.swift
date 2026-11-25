@@ -28,6 +28,8 @@ struct PendingApp: Identifiable {
     @Published var notificationStatus = "Ikke aktiveret"
     @Published var notificationAllowed = false
     @Published var restarting: Set<String> = []
+    /// Apps that were asked to quit and are still shutting down.
+    @Published var waitingToQuit: Set<String> = []
     @Published var repairStatus: String?
     @Published var homebrewVersion = "Ukendt"
     @Published var upgradeResult: RunResult?
@@ -47,6 +49,7 @@ struct PendingApp: Identifiable {
     private var automaticRestartAttempts: Set<String> = []
     private var loadingPreferences = true
     private var oneShot = OneShotNotice()
+    private var blockedLog = ChangeGate()
 
     override init() {
         super.init()
@@ -83,7 +86,13 @@ struct PendingApp: Identifiable {
     func appManagementBlock(for update: PackageUpdate) -> RunResultItem? {
         blockedByAppManagement.first { $0.token == update.token }
     }
-    var blockedMessage: String? { RunResult.danishBlocks(blockedByAppManagement.map { displayName(for: $0) }) }
+    /// Casks that were updated, but that App Management kept brewau from protecting.
+    var unprotectedByAppManagement: [RunResultItem] { upgradeResult?.protectionWarnings ?? [] }
+    var blockedMessage: String? {
+        let parts = [RunResult.danishBlocks(blockedByAppManagement.map { displayName(for: $0) }),
+                     RunResult.danishProtection(unprotectedByAppManagement.map { displayName(for: $0) })].compactMap { $0 }
+        return parts.isEmpty ? nil : parts.joined(separator: " ")
+    }
     var headline: String {
         if !installed { return "Tjenesten skal opdateres" }
         if let job = runJob, let line = runHeadline(job: job, succeeded: runSucceeded, result: runResult) { return line }
@@ -315,13 +324,22 @@ struct PendingApp: Identifiable {
     /// A block repeats on every scheduled run, so the banner is tied to the package and the
     /// version it got stuck on instead of to the run.
     func notifyBlocked() async {
+        // The result is re-read every few seconds; log the blocked set only when it changes.
+        let current = upgradeResult?.appManagementItems ?? []
+        if blockedLog.changed(Set(current.map { "\($0.name) \($0.version)" })) {
+            for item in current {
+                BrewauLog.app.notice("reporting blocked package \(item.name, privacy: .public) \(item.version, privacy: .public)")
+            }
+        }
         guard notificationPreferences.enabled, notificationPreferences.failure else { return }
-        for item in blockedByAppManagement {
-            let key = "blocked-\(item.name)-\(item.version)"
+        let notices = blockedByAppManagement.map { ($0, "blocked", "\(displayName(for: $0)) kunne ikke opdateres",
+                                                    "macOS App Management blokerer baggrundstjenesten brewau-agent. Åbn brewau for at se, hvad du kan gøre.") }
+            + unprotectedByAppManagement.map { ($0, "unprotected", "\(displayName(for: $0)) kunne ikke beskyttes",
+                                                "Appen er opdateret, men macOS App Management afviste baggrundstjenesten brewau-agent. Åbn brewau for at se, hvad du kan gøre.") }
+        for (item, prefix, title, body) in notices {
+            let key = "\(prefix)-\(item.name)-\(item.version)"
             guard oneShot.shouldSubmit(key, delivered: defaults.bool(forKey: key)) else { continue }
-            BrewauLog.app.notice("reporting blocked package \(item.name, privacy: .public) \(item.version, privacy: .public)")
-            let delivered = await sendNotification(id: key, title: "\(displayName(for: item)) kunne ikke opdateres",
-                                                   body: "macOS App Management blokerer baggrundstjenesten brewau-agent. Åbn brewau for at se, hvad du kan gøre.")
+            let delivered = await sendNotification(id: key, title: title, body: body)
             // Remembered only once it was really delivered, so a permission the user grants
             // later still gets the banner.
             if oneShot.finish(key, delivered: delivered) { defaults.set(true, forKey: key) }
@@ -387,22 +405,31 @@ struct PendingApp: Identifiable {
         guard !restarting.contains(item.id), !item.process.isTerminated,
               item.process.bundleURL?.standardizedFileURL.path == item.app.path else { return }
         restarting.insert(item.id)
-        defer { restarting.remove(item.id); detectPending() }
+        defer { restarting.remove(item.id); waitingToQuit.remove(item.id); detectPending() }
+        let oldPID = item.process.processIdentifier
+        let started = Date()
+        var forced = false
         item.process.terminate()
-        for _ in 0..<30 {
-            if item.process.isTerminated { break }
-            try? await Task.sleep(for: .milliseconds(500))
-        }
-        if !item.process.isTerminated && forceIsAllowed(item.app) {
-            item.process.forceTerminate()
-            for _ in 0..<10 {
-                if item.process.isTerminated { break }
+        waitingToQuit.insert(item.id)
+        loop: while true {
+            switch RestartTiming.step(elapsed: Date().timeIntervalSince(started), terminated: item.process.isTerminated,
+                                      forceAllowed: forceIsAllowed(item.app), forced: forced) {
+            case .reopen: break loop
+            case .force:
+                forced = true
+                item.process.forceTerminate()
+            case .giveUp:
+                BrewauLog.app.error("\(item.app.token, privacy: .public) would not quit")
+                error = "\(item.app.name) kunne ikke afsluttes. Gem dit arbejde, og luk appen selv, eller tillad tvungen genstart i indstillingerne."
+                return
+            case .wait:
                 try? await Task.sleep(for: .milliseconds(500))
             }
         }
-        guard item.process.isTerminated else {
-            BrewauLog.app.error("\(item.app.token, privacy: .public) would not quit")
-            error = "\(item.app.name) kunne ikke afsluttes. Gem dit arbejde, og luk appen selv, eller tillad tvungen genstart i indstillingerne."
+        let running = NSWorkspace.shared.runningApplications.filter { !$0.isTerminated }
+            .map { (pid: $0.processIdentifier, path: $0.bundleURL?.standardizedFileURL.path) }
+        guard RestartTiming.shouldReopen(oldPID: oldPID, running: running, appPath: item.app.path) else {
+            BrewauLog.app.notice("\(item.app.token, privacy: .public) was already reopened")
             return
         }
         do { _ = try await NSWorkspace.shared.openApplication(at: URL(fileURLWithPath: item.app.path), configuration: NSWorkspace.OpenConfiguration()) }

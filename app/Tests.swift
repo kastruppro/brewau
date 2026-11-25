@@ -162,6 +162,44 @@ import Darwin
         check(twoBlocks.danishSummary()?.hasPrefix("parallels og docker kunne ikke opdateres") == true, "Several blocks are listed in one sentence")
         check(twoBlocks.danishHeadline == "2 apps er blokeret af macOS", "Several blocks are counted")
 
+        // Live result from 2026-11-25: Paseo was upgraded, only pinning it afterwards was refused.
+        let pinRefused = try RunResult.decode(Data(#"{"status":"blocked","failed":[],"finished":"2026-11-25T10:42:39Z","errors":[],"upgraded":[{"kind":"cask","reason":"ok","name":"paseo","installed":"","version":"0.17.4"}],"reason":"app-management","blocked":[{"version":"0.17.4","kind":"cask","reason":"app-management","name":"paseo","installed":"[\"0.17.4\"]","protection":"\/Applications\/Paseo.app\tpin"}],"job":"upgrade"}"#.utf8))
+        check(pinRefused.blocked.first?.installedVersions == ["0.17.4"], "JSON-encoded installed versions are read")
+        check(pinRefused.appManagementBlocks.isEmpty && pinRefused.protectionWarnings.map(\.token) == ["paseo"], "An upgraded app is a protection warning, not a block")
+        check(!pinRefused.isFailure && pinRefused.isBlockOnly && pinRefused.hasSomethingToReport, "A protection warning is reported, not as a failure")
+        check(pinRefused.danishHeadline == "1 app kunne ikke beskyttes", "A protection warning is not counted as blocked")
+        check(pinRefused.danishSummary { $0.token.capitalized } == "Paseo er opdateret, men brewau kunne ikke beskytte appen, fordi macOS App Management afviste baggrundstjenesten.", "Protection warning says the app was updated")
+        check(pinRefused.logSummary == "paseo 0.17.4: up to date, but macOS App Management refused to let brewau protect it", "Protection warning log line")
+        check(runNotice(job: "upgrade", succeeded: true, result: pinRefused) == .upgradeFinished, "The upgrade itself is still announced")
+        // The same item as a literal array, and an up-to-date app that was not part of this run.
+        let literalArray = try RunResult.decode(Data(#"{"blocked":[{"version":"0.17.4","kind":"cask","reason":"app-management","name":"paseo","installed":["0.17.4"]}],"job":"upgrade","status":"blocked","reason":"app-management"}"#.utf8))
+        check(literalArray.protectionWarnings.count == 1 && literalArray.appManagementBlocks.isEmpty, "A literal installed array is read too")
+        // A real block keeps the old version installed and stays a block, also beside a warning.
+        let mixedBlock = try RunResult.decode(Data(#"{"upgraded":[{"name":"paseo","kind":"cask","version":"0.17.4","reason":"ok","installed":""}],"blocked":[{"version":"0.17.4","kind":"cask","reason":"app-management","name":"paseo","installed":"[\"0.17.3\"]"},{"version":"26.2.1","kind":"cask","reason":"app-management","name":"parallels","installed":"[\"26.1.0\"]"}],"job":"upgrade","status":"blocked","reason":"app-management"}"#.utf8))
+        check(mixedBlock.protectionWarnings.map(\.token) == ["paseo"], "Upgraded in this run counts even if installed lags")
+        check(mixedBlock.appManagementBlocks.map(\.token) == ["parallels"] && mixedBlock.danishHeadline == "1 app er blokeret af macOS", "Only real blocks are counted as blocked")
+        check(mixedBlock.danishSummary()?.hasSuffix("paseo er opdateret, men brewau kunne ikke beskytte appen, fordi macOS App Management afviste baggrundstjenesten.") == true, "Block and warning are both explained")
+
+        // Blocked packages are logged once per change, not on every refresh.
+        var gate = ChangeGate()
+        check(gate.changed(["paseo 0.17.4"]) && !gate.changed(["paseo 0.17.4"]), "An unchanged set is logged once")
+        check(gate.changed([]) && gate.changed(["paseo 0.17.5"]), "Every change is logged")
+        var emptyGate = ChangeGate()
+        check(emptyGate.changed([]) && !emptyGate.changed([]), "An empty first set counts once")
+
+        // Restart: a slow quit is waited on, forcing needs consent, a relaunch is not doubled.
+        check(RestartTiming.step(elapsed: 20, terminated: false, forceAllowed: false, forced: false) == .wait, "A slow app is not given up on after 15 s")
+        check(RestartTiming.step(elapsed: 179, terminated: false, forceAllowed: false, forced: false) == .wait, "Waits for minutes")
+        check(RestartTiming.step(elapsed: 180, terminated: false, forceAllowed: false, forced: false) == .giveUp, "Gives up at the end")
+        check(RestartTiming.step(elapsed: 90, terminated: true, forceAllowed: false, forced: false) == .reopen, "Reopens as soon as it quits")
+        check(RestartTiming.step(elapsed: 14, terminated: false, forceAllowed: true, forced: false) == .wait, "No force before the grace period")
+        check(RestartTiming.step(elapsed: 15, terminated: false, forceAllowed: true, forced: false) == .force, "Force after the grace period with consent")
+        check(RestartTiming.step(elapsed: 16, terminated: false, forceAllowed: true, forced: true) == .wait, "Force is sent once")
+        check(RestartTiming.step(elapsed: 200, terminated: false, forceAllowed: true, forced: true) == .giveUp, "A forced app that never quits is given up on")
+        let paseoPath = "/Applications/Paseo.app"
+        check(RestartTiming.shouldReopen(oldPID: 10, running: [(pid: 10, path: paseoPath), (pid: 11, path: "/Applications/Other.app"), (pid: 12, path: nil)], appPath: paseoPath), "Reopens when nothing else runs the app")
+        check(!RestartTiming.shouldReopen(oldPID: 10, running: [(pid: 42, path: paseoPath)], appPath: paseoPath), "Does not reopen an app the user already started")
+
         // Files from an older brewau, or a half-written one, must not keep the GUI from starting.
         let sparse = try RunResult.decode(Data("{}".utf8))
         check(!sparse.isFailure && !sparse.hasSomethingToReport && sparse.danishSummary() == nil, "An empty result reports nothing")

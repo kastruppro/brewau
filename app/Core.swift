@@ -247,6 +247,9 @@ struct RunResultItem: Equatable, Sendable {
     let reason: String
     /// Opaque installed-version signature the shell layer matches a retry against.
     let installed: String
+    /// The versions installed when the item was recorded. The job writes `installed` as a
+    /// JSON array of versions; an older file wrote one string.
+    var installedVersions: [String] = []
     var isCask: Bool { kind == "cask" }
     /// Casks may be named `tap/user/token`; the catalog knows them by the last component.
     var token: String { String(name.split(separator: "/").last ?? "") }
@@ -301,10 +304,18 @@ struct RunResult: Equatable, Sendable {
             (object[key] as? [[String: Any]] ?? []).prefix(RunResult.itemLimit).compactMap { row in
                 let name = field(row["name"], 200)
                 guard !name.isEmpty else { return nil }
+                // The job stores the versions as JSON text inside a string; a literal array or
+                // a plain version string is read as well.
+                var raw = row["installed"]
+                if let text = raw as? String, text.hasPrefix("["),
+                   let parsed = try? JSONSerialization.jsonObject(with: Data(text.utf8)) as? [Any] { raw = parsed }
+                let versions = ((raw as? [Any]) ?? [raw as Any])
+                    .prefix(RunResult.itemLimit).map { field($0, 64) }.filter { !$0.isEmpty }
                 return RunResultItem(name: name, kind: field(row["kind"], 32),
                                      version: field(row["version"], 64),
                                      reason: field(row["reason"], 32),
-                                     installed: field(row["installed"], 200))
+                                     installed: row["installed"] is String ? field(row["installed"], 200) : versions.joined(separator: ", "),
+                                     installedVersions: versions)
             }
         }
         result.upgraded = items("upgraded")
@@ -326,18 +337,29 @@ struct RunResult: Equatable, Sendable {
     /// Statuses the shell layer exits 0 with; everything else left work undone.
     var isFailure: Bool { !["ok", "blocked", "skipped", ""].contains(status) }
     /// Casks macOS App Management keeps the background job from upgrading.
-    var appManagementBlocks: [RunResultItem] { blocked.filter { $0.reason == "app-management" } }
+    var appManagementBlocks: [RunResultItem] { blocked.filter { $0.reason == "app-management" && !isProtectionOnly($0) } }
+    /// Casks that are at the recorded version already — upgraded by this run, or up to date —
+    /// but that App Management kept brewau from pinning and locking afterwards. Nothing was
+    /// left un-updated, so these are warnings, not blocks.
+    var protectionWarnings: [RunResultItem] { blocked.filter { $0.reason == "app-management" && isProtectionOnly($0) } }
+    func isProtectionOnly(_ item: RunResultItem) -> Bool {
+        guard !item.version.isEmpty else { return false }
+        return item.installedVersions.contains(item.version)
+            || upgraded.contains { $0.token == item.token && $0.version == item.version }
+    }
+    /// Every App Management refusal, block or protection warning.
+    var appManagementItems: [RunResultItem] { appManagementBlocks + protectionWarnings }
     /// Failures that are not the block itself. The job records a blocked cask in both arrays
     /// with the same reason, while the same cask can separately fail to be protected, which
     /// is its own problem and must not be filtered out with the block.
     var otherFailures: [RunResultItem] { failed.filter { $0.reason != "app-management" } }
-    var hasSomethingToReport: Bool { isOffline || isFailure || !errors.isEmpty || !appManagementBlocks.isEmpty }
+    var hasSomethingToReport: Bool { isOffline || isFailure || !errors.isEmpty || !appManagementItems.isEmpty }
     /// Everything this run has to say is that App Management blocks a cask, which the block's
     /// own once-per-version banner covers. The job records every failed step of a run, so an
     /// empty step list with a block present means the block is all there is — no guessing
     /// from the status is needed any more.
     var isBlockOnly: Bool {
-        guard !isOffline, errors.isEmpty, otherFailures.isEmpty, !appManagementBlocks.isEmpty else { return false }
+        guard !isOffline, errors.isEmpty, otherFailures.isEmpty, !appManagementItems.isEmpty else { return false }
         // A result file from a brewau before this contract has no step list. There the status
         // is the only signal, and that version published `upgrade-failed` for the run that
         // discovered a block.
@@ -379,6 +401,7 @@ struct RunResult: Equatable, Sendable {
         if failures.isEmpty, isFailure, !isBlockOnly { failures.append(RunResult.danishStatus(status, job: job)) }
         parts += failures
         if includingBlocks, let blocks = RunResult.danishBlocks(appManagementBlocks.map(displayName)) { parts.append(blocks) }
+        if includingBlocks, let warnings = RunResult.danishProtection(protectionWarnings.map(displayName)) { parts.append(warnings) }
         return parts.isEmpty ? nil : parts.joined(separator: " ")
     }
 
@@ -392,6 +415,9 @@ struct RunResult: Equatable, Sendable {
         }
         if !appManagementBlocks.isEmpty {
             return appManagementBlocks.count == 1 ? "1 app er blokeret af macOS" : "\(appManagementBlocks.count) apps er blokeret af macOS"
+        }
+        if !protectionWarnings.isEmpty {
+            return protectionWarnings.count == 1 ? "1 app kunne ikke beskyttes" : "\(protectionWarnings.count) apps kunne ikke beskyttes"
         }
         if isOffline { return "Sprunget over – ingen forbindelse" }
         return nil
@@ -409,6 +435,9 @@ struct RunResult: Equatable, Sendable {
         for item in appManagementBlocks {
             parts.append("\(item.name) \(item.version): blocked by macOS App Management, skipped until a newer version or a manual upgrade")
         }
+        for item in protectionWarnings {
+            parts.append("\(item.name) \(item.version): up to date, but macOS App Management refused to let brewau protect it")
+        }
         // A run that failed without recording a step has only its status to report.
         if parts.isEmpty || (isFailure && errors.isEmpty && otherFailures.isEmpty && !isBlockOnly) {
             parts.append("status \(status.isEmpty ? "unknown" : status) (reason \(reason.isEmpty ? "unknown" : reason))")
@@ -423,6 +452,16 @@ struct RunResult: Equatable, Sendable {
         }
         if names.count > 1 {
             return "\(list(names)) kunne ikke opdateres, fordi macOS App Management blokerer baggrundsjobbet. De springes over, indtil der kommer nyere versioner, eller du opdaterer dem manuelt."
+        }
+        return nil
+    }
+    /// The protection warning: the app is updated, only brewau's pin and lock were refused.
+    static func danishProtection(_ names: [String]) -> String? {
+        if names.count == 1 {
+            return "\(names[0]) er opdateret, men brewau kunne ikke beskytte appen, fordi macOS App Management afviste baggrundstjenesten."
+        }
+        if names.count > 1 {
+            return "\(list(names)) er opdateret, men brewau kunne ikke beskytte apperne, fordi macOS App Management afviste baggrundstjenesten."
         }
         return nil
     }
@@ -559,6 +598,38 @@ struct OneShotNotice {
     mutating func finish(_ key: String, delivered: Bool) -> Bool {
         inFlight.remove(key)
         return delivered
+    }
+}
+
+/// True when a set differs from the one seen last time, so a state that is re-read every
+/// few seconds is logged once per change instead of on every refresh.
+struct ChangeGate {
+    private var last: Set<String>?
+    mutating func changed(_ value: Set<String>) -> Bool {
+        defer { last = value }
+        return last != value
+    }
+}
+
+enum RestartStep: Equatable, Sendable { case wait, force, reopen, giveUp }
+
+/// When to stop waiting for an app that was asked to quit. Some apps (Electron with helper
+/// processes, say) need well over a few seconds to shut down, so a normal quit is waited on
+/// for minutes. Forcing stays limited to apps the user allowed it for, after the same short
+/// grace period as before.
+enum RestartTiming {
+    static let forceAfter: TimeInterval = 15
+    static let giveUpAfter: TimeInterval = 180
+    static func step(elapsed: TimeInterval, terminated: Bool, forceAllowed: Bool, forced: Bool) -> RestartStep {
+        if terminated { return .reopen }
+        if elapsed >= giveUpAfter { return .giveUp }
+        if forceAllowed, !forced, elapsed >= forceAfter { return .force }
+        return .wait
+    }
+    /// A quit app is reopened only if the user has not already started it again: any other
+    /// running process of the same bundle means they did.
+    static func shouldReopen(oldPID: Int32, running: [(pid: Int32, path: String?)], appPath: String) -> Bool {
+        !running.contains { $0.pid != oldPID && $0.path == appPath }
     }
 }
 

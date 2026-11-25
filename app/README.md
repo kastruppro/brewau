@@ -41,13 +41,21 @@ standalone executables). **Vis i Finder** shows the binary so it can be dragged 
 list instead. On MDM-managed Macs a PPPC profile for that path can grant it. **Prøv igen**
 then asks the helper to drop the block list and starts a new upgrade.
 
+A cask that is already at the recorded version (upgraded in that run, or up to date) but
+that App Management kept brewau from pinning and locking afterwards is shown as a
+protection warning ("… er opdateret, men brewau kunne ikke beskytte appen"), not as a
+block, and is not counted as blocked. The unified log names the blocked set only when it
+changes.
+
 - **Tidsplan:** scans every 15/30 minutes, 1/6/12 hours or daily. Upgrades can run
   by hour interval, daily, or weekly, with up to 24 distinct local times. Press
   **Gem** to apply the schedule. Schedules and Homebrew preferences apply to all
   brewau users on the Mac; notification/restart preferences apply to your session.
 - **Genstart:** active apps with an installation timestamp newer than their launch
   time appear as pending. A manual restart asks for confirmation and tries normal
-  termination. Only apps explicitly allowed in settings can be forcibly terminated
+  termination. A slow app is waited on for up to three minutes ("Venter på at … lukker…")
+  and reopened as soon as it quits, unless you already started it again yourself.
+  Only apps explicitly allowed in settings can be forcibly terminated
   after a 15-second grace period. The allowlist is tied to cask, app path and bundle
   identity. Failed or refused restarts are reported and do not spin in a retry loop.
 - **Notifikationer:** separately select discovery, completion, restart and failure
