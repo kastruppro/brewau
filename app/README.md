@@ -30,8 +30,16 @@ A cask that macOS App Management keeps the background job from replacing is repo
 once, as blocked, and not as a failed run: it is skipped until a newer version appears
 or the user upgrades it by hand. A run whose only news is such a block records no
 failed step, so it never hides a failure of its own — a service that would not
-restart, or a failed cleanup or snapshot, is still reported next to the block. **Åbn Systemindstillinger…** opens Anonymitet og sikkerhed › App-administration,
-and **Prøv igen** asks the helper to drop the block list and starts a new upgrade.
+restart, or a failed cleanup or snapshot, is still reported next to the block.
+
+macOS attributes the daemon's changes to the standalone binary
+`/opt/brewau/libexec/brewau-agent`, not to brewau.app, so switching on App Management
+for the brewau app does nothing. The banner shows the steps: **Åbn Systemindstillinger…**
+copies the agent path and opens Anonymitet og sikkerhed › App-administration; click +,
+press ⌘⇧G, paste the path and switch brewau-agent on (macOS 26.3 or later accepts
+standalone executables). **Vis i Finder** shows the binary so it can be dragged into the
+list instead. On MDM-managed Macs a PPPC profile for that path can grant it. **Prøv igen**
+then asks the helper to drop the block list and starts a new upgrade.
 
 - **Tidsplan:** scans every 15/30 minutes, 1/6/12 hours or daily. Upgrades can run
   by hour interval, daily, or weekly, with up to 24 distinct local times. Press

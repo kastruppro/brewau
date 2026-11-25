@@ -11,6 +11,20 @@ enum BrewauLog {
     static let helper = Logger(subsystem: "com.kastruppro.brewau", category: "helper")
 }
 
+/// The background service. macOS attributes the daemon's changes to /Applications to this
+/// standalone binary, not to brewau.app, so App Management has to be granted to this path.
+enum AppManagementGuide {
+    static let agentPath = "/opt/brewau/libexec/brewau-agent"
+    static let steps = """
+    Det er baggrundstjenesten brewau-agent, ikke brewau-appen, der skal have adgang under App-administration:
+    1. Klik Åbn Systemindstillinger… (stien kopieres) og derefter +.
+    2. Tryk ⌘⇧G, indsæt stien, og vælg brewau-agent. Du kan også trække den ind fra Vis i Finder.
+    3. Slå brewau-agent til, og klik Prøv igen.
+    På Macs, der administreres af IT (MDM), kan en profil give tilladelsen.
+    """
+    static let settingsFallback = "Systemindstillinger kunne ikke åbnes. Gå til Anonymitet og sikkerhed › App-administration, og tilføj \(agentPath)."
+}
+
 enum BrewauError: LocalizedError {
     case message(String)
     /// Danish text for the GUI plus a separate English line for upgrade.log and the unified log.

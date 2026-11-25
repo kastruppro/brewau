@@ -108,14 +108,21 @@ struct PendingApp: Identifiable {
             self.error = error.localizedDescription
         }
     }
-    /// Privacy & Security > App Management, where the user can add the background job.
+    /// Privacy & Security > App Management, where the user adds the background service
+    /// (brewau-agent, not this app). Its path goes to the pasteboard for ⌘⇧G.
     func openAppManagementSettings() {
         BrewauLog.app.notice("opening the App Management privacy settings")
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(AppManagementGuide.agentPath, forType: .string)
         for identifier in ["com.apple.settings.PrivacySecurity.extension", "com.apple.preference.security"] {
             if let url = URL(string: "x-apple.systempreferences:\(identifier)?Privacy_AppBundles"),
                NSWorkspace.shared.open(url) { return }
         }
-        error = "Systemindstillinger kunne ikke åbnes. Gå til Anonymitet og sikkerhed › App-administration."
+        error = AppManagementGuide.settingsFallback
+    }
+    /// Shows brewau-agent in Finder so it can be dragged into the App Management list.
+    func revealAgentInFinder() {
+        NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: AppManagementGuide.agentPath)])
     }
 
     func refresh() async {
@@ -314,7 +321,7 @@ struct PendingApp: Identifiable {
             guard oneShot.shouldSubmit(key, delivered: defaults.bool(forKey: key)) else { continue }
             BrewauLog.app.notice("reporting blocked package \(item.name, privacy: .public) \(item.version, privacy: .public)")
             let delivered = await sendNotification(id: key, title: "\(displayName(for: item)) kunne ikke opdateres",
-                                                   body: "macOS App Management blokerer baggrundsjobbet. Åbn brewau for at se, hvad du kan gøre.")
+                                                   body: "macOS App Management blokerer baggrundstjenesten brewau-agent. Åbn brewau for at se, hvad du kan gøre.")
             // Remembered only once it was really delivered, so a permission the user grants
             // later still gets the banner.
             if oneShot.finish(key, delivered: delivered) { defaults.set(true, forKey: key) }

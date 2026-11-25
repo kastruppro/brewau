@@ -124,6 +124,13 @@ import Darwin
         check(blocked.danishSummary { $0.token.capitalized } == "Parallels kunne ikke opdateres, fordi macOS App Management blokerer baggrundsjobbet. Den springes over, indtil der kommer en nyere version eller du opdaterer den manuelt.", "Block explains itself with the app's name")
         check(blocked.logSummary == "kastruppro/tap/parallels 26.2.1: blocked by macOS App Management, skipped until a newer version or a manual upgrade", "Log line names package and version in English")
         check(blocked.hasSomethingToReport, "A blocked run is reported")
+        // TCC attributes the daemon's changes to the standalone agent binary, so the guide
+        // must send the user to that path and never to the brewau app's own toggle.
+        check(AppManagementGuide.agentPath == "/opt/brewau/libexec/brewau-agent", "Guide names the installed agent binary")
+        for needle in ["brewau-agent, ikke brewau-appen", "⌘⇧G", "Vis i Finder", "Prøv igen", "MDM"] {
+            check(AppManagementGuide.steps.contains(needle), "App Management steps mention \(needle)")
+        }
+        check(AppManagementGuide.settingsFallback.hasSuffix("tilføj /opt/brewau/libexec/brewau-agent."), "Settings fallback names the path")
 
         let standingBlock = try RunResult.decode(Data(#"{"upgraded":[],"failed":[],"blocked":[{"name":"parallels","kind":"cask","version":"26.2.1","reason":"app-management","installed":"x"}],"errors":[],"finished":"2026-11-09T04:00:00Z","job":"upgrade","status":"blocked","reason":"app-management"}"#.utf8))
         check(!standingBlock.isFailure, "A standing block is not a failure")

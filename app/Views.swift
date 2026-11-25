@@ -82,9 +82,14 @@ struct UpdatePopover: View {
                             Label("macOS blokerer opdateringen", systemImage: "exclamationmark.shield.fill")
                                 .font(.system(size: 12, weight: .semibold)).foregroundStyle(.orange)
                             Text(blocked).font(.system(size: 11)).fixedSize(horizontal: false, vertical: true)
+                            Text(AppManagementGuide.steps).font(.system(size: 11)).foregroundStyle(.secondary)
+                                .fixedSize(horizontal: false, vertical: true)
+                            Text(AppManagementGuide.agentPath).font(.system(size: 11, design: .monospaced)).textSelection(.enabled)
                             HStack {
                                 Spacer()
+                                Button("Vis i Finder") { model.revealAgentInFinder() }
                                 Button("Åbn Systemindstillinger…") { model.openAppManagementSettings() }
+                                    .help("Kopierer \(AppManagementGuide.agentPath) og åbner App-administration")
                                 Button(model.clearingBlocked ? "Prøver igen…" : "Prøv igen") { Task { await model.retryBlocked() } }
                                     .buttonStyle(.borderedProminent)
                                     .disabled(model.busy || model.clearingBlocked || !model.installed)
