@@ -44,6 +44,24 @@ private let config = root.appendingPathComponent("etc/brewau.conf")
                 try withFileLock(state.appendingPathComponent("operation.lock").path, nonblocking: true) {
                     try perform(CommandLine.arguments[1])
                 }
+            case "protect":
+                // Root, started by the menu bar app through sudo, so macOS checks the lock and
+                // pin against the user's App Management grant for brewau.app. Holding the
+                // operation lock keeps scans and upgrades out. brewau-upgrade validates every
+                // pending item from scratch and writes its own upgrade.log lines.
+                try requireRoot()
+                guard let account = getpwnam("_brewau") else { throw BrewauError.message("_brewau is missing.") }
+                let status: Int32? = try withFileLock(state.appendingPathComponent("operation.lock").path, nonblocking: true,
+                                                      owner: (account.pointee.pw_uid, account.pointee.pw_gid)) {
+                    try protectPending()
+                }
+                guard let status else {
+                    fputs("brewau: brewau scanner eller opdaterer; prøv igen, når det er færdigt.\n", stderr)
+                    exit(75)
+                }
+                let code: Int32 = status == 0 ? 0 : status == 3 ? 3 : 1
+                BrewauLog.agent.notice("protect finished with \(code)")
+                exit(code)
             case "clear-blocked":
                 // Root marks the retry because the state directory belongs to _brewau.
                 // The next upgrade drops the block list and tries the casks again.
@@ -148,6 +166,18 @@ private let config = root.appendingPathComponent("etc/brewau.conf")
         let danish = result?.danishSummary() ?? RunResult.danishStatus(result?.status ?? "", job: kind)
         BrewauLog.agent.error("\(kind, privacy: .public) failed: \(english, privacy: .public)")
         return BrewauError.reported(ui: danish, log: brewauLogLine(kind, english))
+    }
+    /// Exit status of `brewau-upgrade protect-pending`: 0 all protected, 3 some still refused.
+    static func protectPending() throws -> Int32 {
+        let child = Process()
+        child.executableURL = root.appendingPathComponent("libexec/brewau-upgrade")
+        child.arguments = ["protect-pending"]
+        child.environment = ["PATH": "/usr/bin:/bin:/usr/sbin:/sbin"]
+        child.currentDirectoryURL = URL(fileURLWithPath: "/")
+        child.standardInput = FileHandle.nullDevice
+        try child.run()
+        child.waitUntilExit()
+        return child.terminationReason == .exit ? child.terminationStatus : 1
     }
     static func selfUpdate(now: Bool) throws {
         let marker = root.appendingPathComponent("etc/self-update.pid")

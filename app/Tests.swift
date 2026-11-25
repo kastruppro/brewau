@@ -124,20 +124,52 @@ import Darwin
         check(blocked.danishSummary { $0.token.capitalized } == "Parallels kunne ikke opdateres, fordi macOS App Management blokerer baggrundsjobbet. Den springes over, indtil der kommer en nyere version eller du opdaterer den manuelt.", "Block explains itself with the app's name")
         check(blocked.logSummary == "kastruppro/tap/parallels 26.2.1: blocked by macOS App Management, skipped until a newer version or a manual upgrade", "Log line names package and version in English")
         check(blocked.hasSomethingToReport, "A blocked run is reported")
-        // TCC attributes the daemon's changes to the standalone agent binary, so the guide
-        // must send the user to that path and never to the brewau app's own toggle.
-        check(AppManagementGuide.agentPath == "/opt/brewau/libexec/brewau-agent", "Guide names the installed agent binary")
-        for needle in ["brewau-agent, ikke brewau-appen", "⌘⇧G", "Vis i Finder", "Prøv igen", "MDM"] {
-            check(AppManagementGuide.steps.contains(needle), "App Management steps mention \(needle)")
-        }
-        check(AppManagementGuide.settingsFallback.hasSuffix("tilføj /opt/brewau/libexec/brewau-agent."), "Settings fallback names the path")
-        func macOS(_ major: Int, _ minor: Int) -> OperatingSystemVersion { OperatingSystemVersion(majorVersion: major, minorVersion: minor, patchVersion: 0) }
-        check(AppManagementGuide.plusCannotAddExecutables(macOS(26, 1)) && AppManagementGuide.plusCannotAddExecutables(macOS(26, 2)), "+ cannot add executables on 26.1 and 26.2")
-        for (major, minor) in [(15, 7), (26, 0), (26, 3), (27, 2), (27, 1)] {
-            check(!AppManagementGuide.plusCannotAddExecutables(macOS(major, minor)), "+ works on macOS \(major).\(minor)")
-        }
-        check(AppManagementGuide.steps(for: macOS(26, 2)).hasSuffix("\n" + AppManagementGuide.plusUnavailableNote), "26.2 gets the update/MDM note")
-        check(AppManagementGuide.steps(for: macOS(27, 2)) == AppManagementGuide.steps, "Other versions get the plain steps")
+        // App Management is granted to brewau.app; the menu bar app redoes refused protection.
+        check(AppManagementGuide.instruction == "Slå brewau til under Anonymitet og sikkerhed › App-administration.", "Guide names the brewau app")
+        check(!AppManagementGuide.settingsFallback.contains("brewau-agent"), "Fallback no longer sends the user to the agent binary")
+        check(ProtectOutcome(exitCode: 0) == .protected && ProtectOutcome(exitCode: 3) == .refused, "Protect exit 0 and 3")
+        check(ProtectOutcome(exitCode: 75) == .busy && ProtectOutcome(exitCode: 1) == .failed && ProtectOutcome(exitCode: 2) == .failed, "Busy and every other code")
+
+        // The `unprotected` list: post-upgrade (deferred absent) and pre-upgrade (deferred true).
+        let unprotectedRun = try RunResult.decode(Data(#"{"status":"ok","reason":"unprotected","errors":[],"failed":[],"blocked":[],"finished":"2026-11-25T12:00:00Z","job":"upgrade","upgraded":[{"kind":"cask","reason":"ok","name":"paseo","installed":"","version":"0.17.4"}],"unprotected":[{"kind":"cask","name":"paseo","version":"0.17.4","installed":"[\"0.17.4\"]","reason":"app-management","protection":"\/Applications\/Paseo.app\tpin"},{"kind":"cask","name":"kastruppro/tap/parallels","version":"26.2.1","installed":"[\"26.1.0\"]","reason":"app-management","protection":"\/Applications\/Parallels Desktop.app\tlock","deferred":true}]}"#.utf8))
+        check(unprotectedRun.hasUnprotectedList && unprotectedRun.unprotected.map(\.token) == ["paseo", "parallels"], "Unprotected list is read")
+        check(unprotectedRun.unprotected.map(\.deferred) == [false, true], "Deferred flag is read, absent means false")
+        check(unprotectedRun.appManagementBlocks.isEmpty && unprotectedRun.protectionWarnings.count == 2, "Unprotected items are not blocks")
+        check(!unprotectedRun.isFailure && unprotectedRun.danishHeadline == nil && unprotectedRun.danishSummary() == nil, "The live banner, not the result, reports them")
+        check(unprotectedRun.logSummary == "paseo 0.17.4: up to date, but macOS App Management refused to let brewau protect it; kastruppro/tap/parallels 26.2.1: upgrade deferred until the app can be protected (macOS App Management)", "Log names both kinds")
+        // With the list present, the version heuristic no longer turns a block into a warning.
+        let newBlock = try RunResult.decode(Data(#"{"unprotected":[],"blocked":[{"version":"0.17.4","kind":"cask","reason":"app-management","name":"paseo","installed":"[\"0.17.4\"]"}],"job":"upgrade","status":"blocked","reason":"app-management"}"#.utf8))
+        check(newBlock.appManagementBlocks.count == 1 && newBlock.protectionWarnings.isEmpty, "A new file's block stays a block")
+
+        // The pending list is the live state; the result only adds the deferred flag.
+        let pendingData = Data(#"{"items":[{"token":"paseo","version":"0.17.4","app":"/Applications/Paseo.app","operation":"pin","since":"2026-11-25T12:00:00Z"},{"token":"parallels","version":"26.2.1","app":"/tmp/evil.app","operation":"lock","since":"2026-11-25T12:00:00Z"},{"version":"1"},{"token":"paseo","version":"0.17.4"}]}"#.utf8)
+        let pendingApps = UnprotectedApp.decodePending(pendingData)
+        check(pendingApps?.map(\.token) == ["paseo", "parallels", "paseo"], "Pending items without a token are skipped")
+        check(UnprotectedApp.decodePending(Data("nonsense".utf8)) == nil, "An unreadable pending file is nil")
+        check(UnprotectedApp.decodePending(Data("{}".utf8)) == [], "An empty pending file is empty")
+        let merged = UnprotectedApp.merge(pending: pendingApps, results: [unprotectedRun])
+        check(merged == [UnprotectedApp(token: "paseo", version: "0.17.4"), UnprotectedApp(token: "parallels", version: "26.2.1", deferred: true)], "Merged, deduplicated, deferred from the result")
+        check(UnprotectedApp.merge(pending: [], results: [unprotectedRun]).isEmpty, "Once protected, the stale result shows nothing")
+        check(UnprotectedApp.merge(pending: nil, results: [unprotectedRun]).count == 2, "Without the pending file the result is used")
+
+        // Notice text before and after the helper was refused.
+        let names: (UnprotectedApp) -> String = { $0.token.capitalized }
+        check(UnprotectedApp.danishNotice([], refused: true, displayName: names) == nil, "No apps, no notice")
+        check(UnprotectedApp.danishNotice([merged[0]], refused: false, displayName: names) == "Paseo er opdateret, men endnu ikke beskyttet.", "Not yet tried")
+        check(UnprotectedApp.danishNotice([merged[0]], refused: true, displayName: names) == "Paseo er opdateret, men ikke beskyttet: slå brewau til under App-administration.", "Refused, updated app")
+        check(UnprotectedApp.danishNotice([merged[1]], refused: true, displayName: names) == "Parallels 26.2.1 venter på at blive beskyttet, før den kan opdateres: slå brewau til under App-administration.", "Refused, deferred upgrade")
+        check(UnprotectedApp.danishNotice([merged[1]], refused: false, displayName: names) == "Parallels 26.2.1 venter på at blive beskyttet, før den kan opdateres.", "Deferred, not yet tried")
+
+        // Automatic protection: once per state, never while busy, never without items.
+        var trigger = ProtectTrigger()
+        let finishedAt = [date("2026-11-25T12:00:00Z") as Date?, nil]
+        check(!trigger.shouldRun(pending: [], finishedRuns: finishedAt, busy: false), "Nothing pending, nothing to run")
+        check(!trigger.shouldRun(pending: merged, finishedRuns: finishedAt, busy: true), "Not while a run is busy")
+        check(trigger.shouldRun(pending: merged, finishedRuns: finishedAt, busy: false), "Runs on launch")
+        check(!trigger.shouldRun(pending: merged, finishedRuns: finishedAt, busy: false), "Not again on the next refresh")
+        check(!trigger.shouldRun(pending: Array(merged.reversed()), finishedRuns: finishedAt, busy: false), "Order does not count as a change")
+        check(trigger.shouldRun(pending: merged, finishedRuns: [date("2026-11-25T14:00:00Z"), nil], busy: false), "Runs again after a finished run")
+        check(trigger.shouldRun(pending: [merged[0]], finishedRuns: [date("2026-11-25T14:00:00Z"), nil], busy: false), "Runs again when the pending list changes")
 
         let standingBlock = try RunResult.decode(Data(#"{"upgraded":[],"failed":[],"blocked":[{"name":"parallels","kind":"cask","version":"26.2.1","reason":"app-management","installed":"x"}],"errors":[],"finished":"2026-11-09T04:00:00Z","job":"upgrade","status":"blocked","reason":"app-management"}"#.utf8))
         check(!standingBlock.isFailure, "A standing block is not a failure")
@@ -164,6 +196,7 @@ import Darwin
 
         // Live result from 2026-11-25: Paseo was upgraded, only pinning it afterwards was refused.
         let pinRefused = try RunResult.decode(Data(#"{"status":"blocked","failed":[],"finished":"2026-11-25T10:42:39Z","errors":[],"upgraded":[{"kind":"cask","reason":"ok","name":"paseo","installed":"","version":"0.17.4"}],"reason":"app-management","blocked":[{"version":"0.17.4","kind":"cask","reason":"app-management","name":"paseo","installed":"[\"0.17.4\"]","protection":"\/Applications\/Paseo.app\tpin"}],"job":"upgrade"}"#.utf8))
+        check(UnprotectedApp.merge(pending: nil, results: [pinRefused]).isEmpty, "An older result has no unprotected list")
         check(pinRefused.blocked.first?.installedVersions == ["0.17.4"], "JSON-encoded installed versions are read")
         check(pinRefused.appManagementBlocks.isEmpty && pinRefused.protectionWarnings.map(\.token) == ["paseo"], "An upgraded app is a protection warning, not a block")
         check(!pinRefused.isFailure && pinRefused.isBlockOnly && pinRefused.hasSomethingToReport, "A protection warning is reported, not as a failure")

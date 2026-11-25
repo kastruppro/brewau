@@ -32,20 +32,25 @@ or the user upgrades it by hand. A run whose only news is such a block records n
 failed step, so it never hides a failure of its own — a service that would not
 restart, or a failed cleanup or snapshot, is still reported next to the block.
 
-macOS attributes the daemon's changes to the standalone binary
-`/opt/brewau/libexec/brewau-agent`, not to brewau.app, so switching on App Management
-for the brewau app does nothing. The banner shows the steps: **Åbn Systemindstillinger…**
-copies the agent path and opens Anonymitet og sikkerhed › App-administration; click +,
-press ⌘⇧G, paste the path and switch brewau-agent on (macOS 26.3 or later accepts
-standalone executables). **Vis i Finder** shows the binary so it can be dragged into the
-list instead. On MDM-managed Macs a PPPC profile for that path can grant it. **Prøv igen**
-then asks the helper to drop the block list and starts a new upgrade.
-
-A cask that is already at the recorded version (upgraded in that run, or up to date) but
-that App Management kept brewau from pinning and locking afterwards is shown as a
-protection warning ("… er opdateret, men brewau kunne ikke beskytte appen"), not as a
-block, and is not counted as blocked. The unified log names the blocked set only when it
-changes.
+App Management grants are per user, and the daemon runs as `_brewau`, whose own TCC
+database nobody can edit, so macOS refuses its lock and pin on `/Applications` apps
+whatever the user switches on. The daemon then records the app in
+`state/pending-protection.json` and in the result's `unprotected` list instead of
+blocking it: an app protected only after its upgrade counts as upgraded, and one whose
+pre-upgrade lock or pin was refused has its upgrade deferred (`"deferred": true`) until
+it is protected. The menu bar app protects them through
+`sudo -n /opt/brewau/libexec/brewau-agent protect` (root, holding the operation lock),
+which runs `brewau-upgrade protect-pending`; that re-validates each app from Homebrew and
+logs to upgrade.log. It runs on launch, after each finished scan or upgrade, and from
+**Beskyt nu**, once per state and never during a run. Exit 0 clears the notice; exit 3
+means App Management still refuses, and the notice asks the user to switch on **brewau**
+under Anonymitet og sikkerhed › App-administration (**Åbn Systemindstillinger…**,
+**Prøv igen**). A deferred update shows "Venter på at blive beskyttet"; once a protection
+the user asked for succeeds, the upgrade starts. A real block (Homebrew's own upgrade
+refused) keeps its banner with the same guidance, and **Prøv igen** asks the helper to
+drop the block list and starts a new upgrade. A result file from an older brewau without
+the `unprotected` list is read as before. The unified log names the blocked set only
+when it changes.
 
 - **Tidsplan:** scans every 15/30 minutes, 1/6/12 hours or daily. Upgrades can run
   by hour interval, daily, or weekly, with up to 24 distinct local times. Press

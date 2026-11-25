@@ -35,6 +35,11 @@ struct PendingApp: Identifiable {
     @Published var upgradeResult: RunResult?
     @Published var scanResult: RunResult?
     @Published var clearingBlocked = false
+    /// Apps the daemon could not lock or pin; the app protects them through the helper.
+    @Published var unprotected: [UnprotectedApp] = []
+    @Published var protecting = false
+    /// The helper's last answer was that App Management still refuses (exit 3).
+    @Published var protectRefused = false
     /// What the newest finished run published, if the file really belongs to that run,
     /// together with the job it belonged to and the scheduler's verdict for it.
     @Published var runResult: RunResult?
@@ -50,6 +55,7 @@ struct PendingApp: Identifiable {
     private var loadingPreferences = true
     private var oneShot = OneShotNotice()
     private var blockedLog = ChangeGate()
+    private var protectTrigger = ProtectTrigger()
 
     override init() {
         super.init()
@@ -86,12 +92,51 @@ struct PendingApp: Identifiable {
     func appManagementBlock(for update: PackageUpdate) -> RunResultItem? {
         blockedByAppManagement.first { $0.token == update.token }
     }
-    /// Casks that were updated, but that App Management kept brewau from protecting.
-    var unprotectedByAppManagement: [RunResultItem] { upgradeResult?.protectionWarnings ?? [] }
+    /// Protection warnings from a result file of an older brewau, which has no pending list.
+    var legacyUnprotected: [RunResultItem] { upgradeResult?.legacyProtectionWarnings ?? [] }
     var blockedMessage: String? {
         let parts = [RunResult.danishBlocks(blockedByAppManagement.map { displayName(for: $0) }),
-                     RunResult.danishProtection(unprotectedByAppManagement.map { displayName(for: $0) })].compactMap { $0 }
+                     RunResult.danishProtection(legacyUnprotected.map { displayName(for: $0) })].compactMap { $0 }
         return parts.isEmpty ? nil : parts.joined(separator: " ")
+    }
+    func displayName(for app: UnprotectedApp) -> String {
+        brewauSingleLine(apps.first(where: { $0.token == app.token })?.name ?? app.token, limit: 80)
+    }
+    var unprotectedMessage: String? {
+        UnprotectedApp.danishNotice(unprotected, refused: protectRefused) { self.displayName(for: $0) }
+    }
+    /// An update the daemon holds back until the app can be protected.
+    func deferredProtection(for update: PackageUpdate) -> UnprotectedApp? {
+        unprotected.first { $0.token == update.token && $0.deferred }
+    }
+    /// Locks and pins the pending apps through the helper. Started on launch, after each
+    /// finished run and from the banner; never while a scan or upgrade runs.
+    func protectPending(userInitiated: Bool = false) async {
+        guard !protecting, !busy, installed, !unprotected.isEmpty else { return }
+        protecting = true
+        let hadDeferred = unprotected.contains { $0.deferred }
+        BrewauLog.app.notice("protecting pending apps")
+        let answer = await Task.detached { () -> Result<(Int32, String), Error> in
+            Result { try runCommandStatus("/usr/bin/sudo", ["-n", "/opt/brewau/libexec/brewau-agent", "protect"]) }
+        }.value
+        protecting = false
+        switch answer {
+        case .failure(let failure): self.error = failure.localizedDescription
+        case .success(let (code, text)):
+            switch ProtectOutcome(exitCode: code) {
+            case .protected:
+                protectRefused = false
+                await refresh()
+                // The upgrade it held back can run now; a user who asked for it gets it at once,
+                // otherwise the schedule or Opdater alle picks it up.
+                if userInitiated, hadDeferred { await request("upgrade") }
+            case .refused:
+                protectRefused = true
+                await refresh()
+            case .busy: break
+            case .failed: self.error = text.isEmpty ? "Appene kunne ikke beskyttes (\(code))." : text
+            }
+        }
     }
     var headline: String {
         if !installed { return "Tjenesten skal opdateres" }
@@ -117,21 +162,14 @@ struct PendingApp: Identifiable {
             self.error = error.localizedDescription
         }
     }
-    /// Privacy & Security > App Management, where the user adds the background service
-    /// (brewau-agent, not this app). Its path goes to the pasteboard for ⌘⇧G.
+    /// Privacy & Security > App Management, where the user switches brewau on.
     func openAppManagementSettings() {
         BrewauLog.app.notice("opening the App Management privacy settings")
-        NSPasteboard.general.clearContents()
-        NSPasteboard.general.setString(AppManagementGuide.agentPath, forType: .string)
         for identifier in ["com.apple.settings.PrivacySecurity.extension", "com.apple.preference.security"] {
             if let url = URL(string: "x-apple.systempreferences:\(identifier)?Privacy_AppBundles"),
                NSWorkspace.shared.open(url) { return }
         }
         error = AppManagementGuide.settingsFallback
-    }
-    /// Shows brewau-agent in Finder so it can be dragged into the App Management list.
-    func revealAgentInFinder() {
-        NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: AppManagementGuide.agentPath)])
     }
 
     func refresh() async {
@@ -144,6 +182,7 @@ struct PendingApp: Identifiable {
             var lastUpgrade: OperationState?
             var upgradeResult: RunResult?
             var scanResult: RunResult?
+            var pending: [UnprotectedApp]?
             var error: String?
             var installed: Bool
             var homebrew: String
@@ -170,6 +209,14 @@ struct PendingApp: Identifiable {
                 // Written by brewau-upgrade. Absent before the first run of brewau 0.8.0.
                 snapshot.upgradeResult = readRunResult(state.appendingPathComponent("last-result.json"))
                 snapshot.scanResult = readRunResult(state.appendingPathComponent("last-scan-result.json"))
+                // No file means nothing is pending; a file that cannot be read leaves the
+                // results to say what is unprotected.
+                let pendingFile = state.appendingPathComponent("pending-protection.json")
+                if !FileManager.default.fileExists(atPath: pendingFile.path) { snapshot.pending = [] }
+                else if let handle = try? FileHandle(forReadingFrom: pendingFile) {
+                    snapshot.pending = (try? handle.read(upToCount: RunResult.sizeLimit)).flatMap { $0.flatMap(UnprotectedApp.decodePending) }
+                    try? handle.close()
+                }
                 if let version = try? String(contentsOf: state.appendingPathComponent("homebrew-version"), encoding: .utf8) {
                     snapshot.homebrew = version.trimmingCharacters(in: .whitespacesAndNewlines)
                 }
@@ -198,6 +245,8 @@ struct PendingApp: Identifiable {
         if let updates = snapshot.updates { self.updates = updates; hasScanned = true }
         upgradeResult = snapshot.upgradeResult
         scanResult = snapshot.scanResult
+        unprotected = UnprotectedApp.merge(pending: snapshot.pending, results: [snapshot.upgradeResult, snapshot.scanResult].compactMap { $0 })
+        if unprotected.isEmpty { protectRefused = false }
         let operation = snapshot.operation
         // Only a result published for this run may explain it; a stale file (an earlier
         // offline scan, say) must not excuse a worker that died before publishing its own.
@@ -242,10 +291,14 @@ struct PendingApp: Identifiable {
         await notifyBlocked()
         if !busy { await automaticallyRestartAllowed() }
         refreshLoginStatus()
+        if !protecting, protectTrigger.shouldRun(pending: unprotected, finishedRuns: [upgradeResult?.finished, scanResult?.finished], busy: busy) {
+            Task { await protectPending() }
+        }
     }
 
     func request(_ kind: String) async {
-        guard !busy, installed else { return }
+        // A running protection holds the operation lock, which would make the run a no-op.
+        guard !busy, !protecting, installed else { return }
         busy = true
         requestPendingUntil = Date().addingTimeInterval(15)
         BrewauLog.app.notice("requesting \(kind, privacy: .public)")
@@ -325,17 +378,20 @@ struct PendingApp: Identifiable {
     /// version it got stuck on instead of to the run.
     func notifyBlocked() async {
         // The result is re-read every few seconds; log the blocked set only when it changes.
-        let current = upgradeResult?.appManagementItems ?? []
-        if blockedLog.changed(Set(current.map { "\($0.name) \($0.version)" })) {
-            for item in current {
-                BrewauLog.app.notice("reporting blocked package \(item.name, privacy: .public) \(item.version, privacy: .public)")
-            }
+        let current = (blockedByAppManagement + legacyUnprotected).map { "\($0.name) \($0.version)" } + unprotected.map { "\($0.key) (unprotected)" }
+        if blockedLog.changed(Set(current)) {
+            for item in current { BrewauLog.app.notice("reporting blocked package \(item, privacy: .public)") }
         }
         guard notificationPreferences.enabled, notificationPreferences.failure else { return }
         let notices = blockedByAppManagement.map { ($0, "blocked", "\(displayName(for: $0)) kunne ikke opdateres",
-                                                    "macOS App Management blokerer baggrundstjenesten brewau-agent. Åbn brewau for at se, hvad du kan gøre.") }
-            + unprotectedByAppManagement.map { ($0, "unprotected", "\(displayName(for: $0)) kunne ikke beskyttes",
-                                                "Appen er opdateret, men macOS App Management afviste baggrundstjenesten brewau-agent. Åbn brewau for at se, hvad du kan gøre.") }
+                                                    "macOS App Management blokerer opdateringen. Åbn brewau for at se, hvad du kan gøre.") }
+            // Only once the helper itself was refused: until then brewau protects them on its own.
+            + (protectRefused ? unprotected : []).map {
+                (RunResultItem(name: $0.token, kind: "cask", version: $0.version, reason: "app-management", installed: ""),
+                 $0.deferred ? "deferred" : "unprotected",
+                 "\(displayName(for: $0)) kunne ikke beskyttes",
+                 "\(AppManagementGuide.instruction) Åbn brewau for at se, hvad du kan gøre.")
+            }
         for (item, prefix, title, body) in notices {
             let key = "\(prefix)-\(item.name)-\(item.version)"
             guard oneShot.shouldSubmit(key, delivered: defaults.bool(forKey: key)) else { continue }

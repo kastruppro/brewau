@@ -82,17 +82,31 @@ struct UpdatePopover: View {
                             Label(model.blockedByAppManagement.isEmpty ? "macOS blokerer beskyttelsen" : "macOS blokerer opdateringen", systemImage: "exclamationmark.shield.fill")
                                 .font(.system(size: 12, weight: .semibold)).foregroundStyle(.orange)
                             Text(blocked).font(.system(size: 11)).fixedSize(horizontal: false, vertical: true)
-                            Text(AppManagementGuide.steps(for: ProcessInfo.processInfo.operatingSystemVersion)).font(.system(size: 11)).foregroundStyle(.secondary)
+                            Text(AppManagementGuide.instruction).font(.system(size: 11)).foregroundStyle(.secondary)
                                 .fixedSize(horizontal: false, vertical: true)
-                            Text(AppManagementGuide.agentPath).font(.system(size: 11, design: .monospaced)).textSelection(.enabled)
                             HStack {
                                 Spacer()
-                                Button("Vis i Finder") { model.revealAgentInFinder() }
                                 Button("Åbn Systemindstillinger…") { model.openAppManagementSettings() }
-                                    .help("Kopierer \(AppManagementGuide.agentPath) og åbner App-administration")
                                 Button(model.clearingBlocked ? "Prøver igen…" : "Prøv igen") { Task { await model.retryBlocked() } }
                                     .buttonStyle(.borderedProminent)
                                     .disabled(model.busy || model.clearingBlocked || !model.installed)
+                            }.controlSize(.small)
+                        }.padding(12).background(Color.orange.opacity(0.1), in: RoundedRectangle(cornerRadius: 8))
+                    }
+                    if let unprotected = model.unprotectedMessage {
+                        VStack(alignment: .leading, spacing: 8) {
+                            Label("Apps er ikke beskyttet", systemImage: "lock.trianglebadge.exclamationmark")
+                                .font(.system(size: 12, weight: .semibold)).foregroundStyle(.orange)
+                            Text(unprotected).font(.system(size: 11)).fixedSize(horizontal: false, vertical: true)
+                            HStack {
+                                Spacer()
+                                if model.protectRefused {
+                                    Button("Åbn Systemindstillinger…") { model.openAppManagementSettings() }
+                                }
+                                Button(model.protecting ? "Beskytter…" : model.protectRefused ? "Prøv igen" : "Beskyt nu") {
+                                    Task { await model.protectPending(userInitiated: true) }
+                                }.buttonStyle(.borderedProminent)
+                                    .disabled(model.busy || model.protecting || !model.installed)
                             }.controlSize(.small)
                         }.padding(12).background(Color.orange.opacity(0.1), in: RoundedRectangle(cornerRadius: 8))
                     }
@@ -108,6 +122,9 @@ struct UpdatePopover: View {
                                 VStack(alignment: .leading, spacing: 3) {
                                     Text(model.name(for: update)).font(.system(size: 12, weight: .medium))
                                     if update.blocked { Text("Fastlåst eller udelukket").font(.system(size: 10)).foregroundStyle(.secondary) }
+                                    else if model.deferredProtection(for: update) != nil {
+                                        Text("Venter på at blive beskyttet").font(.system(size: 10)).foregroundStyle(.orange)
+                                    }
                                     else if model.appManagementBlock(for: update) != nil {
                                         Text("Blokeret af macOS App Management").font(.system(size: 10)).foregroundStyle(.orange)
                                     }
@@ -126,7 +143,7 @@ struct UpdatePopover: View {
                             Text(model.busy ? "Arbejder…" : model.hasScanned ? "Opdater alle" : "Scan nu")
                                 .frame(maxWidth: .infinity).padding(.vertical, 5)
                         }.buttonStyle(.borderedProminent)
-                            .disabled(model.busy || (model.hasScanned && model.availableUpdates.isEmpty))
+                            .disabled(model.busy || model.protecting || (model.hasScanned && model.availableUpdates.isEmpty))
                         Label(model.savedSettings.summary, systemImage: "clock").font(.system(size: 11)).foregroundStyle(.secondary)
                     } else {
                         Text("Installer den medfølgende brewau.pkg. Dine eksisterende indstillinger bevares.")

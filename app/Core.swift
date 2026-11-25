@@ -11,26 +11,91 @@ enum BrewauLog {
     static let helper = Logger(subsystem: "com.kastruppro.brewau", category: "helper")
 }
 
-/// The background service. macOS attributes the daemon's changes to /Applications to this
-/// standalone binary, not to brewau.app, so App Management has to be granted to this path.
+/// macOS App Management refuses the daemon's lock and pin on /Applications apps: its grants
+/// are per user, and _brewau's own TCC database cannot be edited. The menu bar app redoes
+/// that protection through the helper instead, so the grant the user gives is the one for
+/// brewau.app itself.
 enum AppManagementGuide {
-    static let agentPath = "/opt/brewau/libexec/brewau-agent"
-    static let steps = """
-    Det er baggrundstjenesten brewau-agent, ikke brewau-appen, der skal have adgang under App-administration:
-    1. Klik Åbn Systemindstillinger… (stien kopieres) og derefter +.
-    2. Tryk ⌘⇧G, indsæt stien, og vælg brewau-agent. Du kan også trække den ind fra Vis i Finder.
-    3. Slå brewau-agent til, og klik Prøv igen.
-    På Macs, der administreres af IT (MDM), kan en profil give tilladelsen.
-    """
-    /// macOS 26.1 and 26.2 cannot add a standalone executable with + (Apple DTS, fixed in 26.3).
-    static func plusCannotAddExecutables(_ version: OperatingSystemVersion) -> Bool {
-        version.majorVersion == 26 && (version.minorVersion == 1 || version.minorVersion == 2)
+    static let instruction = "Slå brewau til under Anonymitet og sikkerhed › App-administration."
+    static let settingsFallback = "Systemindstillinger kunne ikke åbnes. Gå til Anonymitet og sikkerhed › App-administration, og slå brewau til."
+}
+
+/// What `brewau-agent protect` reported. 75 (EX_TEMPFAIL) means a scan or upgrade held the
+/// operation lock, so nothing ran and the next trigger tries again.
+enum ProtectOutcome: Equatable, Sendable {
+    case protected, refused, busy, failed
+    init(exitCode: Int32) {
+        switch exitCode {
+        case 0: self = .protected
+        case 3: self = .refused
+        case 75: self = .busy
+        default: self = .failed
+        }
     }
-    static let plusUnavailableNote = "På denne macOS-version kan + ikke tilføje programmet. Opdater macOS til 26.3 eller nyere, eller brug MDM-profilen på administrerede Macs."
-    static func steps(for version: OperatingSystemVersion) -> String {
-        plusCannotAddExecutables(version) ? steps + "\n" + plusUnavailableNote : steps
+}
+
+/// One app the daemon could not lock or pin, from `state/pending-protection.json`.
+/// `deferred` comes from the run result: the cask's upgrade waits until it is protected.
+struct UnprotectedApp: Equatable, Sendable {
+    let token: String
+    let version: String
+    var deferred = false
+    var key: String { "\(token) \(version)" }
+
+    /// The daemon's pending list. Only token and version are used: the helper re-resolves
+    /// the app path from Homebrew itself, so the path in the file is never trusted.
+    static func decodePending(_ data: Data) -> [UnprotectedApp]? {
+        guard data.count <= RunResult.sizeLimit,
+              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
+        return (object["items"] as? [[String: Any]] ?? []).prefix(RunResult.itemLimit).compactMap { row in
+            let token = brewauSingleLine(row["token"] as? String ?? "", limit: 200)
+            guard !token.isEmpty else { return nil }
+            return UnprotectedApp(token: token, version: brewauSingleLine(row["version"] as? String ?? "", limit: 64))
+        }
     }
-    static let settingsFallback = "Systemindstillinger kunne ikke åbnes. Gå til Anonymitet og sikkerhed › App-administration, og tilføj \(agentPath)."
+    /// What is still unprotected: the pending file when it could be read, otherwise what the
+    /// latest results reported. Results mark which of them hold back an upgrade.
+    static func merge(pending: [UnprotectedApp]?, results: [RunResult]) -> [UnprotectedApp] {
+        let reported = results.flatMap(\.unprotected)
+        func deferred(_ token: String, _ version: String) -> Bool {
+            reported.contains { $0.token == token && $0.version == version && $0.deferred }
+        }
+        var seen = Set<String>()
+        let base = pending ?? reported.map { UnprotectedApp(token: $0.token, version: $0.version) }
+        return base.compactMap { app in
+            guard seen.insert(app.key).inserted else { return nil }
+            return UnprotectedApp(token: app.token, version: app.version, deferred: deferred(app.token, app.version))
+        }
+    }
+    /// The banner text. `refused` is true once the helper reported that App Management still
+    /// refuses the protection, which only the user's grant for brewau can change.
+    static func danishNotice(_ apps: [UnprotectedApp], refused: Bool, displayName: (UnprotectedApp) -> String) -> String? {
+        guard !apps.isEmpty else { return nil }
+        let sentences = apps.map { app -> String in
+            let name = displayName(app)
+            if app.deferred {
+                return refused ? "\(name) \(app.version) venter på at blive beskyttet, før den kan opdateres: slå brewau til under App-administration."
+                               : "\(name) \(app.version) venter på at blive beskyttet, før den kan opdateres."
+            }
+            return refused ? "\(name) er opdateret, men ikke beskyttet: slå brewau til under App-administration."
+                           : "\(name) er opdateret, men endnu ikke beskyttet."
+        }
+        return sentences.joined(separator: " ")
+    }
+}
+
+/// Automatic protection runs once per state: on launch, and again only when a run has
+/// finished or the pending list changed. The refresh loop can never turn it into a retry loop.
+struct ProtectTrigger {
+    private var lastKey: String?
+    mutating func shouldRun(pending: [UnprotectedApp], finishedRuns: [Date?], busy: Bool) -> Bool {
+        guard !pending.isEmpty, !busy else { return false }
+        let key = (pending.map(\.key).sorted() + finishedRuns.map { $0.map { String($0.timeIntervalSince1970) } ?? "-" })
+            .joined(separator: "|")
+        guard key != lastKey else { return false }
+        lastKey = key
+        return true
+    }
 }
 
 enum BrewauError: LocalizedError {
@@ -250,6 +315,8 @@ struct RunResultItem: Equatable, Sendable {
     /// The versions installed when the item was recorded. The job writes `installed` as a
     /// JSON array of versions; an older file wrote one string.
     var installedVersions: [String] = []
+    /// An unprotected cask whose upgrade waits until the app can be protected.
+    var deferred = false
     var isCask: Bool { kind == "cask" }
     /// Casks may be named `tap/user/token`; the catalog knows them by the last component.
     var token: String { String(name.split(separator: "/").last ?? "") }
@@ -274,6 +341,10 @@ struct RunResult: Equatable, Sendable {
     var upgraded: [RunResultItem] = []
     var failed: [RunResultItem] = []
     var blocked: [RunResultItem] = []
+    /// Casks whose lock or pin App Management refused; the menu bar app protects them later.
+    /// Absent in files from a brewau before this contract.
+    var unprotected: [RunResultItem] = []
+    var hasUnprotectedList = false
     /// Every failed step of this run, reset each run. The first entry decides the status
     /// (`<stage>-failed`) and the reason, and any entry means the job exited non-zero.
     var errors: [RunError] = []
@@ -315,12 +386,15 @@ struct RunResult: Equatable, Sendable {
                                      version: field(row["version"], 64),
                                      reason: field(row["reason"], 32),
                                      installed: row["installed"] is String ? field(row["installed"], 200) : versions.joined(separator: ", "),
-                                     installedVersions: versions)
+                                     installedVersions: versions,
+                                     deferred: row["deferred"] as? Bool ?? false)
             }
         }
         result.upgraded = items("upgraded")
         result.failed = items("failed")
         result.blocked = items("blocked")
+        result.hasUnprotectedList = object["unprotected"] is [Any]
+        result.unprotected = items("unprotected")
         if let errors = object["errors"] as? [[String: Any]] {
             result.hasErrorList = true
             result.errors = errors.prefix(RunResult.itemLimit).compactMap { row in
@@ -337,11 +411,20 @@ struct RunResult: Equatable, Sendable {
     /// Statuses the shell layer exits 0 with; everything else left work undone.
     var isFailure: Bool { !["ok", "blocked", "skipped", ""].contains(status) }
     /// Casks macOS App Management keeps the background job from upgrading.
-    var appManagementBlocks: [RunResultItem] { blocked.filter { $0.reason == "app-management" && !isProtectionOnly($0) } }
+    var appManagementBlocks: [RunResultItem] {
+        blocked.filter { $0.reason == "app-management" && (hasUnprotectedList || !isProtectionOnly($0)) }
+    }
     /// Casks that are at the recorded version already — upgraded by this run, or up to date —
     /// but that App Management kept brewau from pinning and locking afterwards. Nothing was
     /// left un-updated, so these are warnings, not blocks.
-    var protectionWarnings: [RunResultItem] { blocked.filter { $0.reason == "app-management" && isProtectionOnly($0) } }
+    /// A file with an `unprotected` list says so itself; an older one is read by comparing
+    /// the blocked version with the installed one.
+    var protectionWarnings: [RunResultItem] {
+        hasUnprotectedList ? unprotected : blocked.filter { $0.reason == "app-management" && isProtectionOnly($0) }
+    }
+    /// Warnings only an older file carries. Newer ones are reported live from the pending
+    /// list, which the menu bar app empties once it has protected the apps.
+    var legacyProtectionWarnings: [RunResultItem] { hasUnprotectedList ? [] : protectionWarnings }
     func isProtectionOnly(_ item: RunResultItem) -> Bool {
         guard !item.version.isEmpty else { return false }
         return item.installedVersions.contains(item.version)
@@ -401,7 +484,7 @@ struct RunResult: Equatable, Sendable {
         if failures.isEmpty, isFailure, !isBlockOnly { failures.append(RunResult.danishStatus(status, job: job)) }
         parts += failures
         if includingBlocks, let blocks = RunResult.danishBlocks(appManagementBlocks.map(displayName)) { parts.append(blocks) }
-        if includingBlocks, let warnings = RunResult.danishProtection(protectionWarnings.map(displayName)) { parts.append(warnings) }
+        if includingBlocks, let warnings = RunResult.danishProtection(legacyProtectionWarnings.map(displayName)) { parts.append(warnings) }
         return parts.isEmpty ? nil : parts.joined(separator: " ")
     }
 
@@ -416,8 +499,8 @@ struct RunResult: Equatable, Sendable {
         if !appManagementBlocks.isEmpty {
             return appManagementBlocks.count == 1 ? "1 app er blokeret af macOS" : "\(appManagementBlocks.count) apps er blokeret af macOS"
         }
-        if !protectionWarnings.isEmpty {
-            return protectionWarnings.count == 1 ? "1 app kunne ikke beskyttes" : "\(protectionWarnings.count) apps kunne ikke beskyttes"
+        if !legacyProtectionWarnings.isEmpty {
+            return legacyProtectionWarnings.count == 1 ? "1 app kunne ikke beskyttes" : "\(legacyProtectionWarnings.count) apps kunne ikke beskyttes"
         }
         if isOffline { return "Sprunget over – ingen forbindelse" }
         return nil
@@ -436,7 +519,9 @@ struct RunResult: Equatable, Sendable {
             parts.append("\(item.name) \(item.version): blocked by macOS App Management, skipped until a newer version or a manual upgrade")
         }
         for item in protectionWarnings {
-            parts.append("\(item.name) \(item.version): up to date, but macOS App Management refused to let brewau protect it")
+            parts.append(item.deferred
+                ? "\(item.name) \(item.version): upgrade deferred until the app can be protected (macOS App Management)"
+                : "\(item.name) \(item.version): up to date, but macOS App Management refused to let brewau protect it")
         }
         // A run that failed without recording a step has only its status to report.
         if parts.isEmpty || (isFailure && errors.isEmpty && otherFailures.isEmpty && !isBlockOnly) {
@@ -647,6 +732,13 @@ func readOperation(_ url: URL) throws -> OperationState {
 
 /// One pipe is drained while the child runs, so verbose stderr cannot deadlock stdout.
 func runCommand(_ executable: String, _ arguments: [String], input: Data? = nil) throws -> String {
+    let (status, text) = try runCommandStatus(executable, arguments, input: input)
+    guard status == 0 else { throw BrewauError.message(text.isEmpty ? "Handlingen mislykkedes (\(status))." : text) }
+    return text
+}
+
+/// Like `runCommand`, but hands back the exit status for a caller that tells codes apart.
+func runCommandStatus(_ executable: String, _ arguments: [String], input: Data? = nil) throws -> (Int32, String) {
     let process = Process()
     process.executableURL = URL(fileURLWithPath: executable)
     process.arguments = arguments
@@ -670,10 +762,10 @@ func runCommand(_ executable: String, _ arguments: [String], input: Data? = nil)
     let command = ([executable] + arguments).joined(separator: " ")
     guard process.terminationStatus == 0 else {
         BrewauLog.helper.error("\(command, privacy: .public) exited \(process.terminationStatus)")
-        throw BrewauError.message(text.isEmpty ? "Handlingen mislykkedes (\(process.terminationStatus))." : text)
+        return (process.terminationStatus, text)
     }
     BrewauLog.helper.notice("\(command, privacy: .public) succeeded")
-    return text
+    return (0, text)
 }
 
 /// Locks survive crashes as unlocked files; never unlink a file another worker may be waiting on.
