@@ -47,8 +47,10 @@ means App Management still refuses, and the notice asks the user to switch on **
 under Anonymitet og sikkerhed › App-administration (**Åbn Systemindstillinger…**,
 **Prøv igen**). A deferred update shows "Venter på at blive beskyttet"; once a protection
 the user asked for succeeds, the upgrade starts. A real block (Homebrew's own upgrade
-refused) keeps its banner with the same guidance, and **Prøv igen** asks the helper to
-drop the block list and starts a new upgrade. A result file from an older brewau without
+refused in the daemon) cannot be lifted by a user's grant: its banner says to upgrade the
+app by hand (from the app itself or `brew upgrade --cask <cask>`) or have IT install the
+brewau MDM profile, and that it is skipped until a newer version. **Prøv igen** asks the
+helper to drop the block list and starts a new upgrade. A result file from an older brewau without
 the `unprotected` list is read as before. The unified log names the blocked set only
 when it changes.
 

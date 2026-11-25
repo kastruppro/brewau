@@ -483,7 +483,7 @@ struct RunResult: Equatable, Sendable {
         // only its status to go by.
         if failures.isEmpty, isFailure, !isBlockOnly { failures.append(RunResult.danishStatus(status, job: job)) }
         parts += failures
-        if includingBlocks, let blocks = RunResult.danishBlocks(appManagementBlocks.map(displayName)) { parts.append(blocks) }
+        if includingBlocks, let blocks = RunResult.danishBlocks(appManagementBlocks.map { (displayName($0), $0.name) }) { parts.append(blocks) }
         if includingBlocks, let warnings = RunResult.danishProtection(legacyProtectionWarnings.map(displayName)) { parts.append(warnings) }
         return parts.isEmpty ? nil : parts.joined(separator: " ")
     }
@@ -531,14 +531,17 @@ struct RunResult: Equatable, Sendable {
     }
 
     /// The App Management explanation, also shown on its own next to the retry buttons.
-    static func danishBlocks(_ names: [String]) -> String? {
-        if names.count == 1 {
-            return "\(names[0]) kunne ikke opdateres, fordi macOS App Management blokerer baggrundsjobbet. Den springes over, indtil der kommer en nyere version eller du opdaterer den manuelt."
+    /// `apps` pairs the name the user knows with Homebrew's cask name. The daemon runs as
+    /// _brewau, whose App Management can only be granted by an MDM profile, so the way out
+    /// is a manual upgrade or that profile, never a switch in System Settings.
+    static func danishBlocks(_ apps: [(name: String, cask: String)]) -> String? {
+        guard !apps.isEmpty else { return nil }
+        let names = list(apps.map(\.name))
+        let casks = apps.map(\.cask).joined(separator: " ")
+        if apps.count == 1 {
+            return "\(names) kunne ikke opdateres, fordi macOS App Management blokerer baggrundstjenesten. Opdater den manuelt (fx fra appen selv eller med brew upgrade --cask \(casks) i Terminal), eller få IT til at installere brewau-MDM-profilen. Den springes over, indtil der kommer en nyere version."
         }
-        if names.count > 1 {
-            return "\(list(names)) kunne ikke opdateres, fordi macOS App Management blokerer baggrundsjobbet. De springes over, indtil der kommer nyere versioner, eller du opdaterer dem manuelt."
-        }
-        return nil
+        return "\(names) kunne ikke opdateres, fordi macOS App Management blokerer baggrundstjenesten. Opdater dem manuelt (fx fra apperne selv eller med brew upgrade --cask \(casks) i Terminal), eller få IT til at installere brewau-MDM-profilen. De springes over, indtil der kommer nyere versioner."
     }
     /// The protection warning: the app is updated, only brewau's pin and lock were refused.
     static func danishProtection(_ names: [String]) -> String? {

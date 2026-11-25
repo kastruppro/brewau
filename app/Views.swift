@@ -82,11 +82,8 @@ struct UpdatePopover: View {
                             Label(model.blockedByAppManagement.isEmpty ? "macOS blokerer beskyttelsen" : "macOS blokerer opdateringen", systemImage: "exclamationmark.shield.fill")
                                 .font(.system(size: 12, weight: .semibold)).foregroundStyle(.orange)
                             Text(blocked).font(.system(size: 11)).fixedSize(horizontal: false, vertical: true)
-                            Text(AppManagementGuide.instruction).font(.system(size: 11)).foregroundStyle(.secondary)
-                                .fixedSize(horizontal: false, vertical: true)
                             HStack {
                                 Spacer()
-                                Button("Åbn Systemindstillinger…") { model.openAppManagementSettings() }
                                 Button(model.clearingBlocked ? "Prøver igen…" : "Prøv igen") { Task { await model.retryBlocked() } }
                                     .buttonStyle(.borderedProminent)
                                     .disabled(model.busy || model.clearingBlocked || !model.installed)

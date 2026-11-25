@@ -95,7 +95,7 @@ struct PendingApp: Identifiable {
     /// Protection warnings from a result file of an older brewau, which has no pending list.
     var legacyUnprotected: [RunResultItem] { upgradeResult?.legacyProtectionWarnings ?? [] }
     var blockedMessage: String? {
-        let parts = [RunResult.danishBlocks(blockedByAppManagement.map { displayName(for: $0) }),
+        let parts = [RunResult.danishBlocks(blockedByAppManagement.map { (displayName(for: $0), $0.name) }),
                      RunResult.danishProtection(legacyUnprotected.map { displayName(for: $0) })].compactMap { $0 }
         return parts.isEmpty ? nil : parts.joined(separator: " ")
     }

@@ -121,7 +121,7 @@ import Darwin
         check(blocked.appManagementBlocks.count == 1 && blocked.appManagementBlocks.first?.token == "parallels", "Block is attributed to the cask")
         check(blocked.otherFailures.isEmpty, "A newly blocked cask is not reported twice")
         check(blocked.danishHeadline == "1 app er blokeret af macOS", "A block is not presented as a plain failure")
-        check(blocked.danishSummary { $0.token.capitalized } == "Parallels kunne ikke opdateres, fordi macOS App Management blokerer baggrundsjobbet. Den springes over, indtil der kommer en nyere version eller du opdaterer den manuelt.", "Block explains itself with the app's name")
+        check(blocked.danishSummary { $0.token.capitalized } == "Parallels kunne ikke opdateres, fordi macOS App Management blokerer baggrundstjenesten. Opdater den manuelt (fx fra appen selv eller med brew upgrade --cask kastruppro/tap/parallels i Terminal), eller få IT til at installere brewau-MDM-profilen. Den springes over, indtil der kommer en nyere version.", "Block explains itself with the app's name")
         check(blocked.logSummary == "kastruppro/tap/parallels 26.2.1: blocked by macOS App Management, skipped until a newer version or a manual upgrade", "Log line names package and version in English")
         check(blocked.hasSomethingToReport, "A blocked run is reported")
         // App Management is granted to brewau.app; the menu bar app redoes refused protection.
@@ -192,6 +192,8 @@ import Darwin
 
         let twoBlocks = try RunResult.decode(Data(#"{"blocked":[{"name":"parallels","kind":"cask","version":"1","reason":"app-management","installed":""},{"name":"docker","kind":"cask","version":"2","reason":"app-management","installed":""}],"job":"upgrade","status":"blocked","reason":"app-management"}"#.utf8))
         check(twoBlocks.danishSummary()?.hasPrefix("parallels og docker kunne ikke opdateres") == true, "Several blocks are listed in one sentence")
+        check(twoBlocks.danishSummary()?.contains("Opdater dem manuelt (fx fra apperne selv eller med brew upgrade --cask parallels docker i Terminal), eller få IT til at installere brewau-MDM-profilen. De springes over, indtil der kommer nyere versioner.") == true, "Several blocks share one way out")
+        check(twoBlocks.danishSummary()?.contains("App-administration") == false, "A real block does not send the user to System Settings")
         check(twoBlocks.danishHeadline == "2 apps er blokeret af macOS", "Several blocks are counted")
 
         // Live result from 2026-11-25: Paseo was upgraded, only pinning it afterwards was refused.
@@ -319,7 +321,7 @@ import Darwin
         check(restartBeside.status == "restart-failed" && !restartBeside.isBlockOnly, "A failed step beside a block is not block-only")
         check(runNotice(job: "upgrade", succeeded: false, result: restartBeside) == .failure, "A failed service restart beside a block is notified")
         check(restartBeside.danishHeadline == "Opdateringen mislykkedes", "and keeps the failure headline")
-        check(restartBeside.danishSummary { $0.token.capitalized } == "En systemtjeneste kunne ikke genstartes efter opdateringen. Se loggen for detaljer. Parallels kunne ikke opdateres, fordi macOS App Management blokerer baggrundsjobbet. Den springes over, indtil der kommer en nyere version eller du opdaterer den manuelt.",
+        check(restartBeside.danishSummary { $0.token.capitalized } == "En systemtjeneste kunne ikke genstartes efter opdateringen. Se loggen for detaljer. Parallels kunne ikke opdateres, fordi macOS App Management blokerer baggrundstjenesten. Opdater den manuelt (fx fra appen selv eller med brew upgrade --cask parallels i Terminal), eller få IT til at installere brewau-MDM-profilen. Den springes over, indtil der kommer en nyere version.",
               "and is named before the block, which is still explained")
         check(restartBeside.danishSummary(includingBlocks: false) == "En systemtjeneste kunne ikke genstartes efter opdateringen. Se loggen for detaljer.",
               "while its banner leaves the block to the block banner")
