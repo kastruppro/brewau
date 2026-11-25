@@ -43,9 +43,9 @@ it is protected. The menu bar app protects them through
 which runs `brewau-upgrade protect-pending`; that re-validates each app from Homebrew and
 logs to upgrade.log. The agent ignores terminal signals and starts that script in a
 session of its own, so ^C, ^Z or a closed terminal cannot stop it while an app is in
-staging; after 15 minutes it stops waiting (and releases the lock) without killing it.
+staging. The agent holds the operation lock until the script has exited.
 A busy answer (exit 75: a scan, upgrade or self-update holds the lock) is retried after
-30 seconds. It runs on launch, after each finished scan or upgrade, and from
+30 seconds, also when the user asked for it ("Venter på brewau…"). It runs on launch, after each finished scan or upgrade, and from
 **Beskyt nu**, once per state and never during a run. Exit 0 clears the notice; exit 3
 means App Management still refuses, and the notice asks the user to switch on **brewau**
 under Anonymitet og sikkerhed › App-administration (**Åbn Systemindstillinger…**,

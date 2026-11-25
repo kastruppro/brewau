@@ -183,22 +183,25 @@ import Darwin
         }
         trigger.record(firstKey, outcome: .refused, now: start.addingTimeInterval(40))
         check(!trigger.shouldRun(pending: merged, finishedRuns: finishedAt, busy: false, now: start.addingTimeInterval(80)), "A retry that completes is deduplicated")
+        // Round 3: after that refusal the user grants access and clicks Prøv igen during a
+        // self-update. The busy answer must not leave the refused state marked as done.
+        trigger.record(firstKey, outcome: .busy, now: start.addingTimeInterval(100))
+        check(!trigger.shouldRun(pending: merged, finishedRuns: finishedAt, busy: false, now: start.addingTimeInterval(110)), "The manual retry backs off while busy")
+        check(trigger.shouldRun(pending: merged, finishedRuns: finishedAt, busy: false, now: start.addingTimeInterval(100 + ProtectTrigger.busyRetry)), "and then runs again for the refused state")
 
-        // M2: the protect child runs in its own session, with default signals, and a deadline
-        // stops waiting without killing it.
-        check(try runDetached("/bin/sh", ["-c", "exit 3"], deadline: 10) == 3, "Exit status is passed on")
-        check(try runDetached("/bin/sh", ["-c", "kill -TERM $$"], deadline: 10) == 1, "A child killed by a signal counts as failed")
-        check(try runDetached("/bin/sh", ["-c", #"[ "$(/bin/ps -o pgid= -p $$ | tr -d ' ')" = "$$" ] && [ "$PWD" = / ]"#], deadline: 10) == 0, "Child leads its own session and process group, in /")
+        // The protect child runs in its own session with default signals, and the agent waits
+        // for it to exit, so the operation lock is held for the whole run.
+        check(try runDetached("/bin/sh", ["-c", "exit 3"]) == 3, "Exit status is passed on")
+        check(try runDetached("/bin/sh", ["-c", "kill -TERM $$"]) == 1, "A child killed by a signal counts as failed")
+        check(try runDetached("/bin/sh", ["-c", #"[ "$(/bin/ps -o pgid= -p $$ | tr -d ' ')" = "$$" ] && [ "$PWD" = / ]"#]) == 0, "Child leads its own session and process group, in /")
         let marker = FileManager.default.temporaryDirectory.appendingPathComponent("brewau-detached-\(getpid())")
         try? FileManager.default.removeItem(at: marker)
         let begun = Date()
-        check(try runDetached("/bin/sh", ["-c", "sleep 1; /usr/bin/touch '\(marker.path)'"], deadline: 0.2) == nil, "The deadline stops waiting")
-        check(Date().timeIntervalSince(begun) < 0.9, "and returns before the child is done")
-        usleep(1_500_000)
-        check(FileManager.default.fileExists(atPath: marker.path), "The child is not killed at the deadline")
+        check(try runDetached("/bin/sh", ["-c", "sleep 1; /usr/bin/touch '\(marker.path)'"]) == 0, "A slow child is waited for")
+        check(Date().timeIntervalSince(begun) >= 0.9 && FileManager.default.fileExists(atPath: marker.path), "Only returns once the child has finished")
         try? FileManager.default.removeItem(at: marker)
         signal(SIGINT, SIG_IGN)
-        check(try runDetached("/bin/sh", ["-c", "kill -INT $$; exit 0"], deadline: 10) == 1, "Ignored signals are reset to default in the child")
+        check(try runDetached("/bin/sh", ["-c", "kill -INT $$; exit 0"]) == 1, "Ignored signals are reset to default in the child")
         signal(SIGINT, SIG_DFL)
 
         let standingBlock = try RunResult.decode(Data(#"{"upgraded":[],"failed":[],"blocked":[{"name":"parallels","kind":"cask","version":"26.2.1","reason":"app-management","installed":"x"}],"errors":[],"finished":"2026-11-09T04:00:00Z","job":"upgrade","status":"blocked","reason":"app-management"}"#.utf8))

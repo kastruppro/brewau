@@ -100,7 +100,7 @@ struct UpdatePopover: View {
                                 if model.protectRefused {
                                     Button("Åbn Systemindstillinger…") { model.openAppManagementSettings() }
                                 }
-                                Button(model.protecting ? "Beskytter…" : model.protectRefused ? "Prøv igen" : "Beskyt nu") {
+                                Button(model.protecting ? "Beskytter…" : model.protectWaiting ? "Venter på brewau…" : model.protectRefused ? "Prøv igen" : "Beskyt nu") {
                                     Task { await model.protectPending(userInitiated: true) }
                                 }.buttonStyle(.borderedProminent)
                                     .disabled(model.busy || model.protecting || !model.installed)

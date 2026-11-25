@@ -87,7 +87,8 @@ struct UnprotectedApp: Equatable, Sendable {
 /// Automatic protection runs once per state: on launch, and again only when a run has
 /// finished or the pending list changed. A completed attempt (0, 1 or 3) is remembered, so
 /// the refresh loop can never turn it into a retry loop. A busy helper (75) ran nothing, so
-/// that state stays eligible and is tried again after `busyRetry`.
+/// that state stays eligible and is tried again after `busyRetry` — also a state that was
+/// attempted before, so a retry the user asked for is never lost to a busy lock.
 struct ProtectTrigger {
     static let busyRetry: TimeInterval = 30
     private var lastKey: String?
@@ -103,6 +104,7 @@ struct ProtectTrigger {
     }
     mutating func record(_ key: String, outcome: ProtectOutcome, now: Date = Date()) {
         if outcome == .busy {
+            lastKey = nil
             busyUntil = now.addingTimeInterval(ProtectTrigger.busyRetry)
         } else {
             lastKey = key
@@ -113,9 +115,9 @@ struct ProtectTrigger {
 
 /// Starts a fixed root command in a session of its own, so nothing a terminal sends (^C,
 /// ^Z, a closed window) reaches it, with default signal handling, stdin and output on
-/// /dev/null, and waits for it. Returns its exit status (1 for a signal), or nil once
-/// `deadline` has passed: the child is then left to finish, never killed half-way.
-func runDetached(_ path: String, _ arguments: [String], deadline: TimeInterval) throws -> Int32? {
+/// /dev/null, and waits for it to exit, however long that takes: the caller holds the
+/// operation lock for exactly that long. Returns its exit status (1 for a signal).
+func runDetached(_ path: String, _ arguments: [String]) throws -> Int32 {
     var attributes: posix_spawnattr_t?
     posix_spawnattr_init(&attributes)
     defer { posix_spawnattr_destroy(&attributes) }
@@ -140,14 +142,9 @@ func runDetached(_ path: String, _ arguments: [String], deadline: TimeInterval) 
     var pid: pid_t = 0
     let spawned = posix_spawn(&pid, path, &actions, &attributes, argv, envp)
     guard spawned == 0 else { throw BrewauError.message("Kunne ikke starte \(path) (\(spawned)).") }
-    let end = Date().addingTimeInterval(deadline)
     var status: Int32 = 0
-    while true {
-        let waited = waitpid(pid, &status, WNOHANG)
-        if waited == pid { break }
-        if waited < 0, errno != EINTR { throw BrewauError.message("Kunne ikke vente på \(path).") }
-        if Date() >= end { return nil }
-        usleep(100_000)
+    while waitpid(pid, &status, 0) < 0 {
+        guard errno == EINTR else { throw BrewauError.message("Kunne ikke vente på \(path).") }
     }
     // WIFEXITED / WEXITSTATUS, which Swift does not import.
     return status & 0x7f == 0 ? (status >> 8) & 0xff : 1

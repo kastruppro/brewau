@@ -51,23 +51,18 @@ private let config = root.appendingPathComponent("etc/brewau.conf")
                 // pending item from scratch and writes its own upgrade.log lines.
                 // An app can be in staging while this runs, so a terminal must not be able to
                 // stop or suspend it half-way: the agent ignores those signals and the script
-                // runs in a session of its own. A deadline releases the operation lock if the
-                // script hangs, without killing it.
+                // runs in a session of its own. The operation lock is held until the script has
+                // exited, as the scheduled jobs hold it for their whole run.
                 try requireRoot()
                 for signal in [SIGINT, SIGTERM, SIGHUP, SIGTSTP, SIGQUIT, SIGTTIN, SIGTTOU] { Darwin.signal(signal, SIG_IGN) }
                 guard let account = getpwnam("_brewau") else { throw BrewauError.message("_brewau is missing.") }
-                let finished: Int32?? = try withFileLock(state.appendingPathComponent("operation.lock").path, nonblocking: true,
+                let finished: Int32? = try withFileLock(state.appendingPathComponent("operation.lock").path, nonblocking: true,
                                                          owner: (account.pointee.pw_uid, account.pointee.pw_gid)) {
-                    try runDetached(root.appendingPathComponent("libexec/brewau-upgrade").path, ["protect-pending"], deadline: protectDeadline)
+                    try runDetached(root.appendingPathComponent("libexec/brewau-upgrade").path, ["protect-pending"])
                 }
-                guard let ran = finished else {
+                guard let status = finished else {
                     fputs("brewau: brewau scanner eller opdaterer; prøv igen, når det er færdigt.\n", stderr)
                     exit(75)
-                }
-                guard let status = ran else {
-                    BrewauLog.agent.error("protect still running after \(Int(protectDeadline)) s; no longer waiting")
-                    fputs("brewau: Beskyttelsen kører stadig efter \(Int(protectDeadline / 60)) minutter. Se upgrade.log, og prøv igen senere.\n", stderr)
-                    exit(1)
                 }
                 let code: Int32 = status == 0 ? 0 : status == 3 ? 3 : 1
                 BrewauLog.agent.notice("protect finished with \(code)")
@@ -182,8 +177,6 @@ private let config = root.appendingPathComponent("etc/brewau.conf")
         BrewauLog.agent.error("\(kind, privacy: .public) failed: \(english, privacy: .public)")
         return BrewauError.reported(ui: danish, log: brewauLogLine(kind, english))
     }
-    /// Validating and protecting a handful of apps takes seconds; this only bounds a hang.
-    static let protectDeadline: TimeInterval = 15 * 60
     static func selfUpdate(now: Bool) throws {
         let marker = root.appendingPathComponent("etc/self-update.pid")
         try Data("\(getpid())\n".utf8).write(to: marker, options: .atomic)

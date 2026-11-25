@@ -38,6 +38,8 @@ struct PendingApp: Identifiable {
     /// Apps the daemon could not lock or pin; the app protects them through the helper.
     @Published var unprotected: [UnprotectedApp] = []
     @Published var protecting = false
+    /// The helper found the operation lock held; the same request runs again shortly.
+    @Published var protectWaiting = false
     /// The helper's last answer was that App Management still refuses (exit 3).
     @Published var protectRefused = false
     /// What the newest finished run published, if the file really belongs to that run,
@@ -124,6 +126,7 @@ struct PendingApp: Identifiable {
         protecting = false
         let outcome = (try? answer.get()).map { ProtectOutcome(exitCode: $0.0) } ?? .failed
         protectTrigger.record(key, outcome: outcome)
+        protectWaiting = outcome == .busy
         switch answer {
         case .failure(let failure): self.error = failure.localizedDescription
         case .success(let (code, text)):
