@@ -295,13 +295,17 @@ and an `errors` array of stage and reason. `brewau status` lists errors and bloc
 
 **`Operation not permitted` when a cask changes its app** (e.g. Parallels:
 `chown: /Applications/Parallels Desktop.app/...: Operation not permitted`). macOS App Management
-blocks changes to app bundles, even by root, unless the app that started the command is allowed.
-Enable your terminal (Terminal, iTerm, Ghostty, ...) in System Settings → Privacy & Security →
-App Management and run the command again. The scheduled job cannot obtain App Management
-without an MDM-delivered PPPC grant. Update blocked apps manually from an allowed terminal;
-brewau also blocks a cask when App Management prevents protecting its installed app. It skips
-that version until a newer version, a manual upgrade, or `sudo brewau clear-blocked`.
-The menu also offers retry and a link to App Management settings.
+can block changes to app bundles, including app protection, even by root. For a manual Homebrew
+command, enable your terminal in System Settings → Privacy & Security → App Management.
+
+For scheduled jobs, the responsible process is `/opt/brewau/libexec/brewau-agent`, not
+brewau.app. On macOS 26.3 or later, open System Settings → Privacy & Security → App Management,
+click `+`, press Command-Shift-G, enter `/opt/brewau/libexec/brewau-agent`, and add and enable it.
+On managed Macs, use the PPPC profile and DDM example in [the MDM guide](mdm/README.md).
+
+After granting access, clear the saved per-version block with “Prøv igen” in the menu or
+`sudo brewau clear-blocked`. A blocked app can also be upgraded manually from an allowed terminal;
+a newer version is retried automatically.
 
 ## Limitations
 

@@ -4,6 +4,21 @@ All notable changes to brewau. The format follows [Keep a Changelog](https://kee
 and versions follow [Semantic Versioning](https://semver.org/). Details of each finding behind
 0.4.0 are in [FIXES.md](FIXES.md).
 
+## [Unreleased]
+
+### Added
+
+- A PPPC profile for App Management and a DDM delivery example in `mdm/`.
+
+### Changed
+
+- `brewau-agent` is signed with the stable identifier `com.kastruppro.brewau.agent`. Re-add any
+  existing manual App Management grant for the old identifier.
+
+### Fixed
+
+- App Management guidance now identifies the background agent as the responsible process.
+
 ## [0.9.1] - 2026-11-17
 
 ### Fixed

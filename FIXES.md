@@ -48,11 +48,9 @@ All fixed items have tests (`make test`) except where root is needed (noted).
 
 ### Open follow-ups
 
-- Redesign App Management around a signed `brewau-agent` with fixed identifier
-  `com.kastruppro.brewau.agent` as the launchd program and responsible process. Ship a PPPC
-  profile for `SystemPolicyAppBundles` with path identifier and a DDM
-  `com.apple.configuration.legacy` wrapper in `mdm/`. Responsible-process behaviour and DDM
-  delivery remain untested.
+- [x] Sign the launchd agent with the fixed identifier `com.kastruppro.brewau.agent` and ship
+  a path-based App Management PPPC profile with a DDM legacy configuration example in `mdm/`.
+- Live test the agent path grant on macOS 27 and DDM delivery; both remain unverified.
 - Live test blocking, offline behaviour and notifications on an installed build. The App
   Management block test is still pending: Docker updated itself before it could be reproduced.
   It can be verified with Paseo on the owner’s Mac after installation.

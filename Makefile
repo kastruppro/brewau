@@ -36,7 +36,7 @@ agent:
 	mkdir -p $(BUILD)
 	xcrun swiftc -O -parse-as-library -target arm64-apple-macos14.0 -module-cache-path "$(BUILD)/swift-module-cache" \
 		app/Core.swift app/Completions.swift app/Agent.swift -o "$(BUILD)/brewau-agent"
-	codesign --force --options runtime $(CODESIGN_TIMESTAMP) --sign "$(CODESIGN_IDENTITY)" "$(BUILD)/brewau-agent"
+	codesign --force --options runtime $(CODESIGN_TIMESTAMP) --sign "$(CODESIGN_IDENTITY)" -i com.kastruppro.brewau.agent "$(BUILD)/brewau-agent"
 
 app-check:
 	mkdir -p $(BUILD)
