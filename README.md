@@ -299,9 +299,10 @@ can block changes to app bundles, including app protection, even by root. For a 
 command, enable your terminal in System Settings → Privacy & Security → App Management.
 
 For scheduled jobs, the responsible process is `/opt/brewau/libexec/brewau-agent`, not
-brewau.app. On macOS 26.3 or later, open System Settings → Privacy & Security → App Management,
-click `+`, press Command-Shift-G, enter `/opt/brewau/libexec/brewau-agent`, and add and enable it.
-On managed Macs, use the PPPC profile and DDM example in [the MDM guide](mdm/README.md).
+brewau.app. Open System Settings → Privacy & Security → App Management, click `+`, press
+Command-Shift-G, enter `/opt/brewau/libexec/brewau-agent`, and add and enable it. On macOS
+26.1–26.2, this picker cannot add standalone executables; update macOS (fixed in 26.3) or use
+the PPPC profile and DDM example in [the MDM guide](mdm/README.md) on a managed Mac.
 
 After granting access, clear the saved per-version block with “Prøv igen” in the menu or
 `sudo brewau clear-blocked`. A blocked app can also be upgraded manually from an allowed terminal;
