@@ -4,7 +4,6 @@
 set -u
 
 HERE="$(cd "$(dirname "$0")" && pwd -P)"
-BREWAU_POLICY_TEST=1
 # shellcheck source=../payload/opt/brewau/libexec/brew-policy
 source "${HERE}/../payload/opt/brewau/libexec/brew-policy"
 
@@ -304,6 +303,70 @@ if [[ -r "${BREW_SH}" ]]; then
   done < <(sed -n 's/^ *\([^ )]*\)) HOMEBREW_COMMAND="\([^"]*\)" ;;.*/\1 \2/p' "${BREW_SH}")
 else
   echo "skipping Homebrew drift checks: ${BREW_SH} not found"
+fi
+
+# A separate flock holder uses the same operation.lock as the Swift agent.
+BREWAU_STATE_DIR="$(mktemp -d)"
+/usr/bin/perl -MFcntl=:flock -e '
+  open(my $lock, ">>", $ARGV[0]) or die $!;
+  flock($lock, LOCK_EX) or die $!;
+  open(my $ready, ">", $ARGV[1]) or die $!;
+  close($ready);
+  sleep(5);
+' "${BREWAU_STATE_DIR}/operation.lock" "${BREWAU_STATE_DIR}/ready" &
+lock_pid=$!
+for ((i=0; i<50; i++)); do
+  [[ -e "${BREWAU_STATE_DIR}/ready" ]] && break
+  sleep 0.02
+done
+lock_output="$(with_operation_lock 0 /usr/bin/touch "${BREWAU_STATE_DIR}/ran" 2>&1)"
+lock_status=$?
+kill "${lock_pid}" 2>/dev/null
+wait "${lock_pid}" 2>/dev/null
+if [[ "${lock_status}" == 75 && "${lock_output}" == *"another operation is running"* &&
+  ! -e "${BREWAU_STATE_DIR}/ran" ]]; then
+  PASS=$((PASS + 1))
+else
+  FAIL=$((FAIL + 1))
+  echo "FAIL: an existing flock must time out before the cask command runs"
+fi
+PERL5OPT=-Z with_operation_lock 0 /bin/bash -c 'exit 7'
+if [[ $? == 7 ]]; then
+  PASS=$((PASS + 1))
+else
+  FAIL=$((FAIL + 1))
+  echo "FAIL: a released lock should let the command run in a clean environment and return its status"
+fi
+
+rm -f "${BREWAU_STATE_DIR}/operation.lock"
+ln -s "${BREWAU_STATE_DIR}/target" "${BREWAU_STATE_DIR}/operation.lock"
+if ! with_operation_lock 0 /usr/bin/touch "${BREWAU_STATE_DIR}/ran" 2>/dev/null &&
+  [[ ! -e "${BREWAU_STATE_DIR}/target" && ! -e "${BREWAU_STATE_DIR}/ran" ]]; then
+  PASS=$((PASS + 1))
+else
+  FAIL=$((FAIL + 1))
+  echo "FAIL: a symlink lock must be rejected without running the cask command"
+fi
+rm -rf "${BREWAU_STATE_DIR}"
+
+lock_paths="$(
+  BREWAU_USER="$(id -un)"
+  with_operation_lock() { printf 'locked %s\n' "${*:8}"; }
+  run_policy() { printf 'direct %s\n' "$*"; }
+  main -v reinstall --cask firefox
+  main uninstall firefox
+  main install --formula wget
+  main migrate --cask firefox
+  main update
+  main outdated
+  main tap acme/tools
+  main list
+)"
+if [[ "${lock_paths}" == $'locked -v reinstall --cask firefox\nlocked uninstall firefox\nlocked install --formula wget\nlocked migrate --cask firefox\nlocked update\nlocked outdated\nlocked tap acme/tools\ndirect list' ]]; then
+  PASS=$((PASS + 1))
+else
+  FAIL=$((FAIL + 1))
+  printf 'FAIL: cask commands must use the operation lock, got:\n%s\n' "${lock_paths}"
 fi
 
 # The audit log quotes arguments so free text cannot forge entries.

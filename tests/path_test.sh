@@ -33,7 +33,7 @@ point_at_checkout() {
   sed "s#^BREWAU_LIBEXEC=.*#BREWAU_LIBEXEC=\"${PAYLOAD}/libexec\"#" "$1" >"$2"
 }
 
-run_with_evil_path env BREWAU_POLICY_TEST=1 /bin/bash "${PAYLOAD}/libexec/brew-policy" install wget
+run_with_evil_path /bin/bash -p -c 'source "$1"' brewau "${PAYLOAD}/libexec/brew-policy"
 point_at_checkout "${PAYLOAD}/libexec/brewau-upgrade" "${WORK}/brewau-upgrade"
 run_with_evil_path env BREWAU_UPGRADE_TEST=1 /bin/bash "${WORK}/brewau-upgrade"
 point_at_checkout "${PAYLOAD}/bin/brewau" "${WORK}/brewau"

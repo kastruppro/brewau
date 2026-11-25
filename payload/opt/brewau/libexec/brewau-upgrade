@@ -142,18 +142,20 @@ network_available() {
   return 0
 }
 
-blocked_match() {
-  local name="$1" version="$2" installed="$3" count i blocked_name file="${BREWAU_STATE_DIR}/blocked-casks.json"
-  [[ -r "${file}" ]] || return 1
-  count="$(plutil -extract blocked raw -o - "${file}" 2>/dev/null)" || return 1
-  [[ "${count}" =~ ^[0-9]+$ ]] || return 1
+# A legacy protection row with no saved Homebrew refusal gets one guarded retry.
+legacy_protection_block() {
+  local file="$1" index="$2" name="$3" version="$4" count i failed_name
+  plutil -extract "blocked.${index}.protection" raw -expect string -o /dev/null "${file}" 2>/dev/null || return 1
+  count="$(plutil -extract failed raw -expect array -o - "${file}" 2>/dev/null)" || count=0
   for ((i=0; i<count; i++)); do
-    blocked_name="$(plutil -extract "blocked.${i}.name" raw -o - "${file}")" || continue
-    [[ "${blocked_name##*/}" == "${name##*/}" &&
-       "$(plutil -extract "blocked.${i}.version" raw -o - "${file}")" == "${version}" &&
-       "$(plutil -extract "blocked.${i}.installed" raw -o - "${file}")" == "${installed}" ]] && return 0
+    failed_name="$(plutil -extract "failed.${i}.name" raw -o - "${file}" 2>/dev/null)" || continue
+    if [[ "${failed_name##*/}" == "${name##*/}" &&
+      "$(plutil -extract "failed.${i}.version" raw -o - "${file}" 2>/dev/null)" == "${version}" &&
+      "$(plutil -extract "failed.${i}.reason" raw -o - "${file}" 2>/dev/null)" == app-management ]]; then
+      return 1
+    fi
   done
-  return 1
+  return 0
 }
 
 package_field() {
@@ -472,14 +474,15 @@ run_upgrade() {
   local blocked_tokens="" deferred_protection="" failed_protection="" protect_rc=0 protection_after=0
   if [[ ${enumeration_ok} == 1 ]]; then
     plutil -replace blocked -json '[]' "${RESULT}" || return 1
-    local block_count block_i metadata
-    block_count="$(plutil -extract blocked raw -o - "${BREWAU_STATE_DIR}/blocked-casks.json" 2>/dev/null)" || block_count=0
-    [[ "${block_count}" =~ ^[0-9]+$ ]] || block_count=0
+    local block_file="${BREWAU_STATE_DIR}/blocked-casks.json" block_count block_i metadata
+    block_count="$(plutil -extract blocked raw -expect array -o - "${block_file}" 2>/dev/null)" || block_count=0
     for ((block_i=0; block_i<block_count; block_i++)); do
-      name="$(plutil -extract "blocked.${block_i}.name" raw -o - "${BREWAU_STATE_DIR}/blocked-casks.json")" || continue
+      name="$(plutil -extract "blocked.${block_i}.name" raw -o - "${block_file}")" || continue
       metadata="$(protection_versions "${name##*/}")" || continue
       IFS=$'\t' read -r version installed <<<"${metadata}"
-      if blocked_match "${name}" "${version}" "${installed}"; then
+      if [[ "$(plutil -extract "blocked.${block_i}.version" raw -o - "${block_file}")" == "${version}" &&
+        "$(plutil -extract "blocked.${block_i}.installed" raw -o - "${block_file}")" == "${installed}" ]] &&
+        ! legacy_protection_block "${block_file}" "${block_i}" "${name}" "${version}"; then
         blocked_tokens="${blocked_tokens} ${name##*/}"
         result_item blocked "${name}" cask "${version}" app-management "${installed}" || return 1
       fi
@@ -643,7 +646,10 @@ run_scan() {
 # as _brewau, with only the existing protection operations running as root.
 protect_pending() (
   local file="${BREWAU_STATE_DIR}/pending-protection.json" catalog apps original pending count i token app operation report
-  local failed=0 denied=0 BREWAU_JOB=protect
+  local failed=0 denied=0 BREWAU_JOB=protect cask_count installed_tokens=""
+  local token_pattern='^[a-zA-Z0-9][a-zA-Z0-9._+@-]*$'
+  # A lock may move the bundle into staging before copying it back.
+  trap '' INT TERM HUP QUIT PIPE TSTP
   if [[ -L "${file}" || ( -e "${file}" && ! -f "${file}" ) ]]; then
     log "failed (invalid pending protection file)"
     return 1
@@ -657,19 +663,32 @@ protect_pending() (
   catalog="$(mktemp "${BREWAU_TMP}/protect-catalog.XXXXXX")" || return 1
   trap 'rm -f "${catalog}"' EXIT
   if ! brewau_cache_forbidden_taps || ! brew_run info --json=v2 --installed --cask >"${catalog}" ||
-    ! plutil -extract casks raw -expect array -o /dev/null "${catalog}"; then
+    ! cask_count="$(plutil -extract casks raw -expect array -o - "${catalog}")"; then
     log "failed (could not list installed casks)"
     return 1
   fi
+  for ((i=0; i<cask_count; i++)); do
+    token="$(plutil -extract "casks.${i}.token" raw -expect string -o - "${catalog}" 2>/dev/null)" || token=""
+    if [[ ! "${token}" =~ ${token_pattern} ]]; then
+      log "failed (invalid installed cask catalog)"
+      return 1
+    fi
+    installed_tokens+=${token}$'\n'
+  done
   apps="$(brewau_cask_app_targets "${catalog}")"
   pending="${original}"
   for ((i=count-1; i>=0; i--)); do
     token="$(plutil -extract "items.${i}.token" raw -expect string -o - - <<<"${original}" 2>/dev/null)" || token=""
     app="$(plutil -extract "items.${i}.app" raw -expect string -o - - <<<"${original}" 2>/dev/null)" || app=""
     operation="$(plutil -extract "items.${i}.operation" raw -expect string -o - - <<<"${original}" 2>/dev/null)" || operation=""
-    if [[ ! "${token}" =~ ^[a-zA-Z0-9][a-zA-Z0-9._+@-]*$ ]]; then
+    if [[ ! "${token}" =~ ${token_pattern} ]]; then
       log "failed (invalid cask token)"
       failed=1
+      continue
+    fi
+    if ! grep -Fxq -- "${token}" <<<"${installed_tokens}"; then
+      pending="$(plutil -remove "items.${i}" -o - - <<<"${pending}")" || return 1
+      log "${token}: removed from pending protection (cask uninstalled)"
       continue
     fi
     if ! pending_app_path "${app}" ||
@@ -702,14 +721,16 @@ protect_pending() (
 # With AUTO_UPGRADE=0 the LaunchDaemon has no schedule, so the job only runs
 # when started with `brewau run`.
 main() {
-  if [[ "${1:-}" == protect-pending && "$(id -u)" == 0 ]]; then
+  if [[ "${1:-}" == protect-pending ]]; then
     [[ $# == 1 ]] || return 1
-    exec /usr/bin/sudo -n -u "${BREWAU_USER}" -- "${BREWAU_LIBEXEC}/brewau-upgrade" protect-pending
+    trap '' INT TERM HUP QUIT PIPE TSTP
+    if [[ "$(id -u)" == 0 ]]; then
+      exec /usr/bin/sudo -n -u "${BREWAU_USER}" -- "${BREWAU_LIBEXEC}/brewau-upgrade" protect-pending
+    fi
   fi
   [[ "$(id -un)" == "${BREWAU_USER}" ]] || brewau_die "brewau-upgrade must run as ${BREWAU_USER}"
   brewau_load_config
   if [[ "${1:-}" == protect-pending ]]; then
-    [[ $# == 1 ]] || return 1
     protect_pending >>"${BREWAU_LOG_DIR}/upgrade.log" 2>&1
     return $?
   fi

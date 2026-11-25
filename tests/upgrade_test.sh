@@ -415,12 +415,14 @@ MOCK_PROTECT_REPORT=$'paseo\tapp-management\t/Applications/Paseo.app\tlock'
 MOCK_CATALOG='{"casks":[{"token":"paseo","version":"2","installed":"1","artifacts":[]}]}'
 PENDING="${BREWAU_STATE_DIR}/pending-protection.json"
 RESULT_FILE="${BREWAU_STATE_DIR}/last-result.json"
+LEGACY_BLOCK='{"name":"paseo","kind":"cask","version":"2","reason":"app-management","installed":"[\"1\"]","protection":"/Applications/Paseo.app\tpin"}'
+printf '{"blocked":[%s],"failed":[]}\n' "${LEGACY_BLOCK}" >"${BREWAU_STATE_DIR}/blocked-casks.json"
 run
 check '[[ ${RC} == 0 && "${STATUS}" == ok && "$(plutil -extract reason raw -o - "${RESULT_FILE}")" == unprotected ]]' "deferral is not a job failure"
 check '! called "upgrade --cask paseo" && called "upgrade --cask firefox"' "only the cask awaiting protection is deferred"
 check '[[ "$(plutil -extract unprotected.0.deferred raw -o - "${RESULT_FILE}")" == true &&
   "$(plutil -extract unprotected.0.protection raw -o - "${RESULT_FILE}")" == "$(printf "/Applications/Paseo.app\tlock")" ]]' "result records the deferred lock"
-check '[[ "$(plutil -extract blocked raw -o - "${BREWAU_STATE_DIR}/blocked-casks.json")" == 0 ]]' "deferral never becomes a standing block"
+check '[[ "$(plutil -extract blocked raw -o - "${BREWAU_STATE_DIR}/blocked-casks.json")" == 0 ]]' "legacy protection-only block is reevaluated and becomes pending, not a standing block"
 check '[[ "$(plutil -extract items.0.version raw -o - "${PENDING}")" == 2 &&
   "$(plutil -extract items.0.operation raw -o - "${PENDING}")" == lock &&
   "$(stat -f %Lp "${PENDING}")" == 644 ]]' "pending state matches the deferred target version and keeps state file permissions"
@@ -433,17 +435,17 @@ MOCK_PROTECT_REPORT=''
 run
 check 'called "upgrade --cask paseo" && [[ "$(plutil -extract items raw -o - "${PENDING}")" == 0 ]]' "the next run upgrades after rechecking protection"
 
-scenario "Homebrew block outranks pending protection"
+scenario "legacy Homebrew refusal outranks pending protection"
 MOCK_OUTDATED_CASKS=paseo
-MOCK_CASK_FAIL=paseo
-MOCK_CASK_ERROR='App Management permissions'
-run
+printf '{"blocked":[%s],"failed":[{"name":"paseo","version":"2","reason":"app-management"}]}\n' \
+  "${LEGACY_BLOCK}" >"${BREWAU_STATE_DIR}/blocked-casks.json"
 MOCK_CASK_FAIL=never
 MOCK_UNPROTECTED=paseo
 MOCK_PROTECT_RC=1
 MOCK_PROTECT_REASON=app-management
 run
-check '[[ "${STATUS}" == blocked && "$(plutil -extract unprotected.0.name raw -o - "${RESULT_FILE}")" == paseo ]]' "standing brew block and pending protection both remain visible"
+check '[[ "${STATUS}" == blocked && "$(plutil -extract unprotected.0.name raw -o - "${RESULT_FILE}")" == paseo ]] &&
+  ! called "upgrade --cask paseo"' "explicit legacy Homebrew refusal is preserved alongside pending protection"
 MOCK_PROTECT_REPORT=$'paseo\tprotect-failed\t/Applications/Paseo.app\tlock'
 run
 check '[[ ${RC} != 0 && "${STATUS}" == protect-failed ]]' "new trust failure stays visible beside saved brew block"
@@ -654,6 +656,11 @@ MOCK_CATALOG="$(printf '{"casks":[{"token":"paseo","artifacts":[{"app":[],"targe
 brewau_cache_forbidden_taps() { :; }
 brewau_protect_apps() {
   [[ "$2 $4 $7 $8" == '--report-reasons --only-app /usr/bin/sudo -n' ]] || return 1
+  local signal
+  for signal in INT TERM HUP QUIT PIPE TSTP; do
+    [[ "$(trap -p "${signal}")" == "trap -- '' SIG${signal}" ]] || return 1
+  done
+  /bin/bash -p -c 'kill -s INT "$$" && kill -s TERM "$$"' || return 1
   echo "protect $5 ${6##*/}" >>"${CALLS}"
   if [[ "$5" == "${MOCK_DENIED_TOKEN:-}" ]]; then
     printf '%s\tapp-management\t%s\tpin\n' "$5" "$6"
@@ -677,7 +684,7 @@ MOCK_DENIED_TOKEN=other
 OUTPUT="$(protect_pending)"
 RC=$?
 check '[[ ${RC} == 3 && "${OUTPUT}" == *"[protect] other: still refused by macOS App Management"* &&
-  "${OUTPUT}" == *"[protect] paseo: protected"* ]]' "mixed retry logs success and permission refusal and returns 3"
+  "${OUTPUT}" == *"[protect] paseo: protected"* ]]' "retry survives terminal signals and reports success plus an App Management refusal"
 check '[[ "$(plutil -extract items raw -o - "${PENDING}")" == 1 &&
   "$(plutil -extract items.0.token raw -o - "${PENDING}")" == other ]]' "successful item removed while refused item stays"
 MOCK_DENIED_TOKEN=''
@@ -692,10 +699,18 @@ enqueue other Other.app
 MOCK_PROTECT_FAILED_TOKEN=other
 OUTPUT="$(protect_pending)"
 RC=$?
-check '[[ ${RC} == 1 && "${OUTPUT}" == *"paseo: failed"* && "${OUTPUT}" == *"ghost: failed"* &&
-  "${OUTPUT}" == *"link: failed"* && "${OUTPUT}" == *"other: failed"* ]]' "mismatched, uninstalled and symlinked apps and trust failures are rejected"
+check '[[ ${RC} == 1 && "${OUTPUT}" == *"paseo: failed"* && "${OUTPUT}" == *"ghost: removed from pending protection (cask uninstalled)"* &&
+  "${OUTPUT}" == *"link: failed"* && "${OUTPUT}" == *"other: failed"* ]]' "uninstalled casks are removed and installed items still require safe paths and trust"
 check '[[ "$(grep "^protect " "${CALLS}")" == "protect other Other.app" ]]' "only the verified installed artifact reaches protection"
-check '[[ "$(plutil -extract items raw -o - "${PENDING}")" == 4 ]]' "failed items remain pending"
+check '[[ "$(plutil -extract items raw -o - "${PENDING}")" == 3 ]]' "failed items remain pending"
+MOCK_CATALOG='{"casks":[{}]}'
+OUTPUT="$(protect_pending)"
+RC=$?
+check '[[ ${RC} == 1 && "$(plutil -extract items raw -o - "${PENDING}")" == 3 ]]' "invalid catalog leaves the queue intact"
+MOCK_CATALOG='{"casks":[]}'
+OUTPUT="$(protect_pending)"
+RC=$?
+check '[[ ${RC} == 0 && "$(plutil -extract items raw -o - "${PENDING}")" == 0 ]]' "an authoritative empty catalog drains obsolete items"
 
 # Read both jobs through the CLI consumer, including an old result without errors.
 sed -e "s#^BREWAU_LIBEXEC=.*#BREWAU_LIBEXEC=\"${PAYLOAD}/libexec\"#" -e '/^case "${1:-}" in/,$d' \
