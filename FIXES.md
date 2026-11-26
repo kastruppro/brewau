@@ -56,6 +56,9 @@ All fixed items have tests (`make test`) except where root is needed (noted).
 
 ### Open follow-ups
 
+- Open write handles from before the prefix takeover survive it (pre-existing; see
+  [REVIEW-NOTES.md](REVIEW-NOTES.md)). A clean boundary would replace previously writable files
+  with fresh inodes at install time.
 - After a complete install, live verify that app-launched protection is checked against the
   app's App Management grant,
   that MDM/DDM delivery works, and whether the agent PPPC entry lets the daemon protect at night.
