@@ -206,9 +206,13 @@ sudo brewau uninstall  # closes access to _brewau first, then returns /opt/homeb
                        # permissions and shell profiles
 ```
 
-Uninstall stops and disables Homebrew system services and system daemons whose plists explicitly
-reference the Homebrew prefix. It prints and logs a restart command for each. After uninstall,
-run the printed commands for the services you want to restart. Services the owner of
+Uninstall stops brewau and returns Homebrew to its original owner and modes. The original owner
+must be a member of the macOS admin group. Existing Homebrew system services keep running. If
+App Management blocks a required change, grant App Management to the app you ran uninstall from,
+such as Terminal, under System Settings → Privacy & Security. Run `sudo brewau uninstall` again
+to continue where it stopped.
+
+Services the owner of
 `/opt/homebrew` ran as themselves get their data
 copied back to `/opt/homebrew/var` and are pointed at it again, if they are stopped and nothing
 is in the way there (the copy in `~/Library/Application Support/brewau/var` stays). Other

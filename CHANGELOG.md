@@ -14,8 +14,8 @@ and versions follow [Semantic Versioning](https://semver.org/). Details of each 
 ### Changed
 
 - `brewau-agent` is signed with the stable identifier `com.kastruppro.brewau.agent`.
-- Uninstall stops root services that run Homebrew code before handing the prefix back, and
-  prints restart commands.
+- Uninstall refuses a non-admin original owner, resumes interrupted handoffs, and explains
+  App Management refusals. Existing Homebrew system services keep running.
 
 ### Fixed
 
