@@ -771,14 +771,22 @@ brewau_lock_tree() {
 
   # Files, outside directories that are still unlocked.
   brewau_locked_files "${root}" -links +1 ! -user root ! -user "${BREWAU_USER}" -print0 |
-    while IFS= read -r -d '' f; do brewau_unlink_copy "${f}"; done
-  brewau_locked_files "${root}" -links 1 ! -user root ! -user "${BREWAU_USER}" -exec /usr/bin/chflags -h nouchg,nouappnd {} +
-  brewau_locked_files "${root}" -links 1 ! -user root ! -user "${BREWAU_USER}" -exec /usr/sbin/chown -h "${BREWAU_USER}:admin" {} +
+    while IFS= read -r -d '' f; do
+      brewau_unlink_copy "${f}" || { echo "brewau: could not replace hard-linked file ${f}" >&2; exit 1; }
+    done || return 1
+  brewau_locked_files "${root}" -links 1 ! -user root ! -user "${BREWAU_USER}" \
+    \( -flags +uchg -o -flags +uappnd \) -exec /usr/bin/chflags -h nouchg,nouappnd {} + || return 1
+  brewau_locked_files "${root}" -links 1 ! -user root ! -user "${BREWAU_USER}" -exec /usr/sbin/chown -h "${BREWAU_USER}:admin" {} + || return 1
   brewau_locked_files "${root}" ! -type l \( -links 1 -o -user "${BREWAU_USER}" \) \( -perm -g+w -o -perm -o+w \) \
-    -exec /bin/chmod -h go-w {} +
+    -exec /bin/chmod -h go-w {} + || return 1
   # chmod go-w leaves ACL entries alone, and an ACL can grant write too.
-  brewau_locked_files "${root}" ! -type l \( -links 1 -o -user "${BREWAU_USER}" \) -acl -exec /bin/chmod -h -N {} +
-  [[ -z "$(find "${root}" -type d \( ! -user root ! -user "${BREWAU_USER}" -o -perm -g+w -o -perm -o+w -o -acl \) -print 2>/dev/null | head -1)" ]]
+  brewau_locked_files "${root}" ! -type l \( -links 1 -o -user "${BREWAU_USER}" \) -acl -exec /bin/chmod -h -N {} + || return 1
+  local remaining
+  remaining="$(find "${root}" ! -type l \( ! -user root ! -user "${BREWAU_USER}" -o -perm -g+w -o -perm -o+w -o -acl \) -print)" || return 1
+  if [[ -n "${remaining}" ]]; then
+    printf 'brewau: could not lock %s\n' "${remaining}" >&2
+    return 1
+  fi
 }
 
 # Runs find over the non-directories under $1 that are not inside a directory
@@ -788,7 +796,7 @@ brewau_locked_files() {
   local root="$1"
   shift
   find "${root}" -type d \( ! -user root ! -user "${BREWAU_USER}" -o -perm -g+w -o -perm -o+w -o -acl \) -prune \
-    -o ! -type d "$@" 2>/dev/null
+    -o ! -type d "$@"
 }
 
 # Replaces hard-linked file $1, in a locked directory, by a copy of its own,
@@ -808,12 +816,11 @@ brewau_unlink_copy() {
 # Locks one directory whose parent is already locked. Clears the user flags
 # first: with uchg set, not even root can change it.
 brewau_lock_path() {
-  local owner
-  owner="$(stat -f %Su "$1" 2>/dev/null)" || return 1
-  if [[ "${owner}" != "root" && "${owner}" != "${BREWAU_USER}" ]]; then
-    /usr/bin/chflags -h nouchg,nouappnd "$1" && /usr/sbin/chown -h "${BREWAU_USER}:admin" "$1" || return 1
-  fi
-  /bin/chmod -h go-w "$1" && /bin/chmod -h -N "$1"
+  /usr/bin/find -P "$1" -maxdepth 0 -type d ! -user root ! -user "${BREWAU_USER}" \
+    \( -flags +uchg -o -flags +uappnd \) -exec /usr/bin/chflags -h nouchg,nouappnd {} + &&
+  /usr/bin/find -P "$1" -maxdepth 0 -type d ! -user root ! -user "${BREWAU_USER}" -exec /usr/sbin/chown -h "${BREWAU_USER}:admin" {} + &&
+  /usr/bin/find -P "$1" -maxdepth 0 -type d \( -perm -g+w -o -perm -o+w \) -exec /bin/chmod -h go-w {} + &&
+  /usr/bin/find -P "$1" -maxdepth 0 -type d -acl -exec /bin/chmod -h -N {} +
 }
 
 # True if the app is a symlink, or anything in it is owned by someone other

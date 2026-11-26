@@ -105,6 +105,25 @@ chmod -N "${BREWAU_APPDIR}/Safe.app"
 check "yes" "$(brewau_app_needs_protection "${BREWAU_APPDIR}/Link.app" && echo yes || echo no)" \
   "a symlinked app always needs protection"
 
+# Directory protection only sends the metadata changes that are needed.
+chmod_probe() (
+  local probe="${WORK}/chmod-probe" fixture="${WORK}/lock-path"
+  mkdir -p "${fixture}"
+  cat >"${probe}" <<'CHMOD'
+#!/bin/bash
+printf '%s\n' "$2"
+exec /bin/chmod "$@"
+CHMOD
+  chmod +x "${probe}"
+  eval "$(declare -f brewau_lock_path | sed "s#/bin/chmod#${probe}#g")"
+  brewau_lock_path "${fixture}" || return 1
+  /bin/chmod g+w "${fixture}"
+  brewau_lock_path "${fixture}" || return 1
+  /bin/chmod +a "everyone allow add_file" "${fixture}"
+  brewau_lock_path "${fixture}"
+)
+check $'go-w\n-N' "$(chmod_probe)" "clean, writable-only and ACL-only directories get no unnecessary chmod"
+
 # --- brewau_lock_app ---------------------------------------------------------
 BREWAU_STAGING_DIR="${WORK}/staging"
 mkdir -p "${BREWAU_STAGING_DIR}"

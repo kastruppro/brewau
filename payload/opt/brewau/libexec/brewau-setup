@@ -191,6 +191,23 @@ add_own_tap_once() {
   touch "${OWN_TAP_MARKER}"
 }
 
+# Keep the native path diagnostics and explain denials on protected bundles.
+prefix_permission_change() {
+  local output
+  if output="$("$@" 2>&1)"; then return 0; fi
+  printf '%s\n' "${output}" >&2
+  if grep -Eq "\\.app(/|['\"]?:).*Operation not permitted" <<<"${output}"; then
+    echo "brewau: macOS App Management may be blocking the required changes to the app bundle shown above" >&2
+  fi
+  return 1
+}
+
+prefix_chown() {
+  local owner="$1"
+  shift
+  prefix_permission_change find -P "$@" \( ! -user "${owner}" -o ! -group admin \) -exec chown -h "${owner}:admin" {} +
+}
+
 take_over_prefix() {
   local owner
   owner="$(stat -f%Su "${HOMEBREW_PREFIX_PATH}")"
@@ -199,7 +216,8 @@ take_over_prefix() {
     chown root:wheel "${ORIGINAL_OWNER_FILE}"
     log "transferring ${HOMEBREW_PREFIX_PATH} from ${owner} to ${BREWAU_USER}"
   fi
-  chown -hR "${BREWAU_USER}:admin" "${HOMEBREW_PREFIX_PATH}"
+  prefix_chown "${BREWAU_USER}" "${HOMEBREW_PREFIX_PATH}" ||
+    brewau_die "could not take ownership of ${HOMEBREW_PREFIX_PATH}"
   # `brew services` creates its log directory before starting a service, which
   # fails for users (they cannot write here), so make sure it exists.
   install -d -o "${BREWAU_USER}" -g admin -m 0755 "${HOMEBREW_PREFIX_PATH}/var" "${HOMEBREW_PREFIX_PATH}/var/log"
@@ -214,7 +232,7 @@ take_over_prefix() {
   # Also removes ACLs: an ACL the previous owner set can still grant them
   # write access. Homebrew does not use ACLs. Whoever could write here can
   # still race this, so it never follows their symlinks.
-  brewau_lock_tree "${HOMEBREW_PREFIX_PATH}" ||
+  prefix_permission_change brewau_lock_tree "${HOMEBREW_PREFIX_PATH}" ||
     brewau_die "could not remove group/world write and ACLs from ${HOMEBREW_PREFIX_PATH}"
 }
 
@@ -847,22 +865,28 @@ system_service_names() {
 # keg (the owner controls the rest of the prefix, opt/ links included), so a
 # non-admin owner gets a warning.
 return_prefix() {
-  local owner="$1" services keg name
+  local owner="$1" services keg name path
   services="$(system_service_names)"
   while IFS= read -r -d '' keg; do
     name="${keg##*/}"
     if brewau_in_words "${name}" "${services}"; then
       # Restored modes may have brought back group/world write.
-      chown -hR root:admin "${keg}"
-      chmod -R go-w "${keg}"
+      prefix_chown root -d "${keg}" || return 1
+      prefix_permission_change find -P "${keg}" ! -type l \( -perm -g+w -o -perm -o+w \) -exec chmod -h go-w {} + || return 1
       log "${name} runs as a root system daemon, so its keg stays owned by root (upgrade or remove it with sudo)"
     else
-      chown -hR "${owner}:admin" "${keg}"
+      prefix_chown "${owner}" -d "${keg}" || return 1
     fi
   done < <(find "${HOMEBREW_PREFIX_PATH}/Cellar" -mindepth 1 -maxdepth 1 -print0 2>/dev/null)
-  find "${HOMEBREW_PREFIX_PATH}" -mindepth 1 -maxdepth 1 ! -name Cellar -exec chown -hR "${owner}:admin" {} +
-  [[ -d "${HOMEBREW_PREFIX_PATH}/Cellar" ]] && chown -h "${owner}:admin" "${HOMEBREW_PREFIX_PATH}/Cellar"
-  chown -h "${owner}:admin" "${HOMEBREW_PREFIX_PATH}"
+  for path in "${HOMEBREW_PREFIX_PATH}"/* "${HOMEBREW_PREFIX_PATH}"/.[!.]* "${HOMEBREW_PREFIX_PATH}"/..?*; do
+    [[ -e "${path}" || -L "${path}" ]] || continue
+    [[ "${path##*/}" != Cellar ]] || continue
+    prefix_chown "${owner}" -d "${path}" || return 1
+  done
+  if [[ -e "${HOMEBREW_PREFIX_PATH}/Cellar" || -L "${HOMEBREW_PREFIX_PATH}/Cellar" ]]; then
+    prefix_chown "${owner}" "${HOMEBREW_PREFIX_PATH}/Cellar" -maxdepth 0 || return 1
+  fi
+  prefix_chown "${owner}" "${HOMEBREW_PREFIX_PATH}" -maxdepth 0 || return 1
   if [[ -n "${services}" ]] && ! dseditgroup -o checkmember -m "${owner}" admin >/dev/null 2>&1; then
     log "WARNING: ${owner} is not an administrator but owns ${HOMEBREW_PREFIX_PATH}, which root system daemons run from"
     log "  (${services//$'\n'/ }). Stop them unless ${owner} is trusted with root: sudo brew services stop <formula>"

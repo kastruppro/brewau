@@ -435,6 +435,18 @@ MOCK_PROTECT_REPORT=''
 run
 check 'called "upgrade --cask paseo" && [[ "$(plutil -extract items raw -o - "${PENDING}")" == 0 ]]' "the next run upgrades after rechecking protection"
 
+scenario "legacy Paseo pin block at the installed version"
+MOCK_CATALOG='{"casks":[{"token":"paseo","version":"0.17.4","installed":"0.17.4","artifacts":[]}]}'
+MOCK_PROTECT_REPORT=$'paseo\tapp-management\t/Applications/Paseo.app\tpin'
+printf '%s\n' '{"blocked":[{"reason":"app-management","kind":"cask","protection":"/Applications/Paseo.app\tpin","version":"0.17.4","installed":"[\"0.17.4\"]","name":"paseo"}]}' \
+  >"${BREWAU_STATE_DIR}/blocked-casks.json"
+run
+check '[[ ${RC} == 0 && "${STATUS}" == ok && "$(plutil -extract reason raw -o - "${RESULT_FILE}")" == unprotected &&
+  "$(plutil -extract blocked raw -o - "${BREWAU_STATE_DIR}/blocked-casks.json")" == 0 ]]' "drops the legacy block when no upgrade is available"
+check 'called protect && ! called "upgrade --cask paseo" &&
+  [[ "$(plutil -extract items.0.version raw -o - "${PENDING}")" == 0.17.4 &&
+    "$(plutil -extract items.0.operation raw -o - "${PENDING}")" == pin ]]' "attempts pinning and queues the refused operation"
+
 scenario "legacy Homebrew refusal outranks pending protection"
 MOCK_OUTDATED_CASKS=paseo
 printf '{"blocked":[%s],"failed":[{"name":"paseo","version":"2","reason":"app-management"}]}\n' \

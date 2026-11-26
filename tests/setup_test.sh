@@ -68,6 +68,50 @@ check "755" "$(stat -f '%Lp' "${BREWAU_APPDIR}/Odd.app/Contents")" "and locks it
 check "group:everyone deny delete" "$(brewau_acl "${BREWAU_APPDIR}/Odd.app")" "and pins it in place"
 check "fail" "$( (cmd_trust_app "${WORK}/elsewhere.app") 2>/dev/null && echo ok || echo fail)" "apps outside the app directory are refused"
 
+# --- prefix ownership: repair only mismatched entries ------------------------
+mkdir -p "${WORK}/tools" "${WORK}/protected-prefix/Cellar/tart/Tart.app/Contents" "${WORK}/external"
+PROTECTED="${WORK}/protected-prefix/Cellar/tart/Tart.app"
+touch "${PROTECTED}/Contents/CodeResources" "${WORK}/external/marker"
+ln -s "${WORK}/external" "${WORK}/protected-prefix/link"
+cat >"${WORK}/tools/chown" <<'CHOWN'
+#!/bin/bash
+printf '%s\n' "$@" >>"${0%/*}/chown.calls"
+for path in "$@"; do
+  case "$path" in
+    */CodeResources) echo "chown: $path: Operation not permitted" >&2; exit 1 ;;
+  esac
+done
+CHOWN
+chmod +x "${WORK}/tools/chown"
+prefix_repair() (
+  PATH="${WORK}/tools:${PATH}"
+  HOMEBREW_PREFIX_PATH="${WORK}/protected-prefix"
+  BREWAU_USER="$(id -un)"
+  ORIGINAL_MODES_FILE="${WORK}/prefix-modes"
+  # Use the test user's group as the expected group, or wheel to simulate a mismatch.
+  find() {
+    local arg args=()
+    for arg in "$@"; do
+      [[ "${arg}" != admin ]] || arg="$group"
+      args+=("${arg}")
+    done
+    /usr/bin/find "${args[@]}"
+  }
+  install() { :; }
+  chown() { :; }
+  local group="$1"
+  take_over_prefix
+)
+got="$(prefix_repair "$(id -gn)" 2>&1)"
+check "0" "$?" "repair succeeds when already-correct app files would reject a chown"
+check "yes" "$([[ ! -e "${WORK}/tools/chown.calls" ]] && echo yes || echo no)" "chown never sees the correctly owned protected bundle"
+got="$(prefix_repair wheel 2>&1)"
+check "1" "$?" "repair stops when a required group change is denied"
+check "yes" "$([[ "${got}" == *"${PROTECTED}/Contents/CodeResources"*"Operation not permitted"*"macOS App Management"* ]] && echo yes || echo "${got}")" \
+  "repair identifies the protected file and possible App Management denial"
+check "yes" "$(grep -qxF -- '-h' "${WORK}/tools/chown.calls" && ! grep -qF 'link/marker' "${WORK}/tools/chown.calls" && echo yes)" \
+  "ownership changes never follow the prefix symlink"
+
 # --- sudoers: only fixed agent verbs for members ------------------------------
 sudoers="$(
   visudo() { return 0; }
