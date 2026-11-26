@@ -206,9 +206,10 @@ sudo brewau uninstall  # closes access to _brewau first, then returns /opt/homeb
                        # permissions and shell profiles
 ```
 
-On uninstall, Homebrew system daemons keep running; their kegs stay owned by root, as
-`sudo brew services start` leaves them, and brewau warns if the new owner of `/opt/homebrew`
-is not an administrator. Services the owner of `/opt/homebrew` ran as themselves get their data
+Uninstall stops and disables Homebrew system services and system daemons whose plists explicitly
+reference the Homebrew prefix. It prints and logs a restart command for each. After uninstall,
+run the printed commands for the services you want to restart. Services the owner of
+`/opt/homebrew` ran as themselves get their data
 copied back to `/opt/homebrew/var` and are pointed at it again, if they are stopped and nothing
 is in the way there (the copy in `~/Library/Application Support/brewau/var` stays). Other
 users' and running services are named: move their data before the next `brew services start`.

@@ -14,9 +14,13 @@ and versions follow [Semantic Versioning](https://semver.org/). Details of each 
 ### Changed
 
 - `brewau-agent` is signed with the stable identifier `com.kastruppro.brewau.agent`.
+- Uninstall stops root services that run Homebrew code before handing the prefix back, and
+  prints restart commands.
 
 ### Fixed
 
+- Prefix takeover and uninstall no longer follow a swapped parent or change a hard-linked
+  file outside the prefix.
 - Package installation no longer aborts over redundant permission changes to App Management
   protected bundles in the Homebrew prefix (such as `tart.app` in the Cellar). Prefix takeover
   and uninstall change only ownership, modes and ACLs that need changing, and report a clear
