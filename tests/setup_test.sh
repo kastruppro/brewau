@@ -30,6 +30,7 @@ check() {
 # --- return_prefix ----------------------------------------------------
 HOMEBREW_PREFIX_PATH="${WORK}/prefix"
 ORIGINAL_MODES_FILE="${WORK}/original-modes"
+UNINSTALL_PROGRESS="${WORK}/uninstall-progress"
 mkdir -p "${HOMEBREW_PREFIX_PATH}/var/with  spaces " "${WORK}/outside"
 touch "${HOMEBREW_PREFIX_PATH}/file" "${WORK}/outside/target"
 chmod 755 "${HOMEBREW_PREFIX_PATH}/var/with  spaces "
@@ -55,6 +56,7 @@ check "644" "$(stat -f '%Lp' "${WORK}/outside/target")" "symlinks and paths outs
 check "755 755" "$(stat -f '%Lp' "${WORK}" "${HOMEBREW_PREFIX_PATH}/var" | tr '\n' ' ' | sed 's/ $//')" \
   "paths ending in /. or /.. are refused"
 
+rm -f "${UNINSTALL_PROGRESS}"
 chmod 755 "${HOMEBREW_PREFIX_PATH}/var/with  spaces "
 ln "${WORK}/outside/target" "${HOMEBREW_PREFIX_PATH}/shared"
 printf '666 %s\n' "${HOMEBREW_PREFIX_PATH}/shared" >>"${ORIGINAL_MODES_FILE}"
@@ -144,62 +146,64 @@ check "yes" "$([[ "${got}" == *"multiply linked entry: ${WORK}/protected-prefix/
   "takeover identifies the shared inode"
 check "664" "$(stat -f %Lp "${WORK}/external/marker")" "takeover leaves the external inode alone"
 
-# --- uninstall stops system services before opening the prefix -------------
-mkdir -p "${WORK}/daemons"
-BREWAU_PLIST_FIXTURE="${WORK}/daemons/sh.brew.test.plist"
-OTHER_PLIST_FIXTURE="${WORK}/daemons/com.example.other.plist"
-plutil -create xml1 "${BREWAU_PLIST_FIXTURE}"
-plutil -insert Label -string sh.brew.test "${BREWAU_PLIST_FIXTURE}"
-plutil -create xml1 "${OTHER_PLIST_FIXTURE}"
-plutil -insert Label -string com.example.other "${OTHER_PLIST_FIXTURE}"
-plutil -insert Program -string "${HOMEBREW_PREFIX_PATH}/bin/custom" "${OTHER_PLIST_FIXTURE}"
-uninstall_daemon_fixture() (
-  local deny_stop="$1" live_pid="${2:-no}"
-  HOMEBREW_PREFIX_PATH="${WORK}/daemon-prefix"
+# --- uninstall validates the original owner before making any changes -----
+got="$( (
+  HOMEBREW_PREFIX_PATH="${WORK}/guard-prefix"
   mkdir -p "${HOMEBREW_PREFIX_PATH}"
-  plutil -replace Program -string "${HOMEBREW_PREFIX_PATH}/bin/custom" "${OTHER_PLIST_FIXTURE}"
-  local stopped="${WORK}/stopped"
-  mkdir -p "${stopped}"
   ORIGINAL_OWNER_FILE="${WORK}/handoff-owner"
-  printf '%s\n' "${BREWAU_USER}" >"${ORIGINAL_OWNER_FILE}"
-  BREWAU_SUDOERS="${WORK}/not-live.sudoers"
+  printf '%s\n' original-user >"${ORIGINAL_OWNER_FILE}"
   brewau_managed() { return 1; }
-  launchctl() {
-    case "$1:$2" in
-      print:system) return 0 ;;
-      print:system/*)
-        [[ ! -e "${stopped}/${2#system/}" ]] || return 1
-        if [[ "$2" == system/sh.brew.test && "${live_pid}" == yes ]]; then echo "pid = 123"; fi
-        ;;
-      disable:system/*) echo "disable $2" ;;
-      bootout:system/*)
-        echo "bootout $2"
-        [[ "$2" != "${deny_stop}" ]] || return 1
-        touch "${stopped}/${2#system/}"
-        ;;
-    esac
-  }
-  kill() { [[ "$*" == "-0 123" ]]; }
-  sleep() { :; }
-  logger() { printf 'logged %s\n' "$*"; }
-  eval "$(declare -f stop_prefix_daemons | sed '1s/stop_prefix_daemons/fixture_stop_prefix_daemons/')"
-  stop_prefix_daemons() { fixture_stop_prefix_daemons "${BREWAU_PLIST_FIXTURE}" "${OTHER_PLIST_FIXTURE}"; }
-  stop_service_processes() { :; }
-  restore_users() { echo "restore users"; }
-  return_cask_apps() { :; }
-  return_prefix() { echo "return prefix"; return 1; }
+  id() { [[ "$1" == -Gn ]] && echo "staff brewau_users"; }
+  launchctl() { echo "unexpected launchctl"; return 1; }
+  rm() { echo "unexpected rm"; return 1; }
   cmd_uninstall
+  ) 2>&1
+)"
+check "1" "$?" "uninstall refuses to return the prefix to a non-admin"
+check "brewau: original Homebrew owner original-user is not a member of the admin group. Uninstall made no changes" \
+  "${got}" "uninstall rejects the owner before touching any services or files"
+
+# --- resume after an App Management refusal -------------------------------
+HOMEBREW_PREFIX_PATH="${WORK}/retry-prefix"
+ORIGINAL_MODES_FILE="${WORK}/retry-modes"
+UNINSTALL_PROGRESS="${WORK}/retry-progress"
+mkdir -p "${HOMEBREW_PREFIX_PATH}/already-returned" "${HOMEBREW_PREFIX_PATH}/tart.app"
+touch "${HOMEBREW_PREFIX_PATH}/already-returned/file"
+chmod 644 "${HOMEBREW_PREFIX_PATH}/already-returned/file"
+printf '775 %s\n' "${HOMEBREW_PREFIX_PATH}/already-returned" "${HOMEBREW_PREFIX_PATH}/tart.app" >"${ORIGINAL_MODES_FILE}"
+printf '664 %s\n' "${HOMEBREW_PREFIX_PATH}/already-returned/file" >>"${ORIGINAL_MODES_FILE}"
+cat >"${WORK}/tools/uninstall-chown" <<'CHOWN'
+#!/bin/bash
+if [[ "$3" == */tart.app && ! -e "${0%/*}/app-management-granted" ]]; then
+  echo "chown: $3: Operation not permitted" >&2
+  exit 1
+fi
+printf '%s\n' "$3" >>"${0%/*}/uninstall-chown.calls"
+CHOWN
+chmod +x "${WORK}/tools/uninstall-chown"
+fixture_handoff() (
+  local group=wheel
+  [[ "$(id -gn)" == wheel ]] && group=staff
+  eval "$(declare -f return_prefix | sed "s#/usr/sbin/chown#${WORK}/tools/uninstall-chown#g")"
+  return_prefix "${BREWAU_USER}" "${group}"
 )
-got="$(uninstall_daemon_fixture system/sh.brew.test 2>&1)"
-check "yes" "$([[ "${got}" == *"could not stop system/sh.brew.test"* && "${got}" != *"restore users"* && "${got}" != *"return prefix"* ]] && echo yes || echo "${got}")" \
-  "a root daemon that cannot stop prevents the prefix handoff"
-got="$(uninstall_daemon_fixture never yes 2>&1)"
-check "yes" "$([[ "${got}" == *"could not stop system/sh.brew.test"* && "${got}" != *"return prefix"* ]] && echo yes || echo "${got}")" \
-  "uninstall waits for the reported daemon process to exit"
-rm -f "${WORK}/stopped/sh.brew.test"
-got="$(uninstall_daemon_fixture never 2>&1)"
-check "yes" "$([[ "${got}" == *"Stopped system/sh.brew.test"*"sudo brew services start test"*"Stopped system/com.example.other"*"sudo launchctl bootstrap system"*"logged -t brewau"*"restore users"*"return prefix"* ]] && echo yes || echo "${got}")" \
-  "uninstall stops and reports Homebrew and custom prefix-backed daemons before handoff"
+got="$(fixture_handoff 2>&1)"
+check "1" "$?" "uninstall stops when macOS refuses a required owner change"
+check "yes" "$([[ "${got}" == *"${HOMEBREW_PREFIX_PATH}/tart.app"*"Terminal"*"App Management"*"Privacy & Security"*"continue where it stopped"* ]] && echo yes || echo "${got}")" \
+  "uninstall identifies the denied path and tells the user how to resume"
+check "775 775" "$(stat -f %Lp "${HOMEBREW_PREFIX_PATH}/already-returned" "${HOMEBREW_PREFIX_PATH}/tart.app" | paste -sd ' ' -)" \
+  "the first directory was handed back and the pending directory mode changed before chown failed"
+# Check that a retry neither descends into completed directories nor resets their files.
+chmod 644 "${HOMEBREW_PREFIX_PATH}/already-returned/file"
+touch "${WORK}/tools/app-management-granted"
+: >"${WORK}/tools/uninstall-chown.calls"
+got="$(fixture_handoff 2>&1)"
+check "0" "$?" "uninstall resumes successfully after the user grants access"
+check "644 775" "$(stat -f %Lp "${HOMEBREW_PREFIX_PATH}/already-returned/file" "${HOMEBREW_PREFIX_PATH}/tart.app" | paste -sd ' ' -)" \
+  "the retry skips the completed subtree and finishes the refused handoff"
+check "yes" "$(grep -Fxq "${HOMEBREW_PREFIX_PATH}/tart.app" "${WORK}/tools/uninstall-chown.calls" &&
+  ! grep -Fq "${HOMEBREW_PREFIX_PATH}/already-returned" "${WORK}/tools/uninstall-chown.calls" && echo yes)" \
+  "the retry only changes the refused directory and its unfinished ancestors"
 
 # --- sudoers: only fixed agent verbs for members ------------------------------
 sudoers="$(
