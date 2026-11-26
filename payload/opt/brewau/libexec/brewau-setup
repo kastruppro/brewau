@@ -208,32 +208,65 @@ prefix_chown() {
   prefix_permission_change find -P "$@" \( ! -user "${owner}" -o ! -group admin \) -exec chown -h "${owner}:admin" {} +
 }
 
+# /opt must keep the prefix entry stable while its own metadata is repaired.
+prefix_check_parent() {
+  local parent="${HOMEBREW_PREFIX_PATH%/*}" unsafe
+  [[ -d "${HOMEBREW_PREFIX_PATH}" && ! -L "${HOMEBREW_PREFIX_PATH}" &&
+    "$(cd -P "${parent}" && pwd -P)" == "${parent}" ]] || return 1
+  unsafe="$(find -P "${parent}" -maxdepth 0 \
+    \( ! -user root ! -user "${BREWAU_USER}" -o -perm -g+w -o -perm -o+w -o -acl \) -print)" || return 1
+  [[ -z "${unsafe}" ]]
+}
+
+# Each scan prunes directories whose children are still unsafe to touch.
+prefix_unlocked_dirs() {
+  find -P "${HOMEBREW_PREFIX_PATH}" -type d \
+    \( ! -user "${BREWAU_USER}" -o ! -group admin -o -perm -g+w -o -perm -o+w -o -acl \) -prune "$@"
+}
+
+prefix_lock_directories() (
+  local scan dir
+  scan="$(mktemp "${BREWAU_STAGING_DIR}/prefix-dirs.XXXXXX")" || return 1
+  trap 'rm -f "${scan}"' EXIT
+  while :; do
+    prefix_unlocked_dirs -print0 >"${scan}" || return 1
+    [[ -s "${scan}" ]] || return 0
+    while IFS= read -r -d '' dir; do
+      find -P "${dir}" -maxdepth 0 ! -path $'*\n*' \( -perm -g+w -o -perm -o+w \) \
+        -exec stat -f '%Lp %N' {} + >>"${ORIGINAL_MODES_FILE}" || return 1
+      prefix_chown "${BREWAU_USER}" "${dir}" -maxdepth 0 || return 1
+      prefix_permission_change brewau_lock_path "${dir}" || return 1
+    done <"${scan}"
+  done
+)
+
 take_over_prefix() {
-  local owner
+  local owner shared
+  prefix_check_parent || brewau_die "unsafe Homebrew prefix or parent directory: ${HOMEBREW_PREFIX_PATH}"
   owner="$(stat -f%Su "${HOMEBREW_PREFIX_PATH}")"
   if [[ "${owner}" != "${BREWAU_USER}" ]]; then
     echo "${owner}" >"${ORIGINAL_OWNER_FILE}"
     chown root:wheel "${ORIGINAL_OWNER_FILE}"
     log "transferring ${HOMEBREW_PREFIX_PATH} from ${owner} to ${BREWAU_USER}"
   fi
-  prefix_chown "${BREWAU_USER}" "${HOMEBREW_PREFIX_PATH}" ||
-    brewau_die "could not take ownership of ${HOMEBREW_PREFIX_PATH}"
-  # `brew services` creates its log directory before starting a service, which
-  # fails for users (they cannot write here), so make sure it exists.
-  install -d -o "${BREWAU_USER}" -g admin -m 0755 "${HOMEBREW_PREFIX_PATH}/var" "${HOMEBREW_PREFIX_PATH}/var/log"
-  # Group/world write would let admins or users plant code that _brewau (and
-  # therefore root) executes. Record the old modes for uninstall first.
   touch "${ORIGINAL_MODES_FILE}"
   chown root:wheel "${ORIGINAL_MODES_FILE}"
   chmod 0644 "${ORIGINAL_MODES_FILE}"
-  # One line per path, so names with a newline are not recorded.
-  find "${HOMEBREW_PREFIX_PATH}" ! -type l ! -path $'*\n*' \( -perm -g+w -o -perm -o+w \) \
+  prefix_lock_directories || brewau_die "could not secure directories in ${HOMEBREW_PREFIX_PATH}"
+  shared="$(find -P "${HOMEBREW_PREFIX_PATH}" ! -type d -links +1 \
+    \( ! -user "${BREWAU_USER}" -o ! -group admin -o ! -type l \( -perm -g+w -o -perm -o+w -o -acl \) \) -print -quit)" ||
+    brewau_die "could not check hard links in ${HOMEBREW_PREFIX_PATH}"
+  [[ -z "${shared}" ]] || brewau_die "refusing to change a multiply linked entry: ${shared}"
+  prefix_chown "${BREWAU_USER}" "${HOMEBREW_PREFIX_PATH}" ! -type d -links 1 ||
+    brewau_die "could not take ownership of ${HOMEBREW_PREFIX_PATH}"
+  find -P "${HOMEBREW_PREFIX_PATH}" ! -type d ! -type l ! -path $'*\n*' \( -perm -g+w -o -perm -o+w \) \
     -exec stat -f '%Lp %N' {} + >>"${ORIGINAL_MODES_FILE}"
-  # Also removes ACLs: an ACL the previous owner set can still grant them
-  # write access. Homebrew does not use ACLs. Whoever could write here can
-  # still race this, so it never follows their symlinks.
   prefix_permission_change brewau_lock_tree "${HOMEBREW_PREFIX_PATH}" ||
     brewau_die "could not remove group/world write and ACLs from ${HOMEBREW_PREFIX_PATH}"
+  # brew services expects the log directory to exist before a user starts a service.
+  [[ ! -L "${HOMEBREW_PREFIX_PATH}/var" && ! -L "${HOMEBREW_PREFIX_PATH}/var/log" ]] ||
+    brewau_die "refusing symlink in ${HOMEBREW_PREFIX_PATH}/var/log"
+  install -d -o "${BREWAU_USER}" -g admin -m 0755 "${HOMEBREW_PREFIX_PATH}/var" "${HOMEBREW_PREFIX_PATH}/var/log"
 }
 
 # Whoever owned the prefix before could have changed Homebrew's code, which
@@ -820,77 +853,134 @@ stop_service_processes() {
 # Depth-first, so a directory changes hands only after everything in it and
 # the new owner never controls a path root still has to walk.
 return_cask_apps() {
-  local owner="$1" json app
+  local owner="$1" json app shared
   json="$(installed_casks_json)" || {
     log "WARNING: could not list installed casks; apps owned by ${BREWAU_USER} stay that way"
     return 0
   }
   while IFS= read -r app; do
+    shared="$(find -P "${app}" ! -type d -user "${BREWAU_USER}" -links +1 -print -quit)" ||
+      { rm -f "${json}"; return 1; }
+    if [[ -n "${shared}" ]]; then
+      echo "brewau: refusing to change a multiply linked entry: ${shared}" >&2
+      rm -f "${json}"
+      return 1
+    fi
     # Its pin (see brewau_pin_app) would keep the owner from removing it.
     chmod -h -a "${BREWAU_APP_ACL}" "${app}" 2>/dev/null || true
-    find -d "${app}" -user "${BREWAU_USER}" -exec chown -h "${owner}:admin" {} + 2>/dev/null ||
+    find -P -d "${app}" -user "${BREWAU_USER}" \( -type d -o -links 1 \) -exec chown -h "${owner}:admin" {} + 2>/dev/null ||
       log "WARNING: could not return ${app} to ${owner}"
   done < <(brewau_cask_app_paths "${json}")
   rm -f "${json}"
 }
 
-# Runs while the prefix still belongs to _brewau, so nobody can swap a path
-# for a symlink before root changes its mode.
-restore_prefix_modes() {
-  [[ -f "${ORIGINAL_MODES_FILE}" ]] || return 0
-  local line mode path
-  while IFS= read -r line; do
-    mode="${line%% *}"
-    path="${line#* }"
-    [[ "${mode}" =~ ^[0-7]{3,4}$ && "${path}" == "${HOMEBREW_PREFIX_PATH}"/* ]] || continue
-    [[ "${path}/" != */./* && "${path}/" != */../* ]] || continue
-    [[ -e "${path}" && ! -L "${path}" ]] && { chmod -h "${mode}" "${path}" 2>/dev/null || true; }
-  done <"${ORIGINAL_MODES_FILE}"
-  return 0
+# Reject any subtree whose directory could still be changed by an ordinary user.
+prefix_check_locked() {
+  local unsafe
+  prefix_check_parent || return 1
+  unsafe="$(find -P "${HOMEBREW_PREFIX_PATH}" -type d \
+    \( ! -user root ! -user "${BREWAU_USER}" -o -perm -g+w -o -perm -o+w -o -acl \) -prune -print -quit)" || return 1
+  [[ -z "${unsafe}" ]] || { echo "brewau: insecure directory in Homebrew prefix: ${unsafe}" >&2; return 1; }
 }
 
-# Formulae that run as Homebrew system daemons (root LaunchDaemons).
-system_service_names() {
-  local plist
-  for plist in /Library/LaunchDaemons/sh.brew.*.plist /Library/LaunchDaemons/homebrew.mxcl.*.plist; do
-    [[ -f "${plist}" ]] || continue
-    brewau_service_formula "${plist}" || true
-  done | sort -u
-}
-
-# Hands the prefix to its original owner. Everything inside a directory
-# changes hands before the directory itself, so the owner never controls a
-# directory root still has to walk. Kegs of system daemons go to root
-# instead, as `sudo brew services start` leaves them. That protects only the
-# keg (the owner controls the rest of the prefix, opt/ links included), so a
-# non-admin owner gets a warning.
+# Restore file modes while each parent is still secured. Do not visit a
+# directory again after restoring its mode and handing it back.
 return_prefix() {
-  local owner="$1" services keg name path
-  services="$(system_service_names)"
-  while IFS= read -r -d '' keg; do
-    name="${keg##*/}"
-    if brewau_in_words "${name}" "${services}"; then
-      # Restored modes may have brought back group/world write.
-      prefix_chown root -d "${keg}" || return 1
-      prefix_permission_change find -P "${keg}" ! -type l \( -perm -g+w -o -perm -o+w \) -exec chmod -h go-w {} + || return 1
-      log "${name} runs as a root system daemon, so its keg stays owned by root (upgrade or remove it with sudo)"
-    else
-      prefix_chown "${owner}" -d "${keg}" || return 1
-    fi
-  done < <(find "${HOMEBREW_PREFIX_PATH}/Cellar" -mindepth 1 -maxdepth 1 -print0 2>/dev/null)
-  for path in "${HOMEBREW_PREFIX_PATH}"/* "${HOMEBREW_PREFIX_PATH}"/.[!.]* "${HOMEBREW_PREFIX_PATH}"/..?*; do
-    [[ -e "${path}" || -L "${path}" ]] || continue
-    [[ "${path##*/}" != Cellar ]] || continue
-    prefix_chown "${owner}" -d "${path}" || return 1
+  local owner="$1" group="$2"
+  prefix_check_locked || return 1
+  prefix_permission_change /usr/bin/env -i PATH="${PATH}" /usr/bin/perl - \
+    "${HOMEBREW_PREFIX_PATH}" "${ORIGINAL_MODES_FILE}" "${owner}" "${group}" <<'PERL'
+use strict;
+use warnings;
+use Fcntl ':mode';
+use File::Find 'finddepth';
+
+my ($prefix, $journal, $owner, $group) = @ARGV;
+my $uid = getpwnam($owner);
+my $gid = getgrnam($group);
+die "brewau: invalid prefix owner or group\n" unless defined($uid) && defined($gid);
+
+my %modes;
+if (-e $journal) {
+    open my $log, '<', $journal or die "brewau: cannot read $journal: $!\n";
+    while (<$log>) {
+        chomp;
+        next unless /\A([0-7]{3,4}) (.*)\z/;
+        $modes{$2} = oct($1);
+    }
+    close $log or die "brewau: cannot close $journal: $!\n";
+}
+
+local $SIG{__WARN__} = sub { die @_ };
+for my $preflight (1, 0) {
+    finddepth({no_chdir => 1, wanted => sub {
+        my $path = $File::Find::name;
+        my @st = lstat($path);
+        die "brewau: cannot inspect $path: $!\n" unless @st;
+        my $chown = $st[4] != $uid || $st[5] != $gid;
+        my $mode = $modes{$path};
+        my $chmod = defined($mode) && !S_ISLNK($st[2]) && ($st[2] & 07777) != $mode;
+        return unless $chown || $chmod;
+        die "brewau: refusing to change a multiply linked entry: $path\n"
+            if !S_ISDIR($st[2]) && $st[3] > 1;
+        return if $preflight;
+        # Restore modes before chown clears set-ID bits during the handoff.
+        if ($chmod) {
+            system('/bin/chmod', '-h', sprintf('%04o', $mode), $path) == 0
+                or die "brewau: could not restore the mode of $path\n";
+        }
+        if ($chown) {
+            system('/usr/sbin/chown', '-h', "$uid:$gid", $path) == 0
+                or die "brewau: could not return ownership of $path\n";
+        }
+    }}, $prefix);
+}
+PERL
+}
+
+stop_system_job() {
+  local job="$1" details pid attempt
+  details="$(launchctl print "${job}" 2>/dev/null)" || return 0
+  pid="$(awk '$1 == "pid" && $2 == "=" && $3 ~ /^[0-9]+$/ { print $3; exit }' <<<"${details}")"
+  launchctl bootout "${job}" 2>/dev/null || true
+  if launchctl print "${job}" >/dev/null 2>&1; then return 1; fi
+  # Launchd can forget the registration before the last process exits.
+  [[ -n "${pid}" ]] || return 0
+  for ((attempt=0; attempt<50; attempt++)); do
+    kill -0 "${pid}" 2>/dev/null || return 0
+    sleep 0.2
   done
-  if [[ -e "${HOMEBREW_PREFIX_PATH}/Cellar" || -L "${HOMEBREW_PREFIX_PATH}/Cellar" ]]; then
-    prefix_chown "${owner}" "${HOMEBREW_PREFIX_PATH}/Cellar" -maxdepth 0 || return 1
-  fi
-  prefix_chown "${owner}" "${HOMEBREW_PREFIX_PATH}" -maxdepth 0 || return 1
-  if [[ -n "${services}" ]] && ! dseditgroup -o checkmember -m "${owner}" admin >/dev/null 2>&1; then
-    log "WARNING: ${owner} is not an administrator but owns ${HOMEBREW_PREFIX_PATH}, which root system daemons run from"
-    log "  (${services//$'\n'/ }). Stop them unless ${owner} is trusted with root: sudo brew services stop <formula>"
-  fi
+  ! kill -0 "${pid}" 2>/dev/null
+}
+
+stop_prefix_daemons() {
+  local plist label formula strings job action restart
+  for plist in "$@"; do
+    [[ -f "${plist}" ]] || continue
+    case "${plist##*/}" in com.kastruppro.brewau.*) continue ;; esac
+    formula="$(brewau_service_formula "${plist}")" || formula=""
+    if [[ -z "${formula}" ]]; then
+      strings="$(brewau_plist_strings "${plist}")" || return 1
+      [[ "${strings}" == *"${HOMEBREW_PREFIX_PATH}/"* ]] || continue
+    fi
+    label="$(plutil -extract Label raw -expect string -o - "${plist}")" || return 1
+    [[ "${label}" =~ ^[A-Za-z0-9][A-Za-z0-9._@+-]*$ ]] || return 1
+    job="system/${label}"
+    action=Disabled
+    if launchctl print "${job}" >/dev/null 2>&1; then action=Stopped; fi
+    launchctl disable "${job}" || return 1
+    if ! stop_system_job "${job}" || launchctl print "${job}" >/dev/null 2>&1; then
+      echo "brewau: could not stop ${job}" >&2
+      return 1
+    fi
+    if [[ -n "${formula}" ]]; then
+      restart="sudo brew services start ${formula}"
+    else
+      printf -v restart 'sudo launchctl enable %q && sudo launchctl bootstrap system %q' "${job}" "${plist}"
+    fi
+    log "${action} ${job}. Restart after uninstall with: ${restart}"
+    logger -t brewau "Uninstall: ${action} ${job}. Restart with: ${restart}"
+  done
 }
 
 cmd_uninstall() {
@@ -907,23 +997,33 @@ cmd_uninstall() {
   # Close every way into ${BREWAU_USER} (and so root) before the prefix becomes
   # user-writable again; otherwise a user could edit Homebrew's code and run
   # it through the still-valid policy rule.
-  launchctl bootout "system/${BREWAU_LABEL}" 2>/dev/null || true
-  launchctl bootout system/com.kastruppro.brewau.scan 2>/dev/null || true
-  launchctl bootout system/com.kastruppro.brewau.scheduler 2>/dev/null || true
-  launchctl bootout "system/${SELF_UPDATE_LABEL}" 2>/dev/null || true
-  launchctl bootout "system/${FINISH_LABEL}" 2>/dev/null || true
+  local label
+  launchctl print system >/dev/null 2>&1 || brewau_die "could not inspect system LaunchDaemons"
+  for label in "${BREWAU_LABEL}" com.kastruppro.brewau.scan com.kastruppro.brewau.scheduler \
+    "${SELF_UPDATE_LABEL}" "${FINISH_LABEL}"; do
+    stop_system_job "system/${label}" || brewau_die "could not stop system/${label}"
+  done
   rm -f "${BREWAU_SUDOERS}"
   stop_service_processes
+
+  local return_homebrew=0
+  if [[ -n "${owner}" ]] && id "${owner}" >/dev/null 2>&1 && [[ -d "${HOMEBREW_PREFIX_PATH}" ]]; then
+    stop_prefix_daemons /Library/LaunchDaemons/*.plist ||
+      brewau_die "could not stop all system daemons that use Homebrew. The prefix remains protected"
+    prefix_check_locked || brewau_die "could not verify that ${HOMEBREW_PREFIX_PATH} is protected"
+    return_homebrew=1
+  fi
   # While the prefix still belongs to _brewau, so copies into it are safe.
   restore_users "${owner}"
 
-  if [[ -n "${owner}" ]] && id "${owner}" >/dev/null 2>&1 && [[ -d "${HOMEBREW_PREFIX_PATH}" ]]; then
-    return_cask_apps "${owner}"
-    restore_prefix_modes
+  if [[ ${return_homebrew} == 1 ]]; then
+    return_cask_apps "${owner}" || brewau_die "could not safely return cask apps to ${owner}"
     # brewau's own cask record; the cask has no uninstall steps of its own.
+    [[ ! -L "${HOMEBREW_PREFIX_PATH}/Caskroom" ]] ||
+      brewau_die "refusing symlink in ${HOMEBREW_PREFIX_PATH}/Caskroom"
     rm -rf "${HOMEBREW_PREFIX_PATH}/Caskroom/brewau"
     log "returning ${HOMEBREW_PREFIX_PATH} to ${owner}"
-    return_prefix "${owner}"
+    return_prefix "${owner}" admin || brewau_die "could not return ${HOMEBREW_PREFIX_PATH} to ${owner}"
   else
     log "WARNING: could not determine original owner; ${HOMEBREW_PREFIX_PATH} is still owned by ${BREWAU_USER}"
     log "fix with: sudo chown -hR <you>:admin ${HOMEBREW_PREFIX_PATH}"

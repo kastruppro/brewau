@@ -777,10 +777,10 @@ brewau_lock_tree() {
   brewau_locked_files "${root}" -links 1 ! -user root ! -user "${BREWAU_USER}" \
     \( -flags +uchg -o -flags +uappnd \) -exec /usr/bin/chflags -h nouchg,nouappnd {} + || return 1
   brewau_locked_files "${root}" -links 1 ! -user root ! -user "${BREWAU_USER}" -exec /usr/sbin/chown -h "${BREWAU_USER}:admin" {} + || return 1
-  brewau_locked_files "${root}" ! -type l \( -links 1 -o -user "${BREWAU_USER}" \) \( -perm -g+w -o -perm -o+w \) \
+  brewau_locked_files "${root}" ! -type l -links 1 \( -perm -g+w -o -perm -o+w \) \
     -exec /bin/chmod -h go-w {} + || return 1
   # chmod go-w leaves ACL entries alone, and an ACL can grant write too.
-  brewau_locked_files "${root}" ! -type l \( -links 1 -o -user "${BREWAU_USER}" \) -acl -exec /bin/chmod -h -N {} + || return 1
+  brewau_locked_files "${root}" ! -type l -links 1 -acl -exec /bin/chmod -h -N {} + || return 1
   local remaining
   remaining="$(find "${root}" ! -type l \( ! -user root ! -user "${BREWAU_USER}" -o -perm -g+w -o -perm -o+w -o -acl \) -print)" || return 1
   if [[ -n "${remaining}" ]]; then

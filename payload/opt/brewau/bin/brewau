@@ -50,6 +50,7 @@ Administrator commands (run with sudo):
   move-service-data <user> <formula>
                       copy a service's data from before brewau to where it now runs
   uninstall           remove brewau and return Homebrew to its original owner
+                      stops root services using Homebrew and prints restart commands
 EOF
 }
 

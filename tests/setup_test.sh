@@ -6,6 +6,7 @@ set -u
 HERE="$(cd "$(dirname "$0")" && pwd -P)"
 PAYLOAD="${HERE}/../payload/opt/brewau"
 WORK="$(mktemp -d)"
+WORK="$(cd "${WORK}" && pwd -P)"
 trap 'chmod -RN "${WORK}" 2>/dev/null; rm -rf "${WORK}"' EXIT
 PASS=0
 FAIL=0
@@ -26,7 +27,7 @@ check() {
   fi
 }
 
-# --- restore_prefix_modes ----------------------------------------------------
+# --- return_prefix ----------------------------------------------------
 HOMEBREW_PREFIX_PATH="${WORK}/prefix"
 ORIGINAL_MODES_FILE="${WORK}/original-modes"
 mkdir -p "${HOMEBREW_PREFIX_PATH}/var/with  spaces " "${WORK}/outside"
@@ -34,22 +35,35 @@ touch "${HOMEBREW_PREFIX_PATH}/file" "${WORK}/outside/target"
 chmod 755 "${HOMEBREW_PREFIX_PATH}/var/with  spaces "
 chmod 644 "${HOMEBREW_PREFIX_PATH}/file" "${WORK}/outside/target"
 ln -s "${WORK}/outside/target" "${HOMEBREW_PREFIX_PATH}/link"
+ln -s "${WORK}/outside" "${HOMEBREW_PREFIX_PATH}/linked-dir"
 cat >"${ORIGINAL_MODES_FILE}" <<MODES
 775 ${HOMEBREW_PREFIX_PATH}/var/with  spaces 
 664 ${HOMEBREW_PREFIX_PATH}/file
 777 ${HOMEBREW_PREFIX_PATH}/link
+777 ${HOMEBREW_PREFIX_PATH}/linked-dir/target
 777 ${WORK}/outside/target
 777 ${HOMEBREW_PREFIX_PATH}/../outside/target
 700 ${HOMEBREW_PREFIX_PATH}/..
 700 ${HOMEBREW_PREFIX_PATH}/var/.
 MODES
 chmod 755 "${WORK}"
-restore_prefix_modes
+BREWAU_USER="$(id -un)"
+return_prefix "${BREWAU_USER}" "$(id -gn)"
 check "775" "$(stat -f '%Lp' "${HOMEBREW_PREFIX_PATH}/var/with  spaces ")" "a path with spaces gets its mode back"
 check "664" "$(stat -f '%Lp' "${HOMEBREW_PREFIX_PATH}/file")" "a file gets its mode back"
 check "644" "$(stat -f '%Lp' "${WORK}/outside/target")" "symlinks and paths outside the prefix are left alone"
 check "755 755" "$(stat -f '%Lp' "${WORK}" "${HOMEBREW_PREFIX_PATH}/var" | tr '\n' ' ' | sed 's/ $//')" \
   "paths ending in /. or /.. are refused"
+
+chmod 755 "${HOMEBREW_PREFIX_PATH}/var/with  spaces "
+ln "${WORK}/outside/target" "${HOMEBREW_PREFIX_PATH}/shared"
+printf '666 %s\n' "${HOMEBREW_PREFIX_PATH}/shared" >>"${ORIGINAL_MODES_FILE}"
+got="$(return_prefix "${BREWAU_USER}" "$(id -gn)" 2>&1)"
+check "1" "$?" "uninstall refuses to restore modes through a hard link"
+check "yes" "$([[ "${got}" == *"multiply linked entry: ${HOMEBREW_PREFIX_PATH}/shared"* ]] && echo yes || echo "${got}")" \
+  "uninstall identifies the shared inode"
+check "644 755" "$(stat -f '%Lp' "${WORK}/outside/target" "${HOMEBREW_PREFIX_PATH}/var/with  spaces " | tr '\n' ' ' | sed 's/ $//')" \
+  "hard-link preflight leaves file modes unchanged"
 
 # --- trust-app ---------------------------------------------------------------
 require_root() { :; }
@@ -78,7 +92,14 @@ cat >"${WORK}/tools/chown" <<'CHOWN'
 printf '%s\n' "$@" >>"${0%/*}/chown.calls"
 for path in "$@"; do
   case "$path" in
-    */CodeResources) echo "chown: $path: Operation not permitted" >&2; exit 1 ;;
+    */CodeResources)
+      if [[ "$(stat -f %Lp "${path%/*}")" != 755 ]] || /usr/bin/find -P "${path%/*}" -maxdepth 0 -acl -print | grep -q .; then
+        echo "chown reached a file before its parent was secured" >&2
+        exit 1
+      fi
+      echo "chown: $path: Operation not permitted" >&2
+      exit 1
+      ;;
   esac
 done
 CHOWN
@@ -90,9 +111,10 @@ prefix_repair() (
   ORIGINAL_MODES_FILE="${WORK}/prefix-modes"
   # Use the test user's group as the expected group, or wheel to simulate a mismatch.
   find() {
-    local arg args=()
+    local expected_group="${group}" arg args=()
+    [[ " $* " == *" -links 1 "* ]] || expected_group="$(id -gn)"
     for arg in "$@"; do
-      [[ "${arg}" != admin ]] || arg="$group"
+      [[ "${arg}" != admin ]] || arg="${expected_group}"
       args+=("${arg}")
     done
     /usr/bin/find "${args[@]}"
@@ -105,12 +127,79 @@ prefix_repair() (
 got="$(prefix_repair "$(id -gn)" 2>&1)"
 check "0" "$?" "repair succeeds when already-correct app files would reject a chown"
 check "yes" "$([[ ! -e "${WORK}/tools/chown.calls" ]] && echo yes || echo no)" "chown never sees the correctly owned protected bundle"
+chmod g+w "${PROTECTED}/Contents"
+chmod +a "everyone allow add_file" "${PROTECTED}/Contents"
 got="$(prefix_repair wheel 2>&1)"
 check "1" "$?" "repair stops when a required group change is denied"
 check "yes" "$([[ "${got}" == *"${PROTECTED}/Contents/CodeResources"*"Operation not permitted"*"macOS App Management"* ]] && echo yes || echo "${got}")" \
   "repair identifies the protected file and possible App Management denial"
 check "yes" "$(grep -qxF -- '-h' "${WORK}/tools/chown.calls" && ! grep -qF 'link/marker' "${WORK}/tools/chown.calls" && echo yes)" \
   "ownership changes never follow the prefix symlink"
+
+ln "${WORK}/external/marker" "${WORK}/protected-prefix/shared"
+chmod g+w "${WORK}/external/marker"
+got="$(prefix_repair "$(id -gn)" 2>&1)"
+check "1" "$?" "takeover refuses to remove write bits from a shared inode"
+check "yes" "$([[ "${got}" == *"multiply linked entry: ${WORK}/protected-prefix/shared"* ]] && echo yes || echo "${got}")" \
+  "takeover identifies the shared inode"
+check "664" "$(stat -f %Lp "${WORK}/external/marker")" "takeover leaves the external inode alone"
+
+# --- uninstall stops system services before opening the prefix -------------
+mkdir -p "${WORK}/daemons"
+BREWAU_PLIST_FIXTURE="${WORK}/daemons/sh.brew.test.plist"
+OTHER_PLIST_FIXTURE="${WORK}/daemons/com.example.other.plist"
+plutil -create xml1 "${BREWAU_PLIST_FIXTURE}"
+plutil -insert Label -string sh.brew.test "${BREWAU_PLIST_FIXTURE}"
+plutil -create xml1 "${OTHER_PLIST_FIXTURE}"
+plutil -insert Label -string com.example.other "${OTHER_PLIST_FIXTURE}"
+plutil -insert Program -string "${HOMEBREW_PREFIX_PATH}/bin/custom" "${OTHER_PLIST_FIXTURE}"
+uninstall_daemon_fixture() (
+  local deny_stop="$1" live_pid="${2:-no}"
+  HOMEBREW_PREFIX_PATH="${WORK}/daemon-prefix"
+  mkdir -p "${HOMEBREW_PREFIX_PATH}"
+  plutil -replace Program -string "${HOMEBREW_PREFIX_PATH}/bin/custom" "${OTHER_PLIST_FIXTURE}"
+  local stopped="${WORK}/stopped"
+  mkdir -p "${stopped}"
+  ORIGINAL_OWNER_FILE="${WORK}/handoff-owner"
+  printf '%s\n' "${BREWAU_USER}" >"${ORIGINAL_OWNER_FILE}"
+  BREWAU_SUDOERS="${WORK}/not-live.sudoers"
+  brewau_managed() { return 1; }
+  launchctl() {
+    case "$1:$2" in
+      print:system) return 0 ;;
+      print:system/*)
+        [[ ! -e "${stopped}/${2#system/}" ]] || return 1
+        if [[ "$2" == system/sh.brew.test && "${live_pid}" == yes ]]; then echo "pid = 123"; fi
+        ;;
+      disable:system/*) echo "disable $2" ;;
+      bootout:system/*)
+        echo "bootout $2"
+        [[ "$2" != "${deny_stop}" ]] || return 1
+        touch "${stopped}/${2#system/}"
+        ;;
+    esac
+  }
+  kill() { [[ "$*" == "-0 123" ]]; }
+  sleep() { :; }
+  logger() { printf 'logged %s\n' "$*"; }
+  eval "$(declare -f stop_prefix_daemons | sed '1s/stop_prefix_daemons/fixture_stop_prefix_daemons/')"
+  stop_prefix_daemons() { fixture_stop_prefix_daemons "${BREWAU_PLIST_FIXTURE}" "${OTHER_PLIST_FIXTURE}"; }
+  stop_service_processes() { :; }
+  restore_users() { echo "restore users"; }
+  return_cask_apps() { :; }
+  return_prefix() { echo "return prefix"; return 1; }
+  cmd_uninstall
+)
+got="$(uninstall_daemon_fixture system/sh.brew.test 2>&1)"
+check "yes" "$([[ "${got}" == *"could not stop system/sh.brew.test"* && "${got}" != *"restore users"* && "${got}" != *"return prefix"* ]] && echo yes || echo "${got}")" \
+  "a root daemon that cannot stop prevents the prefix handoff"
+got="$(uninstall_daemon_fixture never yes 2>&1)"
+check "yes" "$([[ "${got}" == *"could not stop system/sh.brew.test"* && "${got}" != *"return prefix"* ]] && echo yes || echo "${got}")" \
+  "uninstall waits for the reported daemon process to exit"
+rm -f "${WORK}/stopped/sh.brew.test"
+got="$(uninstall_daemon_fixture never 2>&1)"
+check "yes" "$([[ "${got}" == *"Stopped system/sh.brew.test"*"sudo brew services start test"*"Stopped system/com.example.other"*"sudo launchctl bootstrap system"*"logged -t brewau"*"restore users"*"return prefix"* ]] && echo yes || echo "${got}")" \
+  "uninstall stops and reports Homebrew and custom prefix-backed daemons before handoff"
 
 # --- sudoers: only fixed agent verbs for members ------------------------------
 sudoers="$(
