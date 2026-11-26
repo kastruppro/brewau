@@ -4,31 +4,33 @@ All notable changes to brewau. The format follows [Keep a Changelog](https://kee
 and versions follow [Semantic Versioning](https://semver.org/). Details of each finding behind
 0.4.0 are in [FIXES.md](FIXES.md).
 
-## [Unreleased]
+## [0.10.0] - 2026-11-26
 
 ### Added
 
-- Pending app protection is recorded in `state/pending-protection.json`; the menu bar app retries
-  it through `brewau-agent protect`. An app-first PPPC profile and DDM example are in `mdm/`.
+- When App Management prevents the daemon from protecting an app, brewau records pending
+  protection in `state/pending-protection.json`. The menu bar app retries it in the user's
+  session through `brewau-agent protect`; upgrades needing protection first are deferred.
+- An app-first App Management PPPC profile and DDM example are available in `mdm/`.
 
 ### Changed
 
 - `brewau-agent` is signed with the stable identifier `com.kastruppro.brewau.agent`.
-- Uninstall refuses a non-admin original owner, resumes interrupted handoffs, and explains
-  App Management refusals. Existing Homebrew system services keep running.
+- A Homebrew upgrade blocked by App Management is reported separately from pending protection,
+  with guidance to upgrade manually or use MDM.
+- Uninstall requires the original Homebrew owner to be a member of the local admin group
+  (GID 80), resumes interrupted handoffs, and explains App Management refusals. Existing
+  Homebrew system services keep running. Setup operations are serialized with a lock.
 
 ### Fixed
 
-- Prefix takeover and uninstall no longer follow a swapped parent or change a hard-linked
-  file outside the prefix.
-- Package installation no longer aborts over redundant permission changes to App Management
-  protected bundles in the Homebrew prefix (such as `tart.app` in the Cellar). Prefix takeover
-  and uninstall change only ownership, modes and ACLs that need changing, and report a clear
-  App Management message if a required change is refused.
-- Manual App Management grants never reached the daemon's `_brewau` account. The menu bar app
-  now requests pending protection in the user's session.
-- App restart waits for slow-quitting apps and reopens them; updated but unprotected apps are
-  no longer shown as blocked, and repeated block log messages are suppressed.
+- User App Management grants did not reach the daemon's `_brewau` account; the app now requests
+  pending protection in the user's session. Updated but unprotected apps are no longer shown as
+  blocked, and repeated block log messages are suppressed.
+- App restart waits for slow-quitting apps before reopening them.
+- Prefix takeover and uninstall no longer follow a swapped parent or change a hard-linked file
+  outside the prefix. They skip unnecessary ownership, mode and ACL changes and explain refused
+  required changes, including on App Management-protected bundles inside the Homebrew prefix.
 
 ## [0.9.1] - 2026-11-17
 

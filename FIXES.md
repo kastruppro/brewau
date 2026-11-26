@@ -59,9 +59,9 @@ All fixed items have tests (`make test`) except where root is needed (noted).
 - Open write handles from before the prefix takeover survive it (pre-existing; see
   [REVIEW-NOTES.md](REVIEW-NOTES.md)). A clean boundary would replace previously writable files
   with fresh inodes at install time.
-- After a complete install, live verify that app-launched protection is checked against the
-  app's App Management grant,
-  that MDM/DDM delivery works, and whether the agent PPPC entry lets the daemon protect at night.
+- [x] Verified on 2026-11-26 on the owner's Mac (macOS 27.2): protection launched from the menu
+  bar app set the ACL on `/Applications/Paseo.app` after the daemon was refused.
+- Live verify MDM/DDM delivery and whether the agent PPPC entry lets the daemon protect at night.
 - Live test blocking, offline behaviour and notifications on an installed build. The App
   Management block test is still pending: Docker updated itself before it could be reproduced.
   It can be verified with Paseo on the owner’s Mac after installation.
