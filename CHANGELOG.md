@@ -17,6 +17,10 @@ and versions follow [Semantic Versioning](https://semver.org/). Details of each 
 
 ### Fixed
 
+- Package installation no longer aborts over redundant permission changes to App Management
+  protected bundles in the Homebrew prefix (such as `tart.app` in the Cellar). Prefix takeover
+  and uninstall change only ownership, modes and ACLs that need changing, and report a clear
+  App Management message if a required change is refused.
 - Manual App Management grants never reached the daemon's `_brewau` account. The menu bar app
   now requests pending protection in the user's session.
 - App restart waits for slow-quitting apps and reopens them; updated but unprotected apps are

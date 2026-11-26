@@ -48,12 +48,16 @@ All fixed items have tests (`make test`) except where root is needed (noted).
 
 ### App Management redesign
 
+- [x] Live testing on 2026-11-25 found that redundant permission changes to a protected app
+  bundle in the Homebrew Cellar could abort installation. Prefix takeover and uninstall now
+  skip unnecessary ownership, mode and ACL changes and explain refused required changes.
 - [x] Record pending protection, retry it from the menu bar app through the signed agent, and
   ship an app-first PPPC profile and DDM example.
 
 ### Open follow-ups
 
-- Live verify that app-launched protection is checked against the app's App Management grant,
+- After a complete install, live verify that app-launched protection is checked against the
+  app's App Management grant,
   that MDM/DDM delivery works, and whether the agent PPPC entry lets the daemon protect at night.
 - Live test blocking, offline behaviour and notifications on an installed build. The App
   Management block test is still pending: Docker updated itself before it could be reproduced.
