@@ -49,7 +49,7 @@ cat >"${ORIGINAL_MODES_FILE}" <<MODES
 MODES
 chmod 755 "${WORK}"
 BREWAU_USER="$(id -un)"
-return_prefix "${BREWAU_USER}" "$(id -gn)"
+return_prefix "$(id -u)" "$(id -g)"
 check "775" "$(stat -f '%Lp' "${HOMEBREW_PREFIX_PATH}/var/with  spaces ")" "a path with spaces gets its mode back"
 check "664" "$(stat -f '%Lp' "${HOMEBREW_PREFIX_PATH}/file")" "a file gets its mode back"
 check "644" "$(stat -f '%Lp' "${WORK}/outside/target")" "symlinks and paths outside the prefix are left alone"
@@ -60,7 +60,7 @@ rm -f "${UNINSTALL_PROGRESS}"
 chmod 755 "${HOMEBREW_PREFIX_PATH}/var/with  spaces "
 ln "${WORK}/outside/target" "${HOMEBREW_PREFIX_PATH}/shared"
 printf '666 %s\n' "${HOMEBREW_PREFIX_PATH}/shared" >>"${ORIGINAL_MODES_FILE}"
-got="$(return_prefix "${BREWAU_USER}" "$(id -gn)" 2>&1)"
+got="$(return_prefix "$(id -u)" "$(id -g)" 2>&1)"
 check "1" "$?" "uninstall refuses to restore modes through a hard link"
 check "yes" "$([[ "${got}" == *"multiply linked entry: ${HOMEBREW_PREFIX_PATH}/shared"* ]] && echo yes || echo "${got}")" \
   "uninstall identifies the shared inode"
@@ -153,15 +153,101 @@ got="$( (
   ORIGINAL_OWNER_FILE="${WORK}/handoff-owner"
   printf '%s\n' original-user >"${ORIGINAL_OWNER_FILE}"
   brewau_managed() { return 1; }
-  id() { [[ "$1" == -Gn ]] && echo "staff brewau_users"; }
+  id() {
+    if [[ "$*" == "-u -- original-user" ]]; then echo 501
+    elif [[ "$*" == "-G -- original-user" ]]; then echo "20 998"
+    elif [[ "$*" == "-Gn -- original-user" ]]; then echo "staff admin"
+    else return 1
+    fi
+  }
   launchctl() { echo "unexpected launchctl"; return 1; }
   rm() { echo "unexpected rm"; return 1; }
   cmd_uninstall
   ) 2>&1
 )"
 check "1" "$?" "uninstall refuses to return the prefix to a non-admin"
-check "brewau: original Homebrew owner original-user is not a member of the admin group. Uninstall made no changes" \
+check "brewau: original Homebrew owner original-user is not a member of the local admin group (GID 80). Uninstall made no changes" \
   "${got}" "uninstall rejects the owner before touching any services or files"
+
+# --- stable original owner identity ----------------------------------------
+recorded_owner() (
+  ORIGINAL_OWNER_FILE="${WORK}/identity-owner"
+  local fixture_guid=A1234567-1234-ABCD-1234-123456789012
+  printf 'former-name\n502\n%s\n' "${fixture_guid}" >"${ORIGINAL_OWNER_FILE}"
+  dscl() {
+    case "$2:$3:$4" in
+      -list:/Users:GeneratedUID)
+        [[ "$1" == . ]] || return 1
+        if [[ "${deleted:-no}" == no ]]; then printf 'renamed-user\t%s\n' "${fixture_guid}"
+        else printf 'former-name\t00000000-0000-0000-0000-000000000000\n'
+        fi
+        ;;
+      -read:/Users/renamed-user:GeneratedUID) printf 'GeneratedUID: %s\n' "${fixture_guid}" ;;
+      *) return 1 ;;
+    esac
+  }
+  id() {
+    if [[ "$*" == "-u -- renamed-user" || "$*" == "-u -- former-name" ]]; then echo 502
+    elif [[ "$*" == "-G -- former-name" ]]; then echo "20 80"
+    else return 1
+    fi
+  }
+  case "$1" in
+    renamed) original_owner ;;
+    replaced)
+      HOMEBREW_PREFIX_PATH="${WORK}/guard-prefix"
+      brewau_managed() { return 1; }
+      launchctl() { echo "unexpected launchctl"; return 1; }
+      deleted=yes
+      cmd_uninstall
+      ;;
+    legacy) printf 'former-name\n' >"${ORIGINAL_OWNER_FILE}"; original_owner ;;
+  esac
+)
+check $'renamed-user\t502' "$(recorded_owner renamed)" "the recorded UUID resolves a renamed local owner"
+got="$(recorded_owner replaced 2>&1)"
+check "1" "$?" "uninstall refuses a deleted original account even when the short name was recorded"
+check "brewau: the recorded original Homebrew account no longer exists or could not be verified. Uninstall made no changes" \
+  "${got}" "uninstall stops before changes if the recorded identity cannot be verified"
+check $'former-name\t' "$(recorded_owner legacy)" "name-only records still fall back to the recorded name"
+
+# --- one setup lock for install, reload and uninstall -----------------------
+SETUP_LOCK="${WORK}/setup.lock"
+/usr/bin/perl -MFcntl=:flock -e '
+  open my $lock, ">>", $ARGV[0] or die $!;
+  flock($lock, LOCK_EX) or die $!;
+  open my $ready, ">", $ARGV[1] or die $!;
+  close $ready;
+  sleep 10;
+' "${SETUP_LOCK}" "${WORK}/setup-lock-ready" &
+lock_pid=$!
+for ((i=0; i<50; i++)); do
+  [[ -e "${WORK}/setup-lock-ready" ]] && break
+  sleep 0.02
+done
+got="$(with_setup_lock 0 /usr/bin/touch "${WORK}/setup-ran" 2>&1)"
+check "yes" "$([[ "${got}" == *"setup is busy"* && ! -e "${WORK}/setup-ran" ]] && echo yes || echo "${got}")" \
+  "another lifecycle operation holds the lock until it exits"
+with_setup_lock 1 /usr/bin/touch "${WORK}/setup-ran" >"${WORK}/setup-wait.log" 2>&1
+check "yes" "$(grep -Fq 'setup is busy' "${WORK}/setup-wait.log" && [[ ! -e "${WORK}/setup-ran" ]] && echo yes)" \
+  "a deferred setup worker times out if the active operation still holds the lock"
+with_setup_lock 5 /usr/bin/touch "${WORK}/setup-ran" &
+wait_pid=$!
+kill "${lock_pid}" 2>/dev/null
+wait "${lock_pid}" 2>/dev/null
+wait "${wait_pid}"
+check "yes" "$([[ -e "${WORK}/setup-ran" ]] && echo yes)" "deferred setup runs after the lock is released"
+rm -f "${WORK}/setup-ran"
+with_setup_lock 0 /usr/bin/perl -MFcntl=:flock -e '
+  open my $lock, "+<", $ARGV[0] or die $!;
+  exit(flock($lock, LOCK_EX | LOCK_NB) ? 1 : 7)
+' "${SETUP_LOCK}"
+check "7" "$?" "the flock stays held through the worker and its status is returned"
+rm -f "${SETUP_LOCK}"
+ln -s "${WORK}/setup-target" "${SETUP_LOCK}"
+got="$(with_setup_lock 0 /usr/bin/touch "${WORK}/setup-ran" 2>&1)"
+check "yes" "$([[ "${got}" == *"could not open the setup lock"* && ! -e "${WORK}/setup-target" && ! -e "${WORK}/setup-ran" ]] && echo yes || echo "${got}")" \
+  "a symlink lock is rejected before the setup worker starts"
 
 # --- resume after an App Management refusal -------------------------------
 HOMEBREW_PREFIX_PATH="${WORK}/retry-prefix"
@@ -178,14 +264,15 @@ if [[ "$3" == */tart.app && ! -e "${0%/*}/app-management-granted" ]]; then
   echo "chown: $3: Operation not permitted" >&2
   exit 1
 fi
+[[ "$1" == -hn && "$2" =~ ^[0-9]+:[0-9]+$ ]] || exit 1
 printf '%s\n' "$3" >>"${0%/*}/uninstall-chown.calls"
 CHOWN
 chmod +x "${WORK}/tools/uninstall-chown"
 fixture_handoff() (
-  local group=wheel
-  [[ "$(id -gn)" == wheel ]] && group=staff
+  local group=0
+  [[ "$(id -g)" == 0 ]] && group=20
   eval "$(declare -f return_prefix | sed "s#/usr/sbin/chown#${WORK}/tools/uninstall-chown#g")"
-  return_prefix "${BREWAU_USER}" "${group}"
+  return_prefix "$(id -u)" "${group}"
 )
 got="$(fixture_handoff 2>&1)"
 check "1" "$?" "uninstall stops when macOS refuses a required owner change"
@@ -193,17 +280,35 @@ check "yes" "$([[ "${got}" == *"${HOMEBREW_PREFIX_PATH}/tart.app"*"Terminal"*"Ap
   "uninstall identifies the denied path and tells the user how to resume"
 check "775 775" "$(stat -f %Lp "${HOMEBREW_PREFIX_PATH}/already-returned" "${HOMEBREW_PREFIX_PATH}/tart.app" | paste -sd ' ' -)" \
   "the first directory was handed back and the pending directory mode changed before chown failed"
+# A completed record must match the current inode, even within the same prefix.
+mv "${HOMEBREW_PREFIX_PATH}/already-returned" "${WORK}/saved-returned"
+mkdir "${HOMEBREW_PREFIX_PATH}/already-returned"
+got="$(fixture_handoff 2>&1)"
+check "yes" "$([[ "${got}" == *"completed directory has changed: ${HOMEBREW_PREFIX_PATH}/already-returned"* ]] && echo yes || echo "${got}")" \
+  "replacement directory cannot be skipped by a completed record"
+rmdir "${HOMEBREW_PREFIX_PATH}/already-returned"
+mv "${WORK}/saved-returned" "${HOMEBREW_PREFIX_PATH}/already-returned"
+
+# A short append must leave the preceding ready checkpoint usable.
+printf 'done\tincomplete' >>"${UNINSTALL_PROGRESS}"
 # Check that a retry neither descends into completed directories nor resets their files.
 chmod 644 "${HOMEBREW_PREFIX_PATH}/already-returned/file"
 touch "${WORK}/tools/app-management-granted"
 : >"${WORK}/tools/uninstall-chown.calls"
 got="$(fixture_handoff 2>&1)"
-check "0" "$?" "uninstall resumes successfully after the user grants access"
+check "0" "$?" "uninstall discards the torn append and resumes after the user grants access"
 check "644 775" "$(stat -f %Lp "${HOMEBREW_PREFIX_PATH}/already-returned/file" "${HOMEBREW_PREFIX_PATH}/tart.app" | paste -sd ' ' -)" \
   "the retry skips the completed subtree and finishes the refused handoff"
 check "yes" "$(grep -Fxq "${HOMEBREW_PREFIX_PATH}/tart.app" "${WORK}/tools/uninstall-chown.calls" &&
   ! grep -Fq "${HOMEBREW_PREFIX_PATH}/already-returned" "${WORK}/tools/uninstall-chown.calls" && echo yes)" \
   "the retry only changes the refused directory and its unfinished ancestors"
+
+mv "${HOMEBREW_PREFIX_PATH}" "${WORK}/previous-prefix"
+mkdir -p "${HOMEBREW_PREFIX_PATH}/tart.app" "${HOMEBREW_PREFIX_PATH}/already-returned"
+got="$(fixture_handoff 2>&1)"
+check "0" "$?" "progress for a replaced prefix is discarded"
+check "775 775" "$(stat -f %Lp "${HOMEBREW_PREFIX_PATH}/already-returned" "${HOMEBREW_PREFIX_PATH}/tart.app" | paste -sd ' ' -)" \
+  "both directories in the replacement prefix are handed back"
 
 # --- sudoers: only fixed agent verbs for members ------------------------------
 sudoers="$(

@@ -20,6 +20,19 @@ if [[ ! -x /opt/homebrew/bin/brew ]]; then
   exit 1
 fi
 
+# Check before PackageKit replaces the payload. Postinstall takes the same lock for setup.
+/usr/bin/env -i PATH="${PATH}" /usr/bin/perl -e '
+    use Fcntl qw(:flock O_CREAT O_RDWR O_NOFOLLOW O_NONBLOCK);
+    sysopen(my $lock, "/opt/.brewau-setup.lock", O_CREAT | O_RDWR | O_NOFOLLOW | O_NONBLOCK, 0600)
+        or die "brewau: could not open the setup lock: $!\n";
+    my @st = stat($lock);
+    @st && -f _ && $st[3] == 1 && $st[4] == 0 && !($st[2] & 022)
+        or die "brewau: invalid setup lock\n";
+    flock($lock, LOCK_EX | LOCK_NB) or die "brewau: setup is busy. Try again when it finishes.\n";
+    die "brewau: uninstall is in progress. Run sudo brewau uninstall again before reinstalling.\n"
+        if -e "/opt/brewau/etc/uninstall-progress";
+' || exit 1
+
 # brewau-agent self-update installs this package while it holds the operation
 # lock, so no scan or upgrade can be busy; it writes its PID here (root-only).
 self_update_running() {

@@ -26,6 +26,8 @@ ORIGINAL_OWNER_FILE="${BREWAU_ROOT}/etc/original-owner"
 # uninstall can put them back.
 ORIGINAL_MODES_FILE="${BREWAU_ROOT}/etc/original-modes"
 UNINSTALL_PROGRESS="${BREWAU_ROOT}/etc/uninstall-progress"
+# Keep the same inode even while uninstall removes BREWAU_ROOT.
+SETUP_LOCK="/opt/.brewau-setup.lock"
 # Written after the first successful install. Users are only granted access
 # automatically before it exists, so `deny-user` survives upgrades.
 INSTALLED_MARKER="${BREWAU_ROOT}/etc/installed"
@@ -246,13 +248,42 @@ prefix_lock_directories() (
   done
 )
 
+owner_generated_uid() {
+  local guid
+  guid="$(dscl . -read "/Users/$1" GeneratedUID 2>/dev/null)" || return 1
+  guid="${guid#GeneratedUID: }"
+  [[ "${guid}" =~ ^[[:xdigit:]]{8}(-[[:xdigit:]]{4}){3}-[[:xdigit:]]{12}$ ]] || return 1
+  printf '%s\n' "${guid}"
+}
+
+# Older records contain just the short name.
+original_owner() {
+  [[ -f "${ORIGINAL_OWNER_FILE}" ]] || return 0
+  local name uid guid current
+  {
+    IFS= read -r name || true
+    IFS= read -r uid || true
+    IFS= read -r guid || true
+  } <"${ORIGINAL_OWNER_FILE}"
+  if [[ -n "${uid}${guid}" ]]; then
+    [[ "${uid}" =~ ^[0-9]+$ && "${guid}" =~ ^[[:xdigit:]]{8}(-[[:xdigit:]]{4}){3}-[[:xdigit:]]{12}$ ]] || return 1
+    name="$(dscl . -list /Users GeneratedUID 2>/dev/null |
+      awk -v guid="${guid}" 'NF == 2 && $2 == guid { name=$1; count++ } END { if (count != 1) exit 1; print name }')" || return 1
+    current="$(owner_generated_uid "${name}")" || return 1
+    [[ "${current}" == "${guid}" && "$(id -u -- "${name}" 2>/dev/null)" == "${uid}" ]] || return 1
+  fi
+  printf '%s\t%s\n' "${name}" "${uid}"
+}
+
 take_over_prefix() {
-  local owner shared
+  local owner uid guid shared
   prefix_check_parent || brewau_die "unsafe Homebrew prefix or parent directory: ${HOMEBREW_PREFIX_PATH}"
   owner="$(stat -f%Su "${HOMEBREW_PREFIX_PATH}")"
-  if [[ "${owner}" != "${BREWAU_USER}" ]]; then
-    echo "${owner}" >"${ORIGINAL_OWNER_FILE}"
-    chown root:wheel "${ORIGINAL_OWNER_FILE}"
+  if [[ "${owner}" != "${BREWAU_USER}" && ! -f "${ORIGINAL_OWNER_FILE}" ]]; then
+    uid="$(id -u -- "${owner}")" && guid="$(owner_generated_uid "${owner}")" ||
+      brewau_die "could not record the original Homebrew owner ${owner} as a local macOS account"
+    brewau_write_state "${ORIGINAL_OWNER_FILE}" "${owner}"$'\n'"${uid}"$'\n'"${guid}" ||
+      brewau_die "could not save the original Homebrew owner"
     log "transferring ${HOMEBREW_PREFIX_PATH} from ${owner} to ${BREWAU_USER}"
   fi
   touch "${ORIGINAL_MODES_FILE}"
@@ -647,7 +678,7 @@ cmd_install() {
     user="$(console_user)"
     [[ -n "${user}" ]] && users+=("${user}")
     # A first install that failed part-way has already given the prefix away.
-    users+=("$(cat "${ORIGINAL_OWNER_FILE}" 2>/dev/null || stat -f%Su "${HOMEBREW_PREFIX_PATH}")")
+    users+=("$(sed -n '1p' "${ORIGINAL_OWNER_FILE}" 2>/dev/null || stat -f%Su "${HOMEBREW_PREFIX_PATH}")")
   fi
 
   take_over_prefix
@@ -882,7 +913,7 @@ return_cask_apps() {
         { rm -f "${json}"; return 1; }
     fi
     prefix_permission_change --uninstall find -P -d "${app}" -user "${BREWAU_USER}" \
-      \( -type d -o -links 1 \) -exec chown -h "${owner}:admin" {} + ||
+      \( -type d -o -links 1 \) -exec chown -hn "${owner}:80" {} + ||
       { rm -f "${json}"; return 1; }
   done < <(brewau_cask_app_paths "${json}")
   rm -f "${json}"
@@ -900,20 +931,19 @@ prefix_check_locked() {
 # Restore file modes while each parent is still secured. Do not visit a
 # directory again after restoring its mode and handing it back.
 return_prefix() {
-  local owner="$1" group="$2"
+  local uid="$1" gid="$2"
   prefix_check_parent || return 1
   prefix_permission_change --uninstall /usr/bin/env -i PATH="${PATH}" /usr/bin/perl - \
-    "${HOMEBREW_PREFIX_PATH}" "${ORIGINAL_MODES_FILE}" "${UNINSTALL_PROGRESS}" "${owner}" "${group}" "${BREWAU_USER}" <<'PERL'
+    "${HOMEBREW_PREFIX_PATH}" "${ORIGINAL_MODES_FILE}" "${UNINSTALL_PROGRESS}" "${uid}" "${gid}" "${BREWAU_USER}" <<'PERL'
 use strict;
 use warnings;
 use Fcntl qw(:mode :flock O_CREAT O_RDWR O_NOFOLLOW O_NONBLOCK);
 use File::Find 'finddepth';
 use IO::Handle;
+use MIME::Base64 qw(encode_base64 decode_base64);
 
-my ($prefix, $journal, $progress_path, $owner, $group, $service_user) = @ARGV;
-my $uid = getpwnam($owner);
-my $gid = getgrnam($group);
-die "brewau: invalid prefix owner or group\n" unless defined($uid) && defined($gid);
+my ($prefix, $journal, $progress_path, $uid, $gid, $service_user) = @ARGV;
+die "brewau: invalid prefix UID or GID\n" unless $uid =~ /\A[0-9]+\z/ && $gid =~ /\A[0-9]+\z/;
 
 my %modes;
 if (-e $journal) {
@@ -926,45 +956,76 @@ if (-e $journal) {
     close $log or die "brewau: cannot close $journal: $!\n";
 }
 
-# Store raw paths with NUL separators so even a newline in a directory name is unambiguous.
+my $directory_inode = sub {
+    my @st = lstat($_[0]);
+    return @st && S_ISDIR($st[2]) ? "$st[0]:$st[1]" : '';
+};
+my $tree = $directory_inode->($prefix) or die "brewau: invalid Homebrew prefix: $prefix\n";
 sysopen my $progress, $progress_path, O_CREAT | O_RDWR | O_NOFOLLOW | O_NONBLOCK, 0600
     or die "brewau: cannot open $progress_path: $!\n";
 die "brewau: invalid uninstall progress file\n" unless -f $progress;
 flock($progress, LOCK_EX | LOCK_NB) or die "brewau: another uninstall handoff is running: $!\n";
-$progress->autoflush(1);
 
-my (%returned, $pending_path, $pending_inode);
-my $header = join("\0", $prefix, $uid, $gid) . "\0";
-my $saved = do { local $/; <$progress> // '' };
+my $saved = '';
+while (1) {
+    my $count = sysread($progress, my $chunk, 65536);
+    die "brewau: cannot read $progress_path: $!\n" unless defined($count);
+    last unless $count;
+    $saved .= $chunk;
+}
+# A record only exists once its newline has been written.
+my $complete = rindex($saved, "\n") + 1;
+$saved = substr($saved, 0, $complete);
+my ($header, @entries) = split /\n/, $saved;
+if (defined $header && $header =~ /\Aprefix\t([0-9]+:[0-9]+)\t/ && $1 ne $tree) {
+    # Take no shortcuts on a replacement tree.
+    $saved = '';
+    @entries = ();
+}
+truncate($progress, length($saved)) && defined sysseek($progress, length($saved), 0)
+    or die "brewau: cannot position $progress_path: $!\n";
+
 my $record = sub {
-    print {$progress} join("\0", @_) . "\0" or die "brewau: cannot write $progress_path: $!\n";
+    my $line = join("\t", @_) . "\n";
+    my $written = syswrite($progress, $line);
+    die "brewau: cannot write $progress_path: $!\n" unless defined($written) && $written == length($line);
+    $progress->sync or die "brewau: cannot sync $progress_path: $!\n";
 };
-if (length $saved) {
+my (%returned, $pending_path, $pending_inode);
+if (!length($saved)) {
+    $record->('prefix', $tree, $uid, $gid);
+} else {
     die "brewau: uninstall progress does not match the prefix or its original owner\n"
-        unless index($saved, $header) == 0;
-    my @entries = split /\0/, substr($saved, length($header)), -1;
-    die "brewau: invalid uninstall progress\n" if @entries && pop(@entries) ne '';
-    die "brewau: invalid uninstall progress\n" if @entries % 3;
-    while (@entries) {
-        my ($action, $path, $inode) = splice @entries, 0, 3;
+        unless $header eq join("\t", 'prefix', $tree, $uid, $gid);
+    for my $entry (@entries) {
+        my ($action, $inode, $encoded) = split /\t/, $entry, 3;
         die "brewau: invalid uninstall progress\n"
-            unless ($path eq $prefix || index($path, "$prefix/") == 0) && $inode =~ /\A[0-9]+:[0-9]+\z/;
+            unless defined($encoded) && $inode =~ /\A[0-9]+:[0-9]+\z/;
+        my $path = decode_base64($encoded);
+        die "brewau: invalid uninstall progress\n"
+            unless ($path eq $prefix || index($path, "$prefix/") == 0) && encode_base64($path, '') eq $encoded;
         if ($action eq 'ready' && !defined($pending_path) && !$returned{$path}) {
             ($pending_path, $pending_inode) = ($path, $inode);
         } elsif ($action eq 'done' && defined($pending_path) && $path eq $pending_path && $inode eq $pending_inode) {
-            $returned{$path} = 1;
+            $returned{$path} = $inode;
             undef $pending_path;
         } else {
             die "brewau: invalid uninstall progress\n";
         }
     }
-    seek($progress, 0, 2) or die "brewau: cannot seek $progress_path: $!\n";
-} else {
-    $record->($prefix, $uid, $gid);
 }
-exit 0 if $returned{$prefix};
 
-my $skip = sub { $returned{$_[0]} || (defined($pending_path) && $_[0] eq $pending_path) };
+my $skip = sub {
+    my ($path) = @_;
+    if (exists $returned{$path}) {
+        die "brewau: completed directory has changed: $path\n"
+            unless $directory_inode->($path) eq $returned{$path};
+        return 1;
+    }
+    return defined($pending_path) && $path eq $pending_path;
+};
+exit 0 if exists($returned{$prefix}) && $skip->($prefix);
+
 open my $unsafe, '-|', '/usr/bin/find', '-P', $prefix, '-type', 'd', '(',
     '!', '-user', 'root', '!', '-user', $service_user, '-o', '-perm', '-g+w',
     '-o', '-perm', '-o+w', '-o', '-acl', ')', '-prune', '-print0'
@@ -999,17 +1060,17 @@ my $handoff = sub {
         if !$directory && $st[3] > 1;
     return if $preflight;
     # The children are already done. Write the checkpoint before a mode change opens this directory.
-    $record->('ready', $path, $inode) if $directory && !$resuming;
+    $record->('ready', $inode, encode_base64($path, '')) if $directory && !$resuming;
     # Restore modes before chown clears set-ID bits during the handoff.
     if ($chmod) {
         system('/bin/chmod', '-h', sprintf('%04o', $mode), $path) == 0
             or die "brewau: could not restore the mode of $path\n";
     }
     if ($chown) {
-        system('/usr/sbin/chown', '-h', "$uid:$gid", $path) == 0
+        system('/usr/sbin/chown', '-hn', "$uid:$gid", $path) == 0
             or die "brewau: could not return ownership of $path\n";
     }
-    $record->('done', $path, $inode) if $directory;
+    $record->('done', $inode, encode_base64($path, '')) if $directory;
 };
 
 for my $preflight (1, 0) {
@@ -1046,16 +1107,18 @@ cmd_uninstall() {
   if brewau_managed PreventUninstall; then
     brewau_die "uninstall is blocked by your organisation's MDM profile (com.kastruppro.brewau, PreventUninstall); remove that setting in the MDM first"
   fi
-  local owner=""
-  [[ -f "${ORIGINAL_OWNER_FILE}" ]] && owner="$(cat "${ORIGINAL_OWNER_FILE}")"
+  local identity owner uid groups return_homebrew=0
+  identity="$(original_owner)" ||
+    brewau_die "the recorded original Homebrew account no longer exists or could not be verified. Uninstall made no changes"
+  IFS=$'\t' read -r owner uid <<<"${identity}"
   [[ -z "${owner}" ]] && owner="$(console_user)"
-
-  local return_homebrew=0 groups
   if [[ -d "${HOMEBREW_PREFIX_PATH}" || -e "${UNINSTALL_PROGRESS}" ]]; then
     [[ -n "${owner}" ]] || brewau_die "cannot determine the original Homebrew owner. Uninstall made no changes"
-    groups="$(id -Gn -- "${owner}" 2>/dev/null)" || brewau_die "cannot verify administrator membership for Homebrew owner ${owner}. Uninstall made no changes"
-    brewau_in_words admin "${groups}" ||
-      brewau_die "original Homebrew owner ${owner} is not a member of the admin group. Uninstall made no changes"
+    if [[ -z "${uid}" ]]; then uid="$(id -u -- "${owner}" 2>/dev/null)" || uid=""; fi
+    [[ "${uid}" =~ ^[0-9]+$ ]] && groups="$(id -G -- "${owner}" 2>/dev/null)" ||
+      brewau_die "cannot verify administrator membership for Homebrew owner ${owner}. Uninstall made no changes"
+    brewau_in_words 80 "${groups}" ||
+      brewau_die "original Homebrew owner ${owner} is not a member of the local admin group (GID 80). Uninstall made no changes"
     return_homebrew=1
   fi
 
@@ -1071,6 +1134,14 @@ cmd_uninstall() {
   rm -f "${BREWAU_SUDOERS}"
   stop_service_processes
 
+  local record tree current_tree
+  if [[ -f "${UNINSTALL_PROGRESS}" && ! -L "${UNINSTALL_PROGRESS}" && -d "${HOMEBREW_PREFIX_PATH}" ]] &&
+    prefix_check_parent && IFS=$'\t' read -r record tree _ <"${UNINSTALL_PROGRESS}" &&
+    [[ "${record}" == prefix && "${tree}" =~ ^[0-9]+:[0-9]+$ ]]; then
+    current_tree="$(stat -f '%d:%i' "${HOMEBREW_PREFIX_PATH}")"
+    if [[ "${tree}" != "${current_tree}" ]]; then rm -f "${UNINSTALL_PROGRESS}" || return 1; fi
+  fi
+
   if [[ ! -e "${UNINSTALL_PROGRESS}" ]]; then
     if [[ ${return_homebrew} == 1 ]]; then
       prefix_check_locked || brewau_die "could not verify that ${HOMEBREW_PREFIX_PATH} is protected"
@@ -1078,7 +1149,7 @@ cmd_uninstall() {
     # The prefix is still protected while service data and app ownership are restored.
     restore_users "${owner}"
     if [[ ${return_homebrew} == 1 ]]; then
-      return_cask_apps "${owner}" || brewau_die "could not safely return cask apps to ${owner}"
+      return_cask_apps "${uid}" || brewau_die "could not safely return cask apps to ${owner}"
       [[ ! -L "${HOMEBREW_PREFIX_PATH}/Caskroom" ]] ||
         brewau_die "refusing symlink in ${HOMEBREW_PREFIX_PATH}/Caskroom"
       rm -rf "${HOMEBREW_PREFIX_PATH}/Caskroom/brewau"
@@ -1086,7 +1157,7 @@ cmd_uninstall() {
   fi
   if [[ ${return_homebrew} == 1 ]]; then
     log "returning ${HOMEBREW_PREFIX_PATH} to ${owner}"
-    return_prefix "${owner}" admin || brewau_die "could not return ${HOMEBREW_PREFIX_PATH} to ${owner}"
+    return_prefix "${uid}" 80 || brewau_die "could not return ${HOMEBREW_PREFIX_PATH} to ${owner}"
   else
     log "WARNING: could not determine original owner; ${HOMEBREW_PREFIX_PATH} is still owned by ${BREWAU_USER}"
     log "fix with: sudo chown -hR <you>:admin ${HOMEBREW_PREFIX_PATH}"
@@ -1136,6 +1207,38 @@ main() {
   esac
 }
 
+with_setup_lock() {
+  require_root
+  /usr/bin/env -i PATH="${PATH}" /usr/bin/perl -e '
+    use Fcntl qw(:flock O_CREAT O_RDWR O_NOFOLLOW O_NONBLOCK);
+    use POSIX qw(WIFEXITED WEXITSTATUS WTERMSIG);
+    my ($path, $wait, @command) = @ARGV;
+    sysopen(my $lock, $path, O_CREAT | O_RDWR | O_NOFOLLOW | O_NONBLOCK, 0600)
+        or die "brewau: could not open the setup lock: $!\n";
+    my @st = stat($lock);
+    @st && -f _ && $st[3] == 1 && $st[4] == $> && !($st[2] & 022)
+        or die "brewau: invalid setup lock\n";
+    my $busy = "brewau: setup is busy. Try again when it finishes.\n";
+    local $SIG{ALRM} = sub { die $busy };
+    alarm($wait);
+    flock($lock, LOCK_EX | ($wait ? 0 : LOCK_NB)) or die $busy;
+    alarm(0);
+    $SIG{$_} = sub {} for qw(INT TERM HUP QUIT PIPE TSTP);
+    my $status = system { $command[0] } @command;
+    exit 1 if $status == -1;
+    exit(WIFEXITED($status) ? WEXITSTATUS($status) : 128 + WTERMSIG($status));
+  ' -- "${SETUP_LOCK}" "$@"
+}
+
 if [[ -z "${BREWAU_SETUP_TEST:-}" ]]; then
-  main "$@"
+  case "${1:-}" in
+    install | reload | uninstall | finish-install)
+      # Launchd can start the deferred install before postinstall has released the lock.
+      setup_lock_wait=0
+      [[ "$1" == finish-install ]] && setup_lock_wait=30
+      with_setup_lock "${setup_lock_wait}" /bin/bash -p -c 'BREWAU_SETUP_TEST=1; source "$1"; shift; main "$@"' \
+        brewau "${BREWAU_LIBEXEC}/brewau-setup" "$@"
+      ;;
+    *) main "$@" ;;
+  esac
 fi
